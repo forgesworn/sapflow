@@ -244,8 +244,11 @@ fn steady_live_use(segment_count: usize) -> (String, usize) {
         ..MuxerConfig::default()
     };
     let quota = Arc::new(FragmentQuota::new(512 << 20));
-    let mut m =
-        Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone()).expect("muxer");
+    let mut m = Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone())
+        .expect("muxer")
+        .with_retention_pool(Arc::new(FragmentQuota::new(
+            crate::muxer::RETENTION_POOL_BYTES,
+        )));
     let (mut frame, mut next_audio) = (0i64, 0i64);
     live_use(
         || {
@@ -322,7 +325,12 @@ fn the_live_budget_holds_what_main_held() {
     let actual = [
         ("steady, segment_count 7", steady_live_use(7)),
         ("steady, segment_count 24", steady_live_use(24)),
-        ("epochs, segment_count 8", epochs_live_use(None)),
+        (
+            "epochs, segment_count 8",
+            epochs_live_use(Some(Arc::new(FragmentQuota::new(
+                crate::muxer::RETENTION_POOL_BYTES,
+            )))),
+        ),
     ];
     for (name, (digest, peak)) in &actual {
         println!("{name}: {digest} peak {peak}");
@@ -346,49 +354,54 @@ fn the_live_budget_holds_what_main_held() {
     assert_eq!(actual, expected);
 }
 
-/// Without a pool passed in, each muxer on a budget keeps media in a
-/// private pool at its own 64 MiB cap: the budget still holds only live
-/// media, and each stream is bounded on its own.
+/// Without a pool, retention is off, as in 0.2.0-rc.1: media leaves with
+/// the window and the budget's use is main's.
 #[test]
-fn without_a_pool_each_muxer_keeps_media_in_a_private_one() {
+fn without_a_pool_media_leaves_with_the_window_as_in_rc_1() {
     let cfg = MuxerConfig {
         segment_count: 7,
         ..MuxerConfig::default()
     };
     let quota = Arc::new(FragmentQuota::new(512 << 20));
-    let muxer = || {
-        Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone()).expect("muxer")
-    };
-    let (mut first, second) = (muxer(), muxer());
-    let pool = first.retention_pool().cloned().expect("a private pool");
-    assert!(!Arc::ptr_eq(
-        &pool,
-        second.retention_pool().expect("its own")
-    ));
+    let mut m =
+        Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone()).expect("muxer");
+    assert!(m.retention_pool().is_none());
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
     let (mut frame, mut next_audio) = (0i64, 0i64);
-    while frame < 30 * 30 {
+    while frame < 60 * 30 {
         let dts = frame * 3000;
         while next_audio <= dts {
-            first
-                .push_audio(next_audio, Bytes::from_static(b"aac"))
+            m.push_audio(next_audio, Bytes::from_static(b"aac"))
                 .expect("AAC");
             next_audio += 1920;
         }
-        first
-            .push_video(
-                dts,
-                dts,
-                frame % 30 == 0,
-                Bytes::from(vec![0u8; 20_000]),
-                NOW,
-            )
-            .expect("video");
+        m.push_video(
+            dts,
+            dts,
+            frame % 30 == 0,
+            Bytes::from(vec![0u8; 20_000]),
+            NOW,
+        )
+        .expect("video");
+        h.update((quota.used() as u64).to_le_bytes());
+        assert_eq!(kept(&m), 0, "nothing kept past the window");
+        for id in 0..m.media_sequence() {
+            assert!(m.segment(id).is_none(), "segment {id} left with the window");
+        }
         frame += 1;
     }
-    assert!(
-        kept(&first) > 0 && pool.used() > 0,
-        "kept in the private pool"
+    assert!(m.media_sequence() > 0);
+    assert_eq!(
+        (m.parts_released_early(), m.segments_released_early()),
+        (0, 0),
+        "nothing was kept, so nothing went early"
     );
-    drop((first, second));
-    assert_eq!((quota.used(), pool.used()), (0, 0));
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        digest, "cdc0e50dc2be513fd7fb6e6cac05033d346074b4b58bce7b2f16fd56aad34f3c",
+        "main's live budget use"
+    );
+    drop(m);
+    assert_eq!(quota.used(), 0);
 }

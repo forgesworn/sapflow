@@ -99,7 +99,11 @@ fn timing(data: &[u8]) {
         Some(AudioConfig::Opus(channels)),
         None,
     )
-    .expect("supported Opus configuration");
+    .expect("supported Opus configuration")
+    // RetentionCheck needs retention, which needs a pool.
+    .with_retention_pool(std::sync::Arc::new(
+        sapflow_core::fragment::FragmentQuota::new(sapflow_hls::muxer::RETENTION_POOL_BYTES),
+    ));
     let mut rules = playlist::RuleCheck::default();
     let mut retention = playlist::RetentionCheck::default();
     let (mut pts, mut dts, mut frame) = (0i64, -3000i64, 0u32);

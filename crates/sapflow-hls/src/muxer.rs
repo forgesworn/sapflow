@@ -488,7 +488,8 @@ pub struct Muxer {
     /// the window is charged to.
     retention_pool: Option<Arc<FragmentQuota>>,
     /// Each init with a charge, for as long as a part or segment holds it.
-    inits: Vec<(Weak<Initialization>, Arc<crate::fragment::Charge>)>,
+    /// Both weak, so that this list never keeps a charge alive.
+    inits: Vec<(Weak<Initialization>, Weak<crate::fragment::Charge>)>,
     /// Every `EXTINF` the window has listed, gaps included. With the open
     /// parts' spans, the published edge that part tags and part retention
     /// are measured back from.
@@ -602,13 +603,11 @@ impl Muxer {
             return Err(MuxError::InvalidTracks);
         }
         let mut muxer = Self::with_tracks(cfg, video, audio, init);
-        // Without a shared pool, a private one at the stream's own cap.
-        muxer.retention_pool = quota
-            .as_ref()
-            .map(|_| Arc::new(FragmentQuota::new(MAX_RETAINED_BYTES)));
         muxer.fragment_quota = quota;
         if let Some(charge) = charge {
-            muxer.inits.push((Arc::downgrade(&muxer.init), charge));
+            muxer
+                .inits
+                .push((Arc::downgrade(&muxer.init), Arc::downgrade(&charge)));
         }
         Ok(muxer)
     }
@@ -617,19 +616,19 @@ impl Muxer {
         self.fragment_quota.clone()
     }
 
-    /// Charges what this muxer keeps past its window for RFC 8216bis 6.2.2
-    /// to `pool` instead of its fragment budget, so that kept media never
-    /// takes room from live media. Give every muxer on one fragment budget
+    /// Turns on retention for RFC 8216bis 6.2.2: parts stay fetchable for
+    /// three target durations after their tags leave the playlist, and
+    /// segments for their Availability Duration, and what is kept past the
+    /// window is charged to `pool` instead of the fragment budget, so that
+    /// it never takes room from live media. Give every muxer on one budget
     /// the same pool to bound what they keep together: memory is then the
-    /// budget plus the pool. Without this, a muxer with a fragment budget
-    /// keeps its media in a private pool of 64 MiB, its own cap, so each
-    /// stream is bounded but streams together are not. A muxer without a
-    /// fragment budget charges nothing and ignores the pool. Set it before
-    /// pushing media: what is already kept stays charged where it is.
+    /// budget plus the pool. Without a pool, media leaves with the window,
+    /// as in 0.2.0-rc.1. A muxer without a fragment budget has nothing to
+    /// charge, so only the per-stream caps (64 MiB, [`MAX_RETAINED_PARTS`],
+    /// [`MAX_RETAINED_SEGMENTS`]) bound what it keeps. Set it before
+    /// pushing media.
     pub fn with_retention_pool(mut self, pool: Arc<FragmentQuota>) -> Self {
-        if self.fragment_quota.is_some() {
-            self.retention_pool = Some(pool);
-        }
+        self.retention_pool = Some(pool);
         self
     }
 
@@ -812,7 +811,12 @@ impl Muxer {
         let retention_pool = retention_pool.as_ref().map(|q| q.used());
         let inits: Vec<_> = inits
             .iter()
-            .map(|(init, charge)| (init.upgrade().map(|i| i.id), charge.kept()))
+            .map(|(init, charge)| {
+                (
+                    init.upgrade().map(|i| i.id),
+                    charge.upgrade().map(|c| c.kept()),
+                )
+            })
             .collect();
         let tagged: Vec<_> = tagged
             .iter()
@@ -1016,7 +1020,8 @@ impl Muxer {
         }
         let update = self.replace_tracks(video, audio, init, now)?;
         if let Some(charge) = charge {
-            self.inits.push((Arc::downgrade(&self.init), charge));
+            self.inits
+                .push((Arc::downgrade(&self.init), Arc::downgrade(&charge)));
         }
         Ok(update)
     }
@@ -2381,10 +2386,9 @@ impl Muxer {
     /// oldest kept media goes early to make room, and what still does not
     /// fit goes too, so nothing kept stays on the live budget.
     fn keep_in_pool(&mut self) {
+        self.inits
+            .retain(|(init, charge)| init.strong_count() > 0 && charge.strong_count() > 0);
         let Some(pool) = self.retention_pool.clone() else {
-            for t in &mut self.tagged {
-                t.pooled = true;
-            }
             return;
         };
         let mut i = 0;
@@ -2424,14 +2428,18 @@ impl Muxer {
             .collect();
         let mut k = 0;
         while k < self.inits.len() {
-            let Some(id) = self.inits[k].0.upgrade().map(|init| init.id) else {
+            let (Some(id), Some(charge)) = (
+                self.inits[k].0.upgrade().map(|init| init.id),
+                self.inits[k].1.upgrade(),
+            ) else {
                 self.inits.swap_remove(k);
                 continue;
             };
-            if used.contains(&id) || self.inits[k].1.keep_in(&pool) {
+            if used.contains(&id) || charge.keep_in(&pool) {
                 k += 1;
                 continue;
             }
+            drop(charge);
             // Only kept media holds this init, and the pool is full: that
             // media goes early, oldest first, and the init with it.
             while self.tagged.iter().any(|t| {
@@ -2440,7 +2448,7 @@ impl Muxer {
                     && (t.segment.is_some() || !t.parts_freed)
             }) && self.release_oldest()
             {}
-            if self.inits[k].0.upgrade().is_none() {
+            if self.inits[k].0.strong_count() == 0 {
                 self.inits.swap_remove(k);
             } else {
                 k += 1;
@@ -2575,20 +2583,33 @@ impl Muxer {
             if listed < floor && byte_capped && !entry_capped {
                 self.window_byte_capped = true;
             }
-            if let Some(Entry::Segment(old)) = self.entries.pop_front() {
+            let removed = self.entries.pop_front();
+            self.media_sequence += 1;
+            if let Some(Entry::Segment(old)) = removed {
                 if old.discontinuity {
                     self.discontinuity_sequence += 1;
                 }
-                // It and its parts stay until RFC 8216bis 6.2.2 lets them
-                // go (`retain_parts`).
-                if let Some(t) = self.tagged.iter_mut().find(|t| t.msn == old.id) {
-                    self.retained.0 += t.bytes;
-                    self.retained.1 += t.parts;
-                    self.retained.2 += 1;
-                    t.segment = Some(old);
+                if let Some(i) = self.tagged.iter().position(|t| t.msn == old.id) {
+                    if self.retention_pool.is_some() {
+                        // It and its parts stay until RFC 8216bis 6.2.2 lets
+                        // them go (`retain_parts`). Their charges move to
+                        // the pool now, as main freed them now, so the live
+                        // budget never holds more than main's at any point.
+                        let t = &mut self.tagged[i];
+                        self.retained.0 += t.bytes;
+                        self.retained.1 += t.parts;
+                        self.retained.2 += 1;
+                        t.segment = Some(old);
+                        self.keep_in_pool();
+                    } else {
+                        // No retention: it goes with the window, as in rc.1.
+                        drop(old);
+                        let end = self.tagged[i].end_part;
+                        self.tagged.remove(i);
+                        self.free_parts_before(end);
+                    }
                 }
             }
-            self.media_sequence += 1;
         }
         // The playlist now distributed lists every entry left: the longest
         // playlist each listed segment has been in.
@@ -3903,11 +3924,7 @@ pub(crate) mod tests {
         // 40 segments + 7 gaps produced, 24 kept.
         assert_eq!(m.media_sequence(), 47 - 24);
         assert!(m.entries().iter().all(|e| matches!(e, Entry::Segment(_))));
-        // The segment removed last is still served for its Availability
-        // Duration (RFC 8216bis 6.2.2): 1 s plus the 24 s playlist since it
-        // appeared. The one before has had it.
-        assert!(m.segment(m.media_sequence() - 1).is_some());
-        assert!(m.segment(m.media_sequence() - 2).is_none());
+        assert!(m.segment(m.media_sequence() - 1).is_none());
         let first = m.segment(m.media_sequence()).expect("oldest kept");
         match m.part(first.parts[0].id) {
             PartLookup::Found(p) => assert_eq!(p.id, first.parts[0].id),
@@ -3942,10 +3959,7 @@ pub(crate) mod tests {
         let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
         feed(&mut m, 0..(30 * 40 + 1), 30);
         let evicted = m.media_sequence() - 1;
-        // Out of the playlist, though still served for its Availability
-        // Duration (RFC 8216bis 6.2.2); the one before is gone.
-        assert!(m.segment(evicted).is_some());
-        assert!(m.segment(evicted - 1).is_none());
+        assert!(m.segment(evicted).is_none());
         assert_eq!(m.readiness(Some(evicted), None), Readiness::Ready);
         assert_eq!(m.readiness(Some(evicted), Some(0)), Readiness::Ready);
         assert_eq!(m.readiness(Some(evicted), Some(u64::MAX)), Readiness::Ready);

@@ -479,6 +479,10 @@ pub fn multivariant(m: &Muxer) -> String {
 /// [`RetentionCheck::check`] after every push, so that no entry joins and
 /// leaves the window between calls.
 ///
+/// Retention is on only for a muxer given a pool
+/// ([`Muxer::with_retention_pool`]); without one, media leaves with the
+/// window and this check fails wherever the window is short.
+///
 /// A part whose tag a render stops listing must be served by
 /// [`Muxer::part`] until the published media is three target durations
 /// further on, and a segment that has left the window must be served by

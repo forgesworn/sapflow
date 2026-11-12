@@ -29,6 +29,13 @@ use crate::{EsIngest, Muxer, MuxerConfig, PartLookup, TrackSet, TsIngest, playli
 
 const NOW: SystemTime = SystemTime::UNIX_EPOCH;
 
+/// A retention pool, which retention needs, at the server's default size.
+fn pool() -> std::sync::Arc<sapflow_core::fragment::FragmentQuota> {
+    std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(
+        crate::muxer::RETENTION_POOL_BYTES,
+    ))
+}
+
 /// What a client could fetch, render by render, on two clocks: the input
 /// timestamps (a publisher sending in real time), and the media the muxer
 /// has published.
@@ -169,7 +176,7 @@ fn steady(name: &'static str, segment_count: usize) -> Case {
         segment_count,
         ..MuxerConfig::default()
     };
-    let mut m = Muxer::new(cfg, video(), Some(aac()));
+    let mut m = Muxer::new(cfg, video(), Some(aac())).with_retention_pool(pool());
     let mut retention = Retention::default();
     let mut next_audio = 0;
     for i in 0..60 * 30 {
@@ -204,7 +211,7 @@ fn opus_audio_only(name: &'static str, samples: u32) -> Case {
         segment_count: 7,
         ..MuxerConfig::default()
     };
-    let mut ingest = EsIngest::new(cfg);
+    let mut ingest = EsIngest::new(cfg).with_retention_pool(pool());
     ingest
         .declare_tracks(TrackSet::AudioOnly, NOW)
         .expect("audio-only");
@@ -233,7 +240,7 @@ fn opus_video_led() -> Case {
         ..MuxerConfig::default()
     };
     let video = video();
-    let mut ingest = EsIngest::new(cfg);
+    let mut ingest = EsIngest::new(cfg).with_retention_pool(pool());
     ingest
         .declare_tracks(TrackSet::AudioVideo, NOW)
         .expect("A/V");
@@ -276,7 +283,9 @@ fn aac_steady(name: &'static str, segment_count: usize) -> Case {
         ..MuxerConfig::default()
     };
     let config = AacConfig::from_audio_specific_config(&[0x11, 0x88]).expect("AAC");
-    let mut m = Muxer::audio_only(cfg, config).expect("AAC");
+    let mut m = Muxer::audio_only(cfg, config)
+        .expect("AAC")
+        .with_retention_pool(pool());
     let mut retention = Retention::default();
     let mut pts = 0;
     while pts < 60 * 90_000 {
@@ -296,7 +305,9 @@ fn aac_steady(name: &'static str, segment_count: usize) -> Case {
 /// `every` frames.
 fn aac_reconnects(name: &'static str, every: i64) -> Case {
     let config = AacConfig::from_audio_specific_config(&[0x11, 0x88]).expect("AAC");
-    let mut m = Muxer::audio_only(MuxerConfig::default(), config).expect("AAC");
+    let mut m = Muxer::audio_only(MuxerConfig::default(), config)
+        .expect("AAC")
+        .with_retention_pool(pool());
     let mut retention = Retention::default();
     let mut pts = 0;
     for i in 0..3000 {
@@ -363,7 +374,7 @@ fn epochs() -> Case {
         segment_count: 8,
         ..MuxerConfig::default()
     };
-    let mut ingest = TsIngest::new(cfg);
+    let mut ingest = TsIngest::new(cfg).with_retention_pool(pool());
     let mut retention = Retention::default();
     // The fixture's timestamps restart each epoch: the published clock
     // stands in for the input one.
@@ -511,7 +522,9 @@ fn kept_past_the_window(m: &Muxer) -> Kept {
 #[test]
 fn kept_parts_and_segments_stop_at_64_mib_and_are_counted() {
     let config = AacConfig::from_audio_specific_config(&[0x11, 0x88]).expect("AAC");
-    let mut m = Muxer::audio_only(MuxerConfig::default(), config).expect("AAC");
+    let mut m = Muxer::audio_only(MuxerConfig::default(), config)
+        .expect("AAC")
+        .with_retention_pool(pool());
     let payload = Bytes::from(vec![0u8; 2 << 20]);
     let mut checker = playlist::RetentionCheck::default();
     let (mut most, mut pts) = (Kept::default(), 0);
@@ -540,7 +553,7 @@ fn kept_parts_and_segments_stop_at_64_mib_and_are_counted() {
 /// parts go early; their segments stay for their own rule.
 #[test]
 fn kept_parts_stop_at_their_count_cap() {
-    let mut m = Muxer::new(MuxerConfig::default(), video(), None);
+    let mut m = Muxer::new(MuxerConfig::default(), video(), None).with_retention_pool(pool());
     let frame = |m: &mut Muxer, i: i64, sync: bool| {
         m.push_video(i * 3000, i * 3000, sync, Bytes::from_static(&[1]), NOW)
             .expect("video");
@@ -577,7 +590,7 @@ fn kept_segments_stop_at_their_count_cap() {
         segment_count: 1000,
         ..MuxerConfig::default()
     };
-    let mut m = Muxer::new(cfg, video(), None);
+    let mut m = Muxer::new(cfg, video(), None).with_retention_pool(pool());
     let frame = |m: &mut Muxer, i: i64, sync: bool| {
         m.push_video(i * 3000, i * 3000, sync, Bytes::from_static(&[1]), NOW)
             .expect("video");
@@ -622,8 +635,9 @@ fn kept_parts_and_segments_stay_under_a_tight_fragment_budget() {
         ..MuxerConfig::default()
     };
     let quota = std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(6 << 20));
-    let mut m =
-        Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone()).expect("muxer");
+    let mut m = Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone())
+        .expect("muxer")
+        .with_retention_pool(pool());
     let mut checker = playlist::RetentionCheck::default();
     let mut next_audio = 0;
     for i in 0..60 * 30 {

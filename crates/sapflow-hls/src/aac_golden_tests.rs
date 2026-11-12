@@ -4,8 +4,7 @@
 //! segments, parts, segments and playlists. The digests were taken from the
 //! code at 945cb21 (crates 0.2.0-rc.1), before any Opus change, so a
 //! difference here means AAC output changed. The one exception is `epochs`,
-//! retaken when the live window began keeping three target durations, and
-//! again when parts began staying three target durations after their tags. The
+//! retaken when the live window began keeping three target durations. The
 //! scenarios cover the unmetered and fragment-quota constructors, TS,
 //! elementary video-led and audio-only input, codec epochs over reconnects,
 //! and every init builder.
@@ -344,15 +343,13 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
         ),
         // Changed with the RFC 8216bis 6.2.2 live window: at eight entries
         // the old count-only eviction left 5.40 s listed after the third and
-        // fourth epochs; one more 1 s segment is now kept (6.40 s). Changed
-        // again with 6.2.2's part rule: after the fourth epoch, the first
-        // epoch's parts 0 to 10, whose tags left under three target
-        // durations before, are still served, and so is that epoch's init.
-        // Every playlist, segment, and part and init served before is
-        // unchanged.
+        // fourth epochs; one more 1 s segment is now kept (6.40 s). Every
+        // part and segment served before is unchanged. Retention for 6.2.2's
+        // part and segment rules needs a pool, which this, like an rc.1
+        // caller, does not give.
         (
             "epochs",
-            "73edc5de8b7f6f979b51d6a6703ee09c700560ae816d627047a498cd68e71535",
+            "96bd3461c6d65e769cec2aaa991366e11013497bcccdb1e7fc78dee15a09df75",
         ),
         (
             "audio-only-reconfigure",

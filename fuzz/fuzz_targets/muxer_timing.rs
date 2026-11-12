@@ -12,6 +12,14 @@ use sapflow_hls::codec::{AacConfig, H264Config};
 use sapflow_hls::{Muxer, MuxerConfig, playlist};
 use sapflow_hls::{fmp4, recording_timing as recording};
 
+/// A retention pool, which `playlist::RetentionCheck` needs the muxer to
+/// have: without one, media leaves with the window.
+fn pool() -> std::sync::Arc<sapflow_core::fragment::FragmentQuota> {
+    std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(
+        sapflow_hls::muxer::RETENTION_POOL_BYTES,
+    ))
+}
+
 const SPS: &[u8] = &[
     0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0x00, 0x00, 0x03, 0x00, 0x08,
     0x00, 0x00, 0x03, 0x01, 0xe0, 0x78, 0xa1, 0x4c, 0xb0,
@@ -244,7 +252,8 @@ fn audio_timing(data: &[u8]) {
     };
     let mut stereo = head & 1 != 0;
     let mut muxer = Muxer::audio_only(MuxerConfig::default(), config(stereo))
-        .expect("fixed supported AAC profile");
+        .expect("fixed supported AAC profile")
+        .with_retention_pool(pool());
     let mut rules = playlist::RuleCheck::default();
     let mut retention = playlist::RetentionCheck::default();
     let mut pts = 0i64;
@@ -429,7 +438,7 @@ fuzz_target!(|data: &[u8]| {
         sample_rate: 48000,
         channels: 2,
     };
-    let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac));
+    let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac)).with_retention_pool(pool());
     let (mut dts, mut audio) = (0i64, 0i64);
     let mut rules = playlist::RuleCheck::default();
     let mut retention = playlist::RetentionCheck::default();

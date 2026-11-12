@@ -63,19 +63,15 @@ fn evicted_fragment_bytes_remain_charged_through_segment_and_slice_owners() {
     assert!(muxer.segment(7).is_none());
     assert!(matches!(muxer.part(part_id), PartLookup::Missing));
     assert!(metadata.upgrade().is_none());
-    // Kept past the window, its charge moved to the retention pool, where
-    // it stays while an alias does.
-    let pool = muxer.retention_pool().cloned().expect("a pool");
     drop(muxer);
-    let charged = || quota.used() + pool.used();
-    assert!(charged() >= body.len());
+    assert!(quota.used() >= body.len());
     drop(body);
     assert!(
-        charged() > suffix.len(),
+        quota.used() > suffix.len(),
         "one-byte offset retains the whole encoded allocation"
     );
     drop(suffix);
-    assert_eq!((quota.used(), pool.used()), (0, 0));
+    assert_eq!(quota.used(), 0);
 }
 
 #[test]

@@ -37,6 +37,15 @@ impl FlvIngest {
         ingest
     }
 
+    /// Turns on retention, with `pool` ([`EsIngest::with_retention_pool`]).
+    pub fn with_retention_pool(
+        mut self,
+        pool: std::sync::Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        self.es.set_retention_pool(pool);
+        self
+    }
+
     /// [`FlvIngest::with_fragment_quota`], with a retention pool
     /// ([`EsIngest::with_fragment_budget`]).
     pub fn with_fragment_budget(

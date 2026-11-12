@@ -567,6 +567,18 @@ impl EsIngest {
         }
     }
 
+    /// Turns on retention, with `pool`, for every muxer this ingest makes
+    /// ([`Muxer::with_retention_pool`]). Without one, media leaves with the
+    /// window, as in 0.2.0-rc.1.
+    pub fn with_retention_pool(mut self, pool: Arc<sapflow_core::fragment::FragmentQuota>) -> Self {
+        self.set_retention_pool(pool);
+        self
+    }
+
+    pub(crate) fn set_retention_pool(&mut self, pool: Arc<sapflow_core::fragment::FragmentQuota>) {
+        self.retention_pool = Some(pool);
+    }
+
     /// A new muxer, given this ingest's retention pool.
     fn pooled(&self, muxer: Muxer) -> Muxer {
         match &self.retention_pool {
@@ -1019,6 +1031,12 @@ impl TsIngest {
         let mut ingest = Self::new(cfg);
         ingest.es = EsIngest::with_fragment_quota(cfg, quota);
         ingest
+    }
+
+    /// Turns on retention, with `pool` ([`EsIngest::with_retention_pool`]).
+    pub fn with_retention_pool(mut self, pool: Arc<sapflow_core::fragment::FragmentQuota>) -> Self {
+        self.es.set_retention_pool(pool);
+        self
     }
 
     /// [`TsIngest::with_fragment_quota`], with a retention pool

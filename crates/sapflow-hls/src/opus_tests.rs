@@ -277,7 +277,9 @@ fn audio_only_opus_cuts_independent_parts_on_toc_durations() {
 /// every render, every part as it is produced (so nothing is lost to the
 /// window), and RFC 8216bis 6.2.2's part retention: a part stays
 /// downloadable for three target durations after its tag leaves the
-/// playlist, at any window (`part_retention_tests` covers short ones).
+/// playlist. Without a retention pool that holds only at windows of about
+/// six target durations, as at the default these tests use;
+/// `part_retention_tests` gives a pool and covers short windows.
 #[derive(Default)]
 struct Watch {
     rules: playlist::RuleCheck,
