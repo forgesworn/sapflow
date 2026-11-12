@@ -112,8 +112,10 @@ internal class SrtPublishingSink(
             selector.set(readiness)
             val socket = DatagramChannel.open(if (destination.address is Inet4Address) StandardProtocolFamily.INET else StandardProtocolFamily.INET6)
             channel.set(socket)
+            val peerSocketAddress = destination.socketAddress
+            val peerNativeAddress = destination.nativeAddress
             socket.configureBlocking(false)
-            socket.connect(destination.socketAddress)
+            socket.connect(peerSocketAddress)
             val key = socket.register(readiness, SelectionKey.OP_READ)
             val input = ByteBuffer.allocateDirect(1501)
             while (!closed.get()) {
@@ -137,9 +139,9 @@ internal class SrtPublishingSink(
                     for (index in 0 until 16) {
                         input.clear()
                         val source = socket.receive(input) ?: break
-                        if (source == destination.socketAddress && input.position() in 1..1500) {
+                        if (source == peerSocketAddress && input.position() in 1..1500) {
                             input.flip()
-                            publisher.feed(destination.nativeAddress, input, nowUs().toULong())
+                            publisher.feed(peerNativeAddress, input, nowUs().toULong())
                         }
                     }
                     check(publisher.state() != NativeSrtState.CLOSED) { "SRT origin closed the attempt" }
@@ -209,13 +211,13 @@ internal class SrtPublishingSink(
                     // service socket readiness before the next bounded batch.
                     readiness.selectNow(); Thread.yield(); continue
                 }
-                val deadline = listOfNotNull(
+                val deadline = srtDeadlineUs(
                     if (publisher == null) configureDeadlineUs else null,
                     // Immediate native mux deadlines must not spin while one
                     // UDP write waits. Its separate 100ms timer remains active.
                     if (pendingWrite == null) publisher?.nextDeadlineUs()?.toLong() else null,
                     writeDeadlineUs, offered.deadlineUs(),
-                ).minOrNull()
+                )
                 if (deadline != null) {
                     alarm = timers.schedule(Runnable { readiness.wakeup() }, (deadline - nowUs()).coerceAtLeast(0), TimeUnit.MICROSECONDS)
                 }
@@ -298,4 +300,12 @@ internal class SrtPublishingSink(
     companion object {
         private fun nowUs() = System.nanoTime() / 1000
     }
+}
+
+internal fun srtDeadlineUs(configure: Long?, native: Long?, write: Long?, offered: Long?): Long? {
+    var earliest = configure
+    if (native != null && (earliest == null || native < earliest)) earliest = native
+    if (write != null && (earliest == null || write < earliest)) earliest = write
+    if (offered != null && (earliest == null || offered < earliest)) earliest = offered
+    return earliest
 }
