@@ -836,18 +836,21 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   release-and-retry to do on any allocation path, the epoch init
   included. If the pool is full, the stream's own oldest kept media goes
   first to make room, and whatever still does not fit goes too, counted,
-  never back onto the live budget. One pool serves each live budget,
-  found from the budget itself, so every stream on it shares the pool
-  without the server handing one over; a cleaner alternative, outside
-  this crate, is for the server or `sapflow-core` to create the pool beside
-  the budget. It holds `muxer::RETENTION_POOL_BYTES`, 128 MiB: the server's
-  defaults are 16 publishers on a 512 MiB budget, and each keeps about
-  8 MiB (three target durations of parts past the window plus a segment,
-  at 9 Mbit/s with a 2 s target). Memory is then bounded by the live
-  budget plus 128 MiB, and each stream by its 64 MiB cap within that. The
-  budget's maximum cannot be read from this crate, so the pool cannot be
-  sized from it. With no budget there is no pool, and only the per-stream
-  caps apply.
+  never back onto the live budget. The pool is explicit: the server
+  creates one beside its fragment budget, `SAPFLOW_MAX_RETAINED_BYTES`
+  (default 128 MiB, `muxer::RETENTION_POOL_BYTES`), and gives it to every
+  muxer that shares the budget, through the ingests'
+  `with_fragment_budget` constructors; fragment memory is then
+  `SAPFLOW_MAX_FRAGMENT_BYTES` plus that pool, and each stream is held to
+  its 64 MiB cap within it. 128 MiB fits the server's defaults: 16
+  publishers on a 512 MiB budget, each keeping about 8 MiB (three target
+  durations of parts past the window plus a segment, at 9 Mbit/s with a
+  2 s target). A library user passes a pool with
+  `Muxer::with_retention_pool` or `with_fragment_budget`; without one, a
+  muxer with a fragment budget keeps its media in a private 64 MiB pool,
+  its own cap, so each stream is bounded and the budget still holds only
+  live media, but streams together are bounded only by their number. With
+  no budget there is no pool, and only the per-stream caps apply.
 
   `Muxer::parts_released_early()` and `Muxer::segments_released_early()`
   count what went early, and `playlist::RetentionCheck` holds a muxer to

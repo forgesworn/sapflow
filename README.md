@@ -168,6 +168,14 @@ Linux the server reads its cgroup memory limit at startup and warns when
 the cap is above three quarters of it, since a high-bitrate publisher could
 then get the server killed instead of refused.
 
+`SAPFLOW_MAX_RETAINED_BYTES` (`--max-retained-bytes`, default 128 MiB) is a
+pool beside it for media kept past the live window, so that parts and
+segments stay fetchable as RFC 8216bis 6.2.2 asks: when media leaves the
+window its charge moves to this pool, so keeping it never refuses live
+media. Fragment memory is `SAPFLOW_MAX_FRAGMENT_BYTES` plus this pool. Kept
+media stays fetchable after a stream ends only while
+`SAPFLOW_RECONNECT_GRACE` keeps the presentation.
+
 `SAPFLOW_HTTP_BODY_TIMEOUT` (`--http-body-timeout`) gives each ready framed
 response 120 seconds by default, configurable from 1 through 3,600. Successful
 writes do not extend it. Parked LL-HLS waiting is excluded, and each keep-alive

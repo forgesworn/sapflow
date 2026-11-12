@@ -32,11 +32,15 @@ Notes for the release after 0.2.0-rc.1.
   parts once, and is capped at `muxer::MAX_RETAINED_SEGMENTS` (1,024)
   segments; `Muxer::segments_released_early()` counts any that go early.
   `playlist::RetentionCheck` checks this rule too.
-- What a muxer keeps for these rules is charged to a retention pool of
-  `muxer::RETENTION_POOL_BYTES` (128 MiB), one per fragment budget and
-  shared by every stream on it, not to the fragment budget: the budget's
-  use is rc.1's, so retention never refuses live media. Memory is bounded
-  by the budget plus the pool.
+- What a muxer keeps for these rules is charged to a retention pool, not
+  to the fragment budget: the budget's use is rc.1's, so retention never
+  refuses live media. New, additive: `Muxer::with_retention_pool`, and
+  `EsIngest`, `TsIngest` and `FlvIngest::with_fragment_budget`, which take
+  the pool beside the budget. Without a pool, a muxer with a budget keeps
+  its media in a private 64 MiB pool, its own cap.
+- The server creates the pool beside its fragment budget:
+  `SAPFLOW_MAX_RETAINED_BYTES` (`--max-retained-bytes`), default 128 MiB.
+  Fragment memory is `SAPFLOW_MAX_FRAGMENT_BYTES` plus this pool.
 - After a stream ends, kept media stays fetchable only while the server
   keeps the presentation: set `SAPFLOW_RECONNECT_GRACE` (default 90 s) to
   at least a segment's duration plus the longest playlist for the rules to

@@ -14,6 +14,7 @@ open. Recorder admission and muxer input limits cover different owners.
 | RTMP connections and publishers | `4N` connections; C9 separately admits `N` current publication owners |
 | Resident presentations | `SAPFLOW_MAX_PRESENTATIONS`, default `4 * N` capped at 4,096 (64 at default publisher admission); includes removed streams through their final owner |
 | Shared encoded init/fragment backings | `SAPFLOW_MAX_FRAGMENT_BYTES`, default 536,870,912 bytes (512 MiB); whole encoded Vec capacity, charged once through the final payload owner |
+| Media kept past the live window (RFC 8216bis 6.2.2) | `SAPFLOW_MAX_RETAINED_BYTES`, default 134,217,728 bytes (128 MiB); a part's or segment's charge moves here from the fragment bytes when it leaves the window, so it never refuses live media. Fragment memory is the two together |
 | HLS window | Default 24 entries per path, configurable from 7 through 1,000, plus open media |
 | Reconnect hold | Default 90 seconds, configurable up to 3,600 seconds per useful path |
 | HTTP connections | 20,000; this is not a media-byte limit |
