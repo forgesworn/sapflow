@@ -41,6 +41,23 @@ ffmpeg -nostdin -hide_banner -loglevel error -y -f concat -safe 0 -i list.txt \
   -c copy -map_metadata -1 -fflags +bitexact -f mpegts resolution-change.ts
 ```
 
+`resolution-blip.ts` is the same test pattern at 160x90 for two seconds,
+128x72 for three frames (0.1 s), then 160x90 for one second, joined the same
+way. Its middle epoch is shorter than one part, after part timing is known,
+so the change out of it seals its one open part: it is served, and the
+server's regression checks that it is recorded. Regenerate it with the
+commands above, encoding `160x90` for `-t 2`, `128x72` for `-t 0.1` and
+`160x90` for `-t 1`, and joining the three in that order into
+`resolution-blip.ts`.
+
+Both were generated with FFmpeg 8.1.2. Different FFmpeg versions may produce
+different encoded bytes.
+
+| Fixture | Bytes | SHA-256 | Video frames |
+| --- | ---: | --- | ---: |
+| `resolution-change.ts` | 231804 | `c9aba77df0c453aaaa7fd9a33ead9533f4ad28c06475fbaa1bf46eddbba7e34b` | 60 at 160x90, 60 at 128x72 |
+| `resolution-blip.ts` | 192700 | `e5bc8b165dd46647fd1f0bcbf08f81f048096dfeead241bbce63a7df98e53337` | 60 at 160x90, 3 at 128x72, 30 at 160x90 |
+
 ## Generated audio-only fixtures
 
 `audio-48k-mono.ts` and `audio-44k1-stereo.ts` each contain six seconds of

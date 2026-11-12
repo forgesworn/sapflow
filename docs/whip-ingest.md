@@ -890,7 +890,22 @@ applies to all three:
   sets of their own. Sets repeated unchanged at every IDR start nothing. A
   changed SPS that does not parse keeps the current epoch, and is logged once.
 - Before the recording rolls, the old file takes its epoch's last parts,
-  which the change sealed.
+  which the change sealed. Media that was served is recorded, or the
+  recording is marked:
+  - Once part timing is known, the change seals the open part, so even an
+    epoch shorter than one part is served (its own `EXT-X-MAP` and a
+    segment). Its recording never started; it is started at the roll, with
+    the tracks the stream noted when the epoch began, and fed the epoch's
+    parts.
+  - An epoch that began and ended inside one ingest batch left no tracks to
+    start a recording with; the next recording is then marked incomplete
+    (`epoch-unrecorded`).
+  - While part timing is still being learnt, at the start of a stream, the
+    change seals nothing and that epoch is never served or recorded.
+    Chrome 157 did this at the start of some runs: its first IDR at
+    640x360, then 480x270 at once, then 640x360.
+  - The log line gives the ended epoch's parts after the change sealed them
+    (`previous_parts`); zero means it was never served.
 
 Before this, the first init stayed while frames of the new size were
 written under it, so players failed to decode them (hls.js stalled after a
@@ -902,13 +917,15 @@ Left open:
 - At the change the muxer drops its pending video frame and pending audio
   (in the fixture test, 1 video frame and 3 AAC frames of 60 and 96), as it
   does at any interrupt, and the recording is not marked for it.
-- An epoch that changes again before its first part is cut leaves no
-  playlist entry and no recording; its frames are not served. Chrome 157
-  did this at the start of some runs: its first IDR at 640x360, then
-  480x270 at once, then 640x360. The log line gives `previous_parts=0`.
-- hls.js 1.7.1 stalled 0.42 to 0.51 s at the boundary in the end-to-end runs.
-  Once, in the diagnosis, it stalled about 7 s on a 0.37 s buffer hole
-  before stepping over it; that was not seen again.
+- Two writers a path (`PATH_WRITERS`): epochs that change faster than a
+  finished file can be written out leave a later recording without a
+  writer, which fails it. In real time the short epoch and the next part
+  give the writer that time; nothing bounds the epoch rate but the IDR
+  cadence (for the bounds work in W3c part 2b).
+- Observed stalls of hls.js 1.7.1 at the boundary in the end-to-end runs:
+  0.10 to 0.82 s, and 0.52 s in the review. Once, in the diagnosis, it
+  stalled about 7 s on a 0.37 s buffer hole before stepping over it; that
+  was not seen again.
 
 Pages that publish from a browser should still hold resolution and let frame
 rate drop (`degradationPreference: "maintain-resolution"` where supported):
