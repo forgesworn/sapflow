@@ -1,0 +1,422 @@
+[
+ {
+  "run": 1,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 43.4,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472876.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 2,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 31.34,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472902.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 3,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 21.58,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472928.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 4,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 15.8,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472953.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 5,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 19.97,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472979.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 6,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 31.95,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0.4,
+     0.4,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794473007.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0.4,
+     0.4,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 7,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 43.06,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794473033.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 8,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 41.76,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794473059.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 9,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 30.86,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     1,
+     1,
+     1,
+     1,
+     1.5,
+     1.5,
+     1.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794473085.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     1,
+     1,
+     1,
+     1,
+     1.5,
+     1.5,
+     1.5,
+     1.5,
+     1.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 10,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 24.46,
+  "alignment": "SenderReports",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794473111.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ }
+]

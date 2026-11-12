@@ -94,9 +94,8 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            0 disables, maximum 3600)
 
 WHIP (browser and OBS publishing over WebRTC) is off unless SAPFLOW_WHIP_ADDR
-is set. It is not ready to face the internet: it has no request throttle of
-its own, no pending-session caps and no panic isolation yet. With it set,
-the next three are required:
+is set. It should not face the internet until the qualification gates in
+docs/whip-ingest.md (W4) pass. With it set, the next three are required:
   SAPFLOW_WHIP_ADDR        WHIP signalling over plain HTTP, behind a TLS proxy
   SAPFLOW_WHIP_PUBLIC_URL  the public base URL of that listener, for Location
   SAPFLOW_WHIP_UDP_ADDR    the media UDP socket every session shares
