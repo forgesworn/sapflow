@@ -29,6 +29,7 @@ const TOKEN: &str = "publisher:whip-tcp-secret";
 
 struct Server {
     app: Arc<App>,
+    whip: Arc<Whip>,
     http: SocketAddr,
     tcp: SocketAddr,
     stats: Arc<Stats>,
@@ -74,6 +75,11 @@ fn app() -> Arc<App> {
 /// A server whose ICE-TCP listener believes PROXY headers from `proxy`,
 /// within `limits`.
 async fn start(proxy: Option<IpAddr>, limits: Limits) -> Server {
+    serve_tcp(proxy, limits, false).await
+}
+
+/// As [`start`]; with `hooks`, the panic hooks are on (A3.4).
+async fn serve_tcp(proxy: Option<IpAddr>, limits: Limits, hooks: bool) -> Server {
     let app = app();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let tcp = listener.local_addr().expect("addr");
@@ -85,12 +91,17 @@ async fn start(proxy: Option<IpAddr>, limits: Limits) -> Server {
         tcp: Some(bound),
     };
     let http = sockets.http.local_addr().expect("addr");
-    let (whip, router, rx) = prepare(&app, server_identity())
+    let (whip, mut router, rx) = prepare(&app, server_identity())
         .expect("router")
         .expect("WHIP on");
-    tokio::spawn(run(app.clone(), whip, router, rx, sockets));
+    if hooks {
+        router.enable_panic_hooks();
+        whip.panic_hooks.store(true, Ordering::Relaxed);
+    }
+    tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
     Server {
         app,
+        whip,
         http,
         tcp,
         stats,
@@ -137,6 +148,19 @@ fn line<'a>(sdp: &'a str, prefix: &str) -> &'a str {
 }
 
 /// Whether the peer closes the connection within `wait`.
+/// Waits up to 2 s for a counter to reach `n`. The listener counts how a
+/// connection ended after the connection's task has dropped its socket, so
+/// the far end can see the close first.
+async fn counted(stats: &Stats, f: fn(&Stats) -> &std::sync::atomic::AtomicU64, n: u64) -> bool {
+    for _ in 0..40 {
+        if get(stats, f) == n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    get(stats, f) == n
+}
+
 async fn closed_within(s: &mut TcpStream, wait: Duration) -> bool {
     let mut b = [0u8; 2048];
     loop {
@@ -338,7 +362,10 @@ async fn any_other_peer_is_dropped_unread() {
     let _ = phone.try_send(&[c]).await;
     assert!(closed_within(&mut phone.stream, Duration::from_secs(2)).await);
     assert!(phone.p.stun_answers.is_empty());
-    assert_eq!(get(&server.stats, |s| &s.untrusted), 1);
+    assert!(
+        counted(&server.stats, |s| &s.untrusted, 1).await,
+        "untrusted"
+    );
 }
 
 /// A LOCAL header is the proxy's own connection: closed, no frame read.
@@ -352,7 +379,7 @@ async fn a_local_header_is_closed_without_reading_frames() {
     let c = phone.p.check(true);
     let _ = phone.try_send(&[c]).await;
     assert!(closed_within(&mut phone.stream, Duration::from_secs(2)).await);
-    assert_eq!(get(&server.stats, |s| &s.local), 1);
+    assert!(counted(&server.stats, |s| &s.local, 1).await, "local");
     assert_eq!(get(&server.stats, |s| &s.frames_in), 0);
 }
 
@@ -372,7 +399,10 @@ async fn a_partial_header_times_out() {
     assert!(closed_within(&mut s, Duration::from_secs(3)).await);
     let took = t.elapsed();
     assert!(took >= Duration::from_millis(250), "{took:?}");
-    assert_eq!(get(&server.stats, |s| &s.header_timeout), 1);
+    assert!(
+        counted(&server.stats, |s| &s.header_timeout, 1).await,
+        "header_timeout"
+    );
 }
 
 /// The connection cap: past it, a connection is closed as it is accepted.
@@ -428,7 +458,10 @@ async fn past_the_per_address_cap_a_connection_is_closed() {
     );
     assert!(!closed_within(&mut a, Duration::from_millis(200)).await);
     assert!(!closed_within(&mut c, Duration::from_millis(200)).await);
-    assert_eq!(get(&server.stats, |s| &s.over_address), 1);
+    assert!(
+        counted(&server.stats, |s| &s.over_address, 1).await,
+        "over_address"
+    );
 }
 
 /// A frame longer than 1500 bytes ends the connection.
@@ -440,7 +473,7 @@ async fn a_frame_over_the_cap_ends_the_connection() {
     b.extend_from_slice(&[0x80; 1501]);
     s.write_all(&b).await.expect("write");
     assert!(closed_within(&mut s, Duration::from_secs(2)).await);
-    assert_eq!(get(&server.stats, |s| &s.framing), 1);
+    assert!(counted(&server.stats, |s| &s.framing, 1).await, "framing");
     assert_eq!(get(&server.stats, |s| &s.frames_in), 0);
 }
 
@@ -461,7 +494,10 @@ async fn unanswered_and_idle_connections_close() {
     let t = tokio::time::Instant::now();
     assert!(closed_within(&mut s, Duration::from_secs(3)).await);
     assert!(t.elapsed() >= Duration::from_millis(250));
-    assert_eq!(get(&server.stats, |s| &s.handshake_timeout), 1);
+    assert!(
+        counted(&server.stats, |s| &s.handshake_timeout, 1).await,
+        "handshake_timeout"
+    );
 
     let mut phone = Phone::new(35, &server, None).await;
     phone.admit(&server, "event-whip-idle").await;
@@ -472,5 +508,71 @@ async fn unanswered_and_idle_connections_close() {
     phone.receive(Duration::from_millis(150)).await;
     assert_eq!(phone.p.stun_answers.len(), 1);
     assert!(closed_within(&mut phone.stream, Duration::from_secs(3)).await);
-    assert_eq!(get(&server.stats, |s| &s.idle_timeout), 1);
+    assert!(
+        counted(&server.stats, |s| &s.idle_timeout, 1).await,
+        "idle_timeout"
+    );
+}
+
+/// A3.4 over ICE-TCP: a panic in a session on a TCP tuple ends only that
+/// session; another, on its own connection to the same listener, keeps
+/// publishing with nothing marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_a_tcp_session_ends_only_that_session() {
+    let server = serve_tcp(None, Limits::default(), true).await;
+    let mut a = Phone::new(41, &server, None).await;
+    a.admit(&server, "event-tcp-panic-a").await;
+    a.connect().await;
+    let mut b = Phone::new(42, &server, None).await;
+    let b_location = b.admit(&server, "event-tcp-panic-b").await;
+    b.connect().await;
+    let b_stream = server
+        .app
+        .streams
+        .get("event-tcp-panic-b")
+        .expect("claimed");
+    for _ in 0..10 {
+        b.publish(1).await;
+        if b_stream.has_content() {
+            break;
+        }
+    }
+    assert!(b_stream.has_content(), "B is live over TCP");
+    let b_id = b_location
+        .rsplit('/')
+        .next()
+        .and_then(SessionId::parse)
+        .expect("B's id");
+    let b_counts = server
+        .whip
+        .resources()
+        .get(&b_id)
+        .map(|r| r.losses.clone())
+        .expect("B is live");
+    let b_task = tokio::spawn(async move {
+        b.publish(3).await;
+        b
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a.send(&[sapflow_whip::testing::PANIC_DATAGRAM.to_vec()])
+        .await;
+    let mut ended = false;
+    for _ in 0..100 {
+        if server.whip.ends.get("panicked") == 1 {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ended, "A ended as panicked: {:?}", server.whip.ends);
+    let after = b_stream.version();
+    let _b = b_task.await.expect("B published throughout");
+    assert!(b_stream.version() > after, "B's playlist kept growing");
+    let marks: u64 = b_counts
+        .fields()
+        .iter()
+        .filter(|(name, _)| *name != "reanchors")
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(marks, 0, "B lost nothing: {b_counts}");
 }

@@ -136,6 +136,8 @@ pub(crate) struct Stats {
     pub queue_full: AtomicU64,
     /// Packets for a connection that has closed.
     pub no_connection: AtomicU64,
+    /// Packets dropped because queueing them panicked (A3.4).
+    pub queue_panics: AtomicU64,
 }
 
 /// The listener, bound at start so a bad address stops the server.
@@ -221,7 +223,17 @@ impl Link {
                     tracing::debug!(target: "sapflow::whip", %error, "WHIP send failed");
                 }
             }
-            Transport::Tcp => self.queue(&t),
+            // A3.4: this runs in the UDP owner, so queueing is guarded as
+            // the owner's code for a session is: a panic drops the packet,
+            // never the owner.
+            Transport::Tcp => {
+                let queued =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.queue(&t)));
+                if queued.is_err() {
+                    self.stats.queue_panics.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(target: "sapflow::whip", "WHIP TCP queue panicked; packet dropped");
+                }
+            }
         }
     }
 

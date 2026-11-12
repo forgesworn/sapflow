@@ -102,6 +102,8 @@ the next three are required:
                            0 asks only when needed, maximum 60)
   SAPFLOW_WHIP_OPUS_MAX_BITRATE   Opus maxaveragebitrate offered (default 128000;
                            6000 to 510000)
+  SAPFLOW_WHIP_STALE       seconds without media after which a new POST takes a
+                           WHIP session's path over (default 2, 1 to 60)
 
 Publish with SRT, streamid=publish:live/<eventId>:<user>:<pass>, or RTMP,
 rtmp://<host>:1935/live with key <eventId>?user=<user>&pass=<pass>, or WHIP,
@@ -152,6 +154,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_WHIP_TRUSTED_PROXY",
     "SAPFLOW_WHIP_KEYFRAME_INTERVAL",
     "SAPFLOW_WHIP_OPUS_MAX_BITRATE",
+    "SAPFLOW_WHIP_STALE",
     "SAPFLOW_WHIP_TCP_ADDR",
     "SAPFLOW_WHIP_TCP_PROXY_PROTOCOL",
 ];
@@ -178,6 +181,8 @@ pub struct WhipConfig {
     pub trusted_proxy: Option<IpAddr>,
     pub keyframe_interval: Option<Duration>,
     pub opus_max_bitrate: u32,
+    /// Media silence after which a new `POST` may supersede a session.
+    pub stale: Duration,
 }
 
 impl WhipConfig {
@@ -321,7 +326,17 @@ impl WhipConfig {
                 .filter(|n| (6_000..=510_000).contains(n))
                 .ok_or_else(|| invalid("SAPFLOW_WHIP_OPUS_MAX_BITRATE: 6000 to 510000"))?,
         };
+        let stale = match vals.get("SAPFLOW_WHIP_STALE") {
+            None => Duration::from_secs(2),
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (1..=60).contains(n))
+                .map(Duration::from_secs)
+                .ok_or_else(|| invalid("SAPFLOW_WHIP_STALE: seconds, 1 to 60"))?,
+        };
         Ok(Some(Self {
+            stale,
             addr,
             public_url,
             udp_addr,
@@ -914,6 +929,7 @@ mod tests {
         assert_eq!(c.candidates.len(), 2);
         assert_eq!(c.keyframe_interval, Some(Duration::from_secs(2)));
         assert_eq!(c.opus_max_bitrate, 128_000);
+        assert_eq!(c.stale, Duration::from_secs(2));
         assert!(c.allow_origins.is_empty() && c.trusted_proxy.is_none());
         let c = load(
             &with(
@@ -925,6 +941,7 @@ mod tests {
                     ),
                     ("SAPFLOW_WHIP_TRUSTED_PROXY", Some("10.0.0.1")),
                     ("SAPFLOW_WHIP_KEYFRAME_INTERVAL", Some("0")),
+                    ("SAPFLOW_WHIP_STALE", Some("5")),
                     ("SAPFLOW_WHIP_OPUS_MAX_BITRATE", Some("64000")),
                 ],
             ),
@@ -939,6 +956,7 @@ mod tests {
         );
         assert_eq!(c.trusted_proxy, Some("10.0.0.1".parse().expect("ip")));
         assert_eq!((c.keyframe_interval, c.opus_max_bitrate), (None, 64_000));
+        assert_eq!(c.stale, Duration::from_secs(5));
         // A WHIP setting without the address is refused, not ignored.
         assert!(load(&[open, ("SAPFLOW_WHIP_UDP_ADDR", "0.0.0.0:8189")], &[]).is_err());
         for missing in [
@@ -1019,6 +1037,8 @@ mod tests {
             ("SAPFLOW_WHIP_TRUSTED_PROXY", "proxy.example"),
             ("SAPFLOW_WHIP_KEYFRAME_INTERVAL", "61"),
             ("SAPFLOW_WHIP_OPUS_MAX_BITRATE", "5999"),
+            ("SAPFLOW_WHIP_STALE", "0"),
+            ("SAPFLOW_WHIP_STALE", "61"),
         ] {
             assert!(
                 load(&with(&whip, &[(key, Some(bad))]), &[]).is_err(),

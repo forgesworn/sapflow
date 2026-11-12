@@ -173,6 +173,7 @@ pub fn bearer(authorization: Option<&str>) -> Option<&str> {
 /// The fuzz target's body, and the seed replay's: a head parsed from
 /// arbitrary bytes through every rule here, checking each answer.
 #[cfg(any(test, feature = "fuzzing"))]
+#[cfg_attr(not(test), allow(dead_code))] // The fuzz target includes this module directly.
 pub fn check(data: &[u8]) {
     let crate::http_lite::ParsedRequest::Complete(head, used) =
         crate::http_lite::parse_request(data)

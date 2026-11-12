@@ -205,7 +205,7 @@ if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 | `framing` | RFC 4571 `Decoder` and `encode`, 1500 bytes a frame |
 | `resource` | Bearer token split at the first colon, 128-bit session IDs, `/whip/session/<id>`, `Location` from an absolute public base URL, every refusal and its status (400, 401, 403, 409, 415, 422, 429, 503) |
 | `session` | `Session` |
-| `router` | `Router`: every session on one socket for the UDP owner. Binding requests go to the session their USERNAME names, everything else to the tuple's owner; a new check takes a tuple unless its owner has had fresh media from it within 2 s (`RouterConfig::media_hold`) or has not connected yet. Bounded by `RouterConfig::max_sessions` |
+| `router` | `Router`: every session on one socket for the UDP owner. Binding requests go to the session their USERNAME names, everything else to the tuple's owner; a new check takes a tuple unless its owner has had fresh media from it within 2 s (`RouterConfig::media_hold`) or has not connected yet. Bounded by `RouterConfig::max_sessions`. Every call into a session, and every read of one between calls (deadlines, a tuple owner's state, and a caller's reads through `Router::inspect`), runs under `catch_unwind`: a session that panics is dropped and ends with `EndReason::Panicked`, and the others go on |
 
 ## Bounds and defaults
 

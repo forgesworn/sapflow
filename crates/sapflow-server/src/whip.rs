@@ -178,12 +178,16 @@ pub(crate) struct LossCounts {
     /// Timeline re-anchors with no loss of their own: not a mark, counted
     /// beside the marks.
     pub reanchors: AtomicU64,
+    /// Panics that ended the session: in a call into it or a read of it,
+    /// in the UDP owner's code for it, or in its ingest task. Its ingest
+    /// task sets this before closing its queue, which tells the owner.
+    pub panics: AtomicU64,
     /// The last break the audio-only muxer reported, explained.
     pub muxer_break: Mutex<Option<String>>,
 }
 
 impl LossCounts {
-    fn fields(&self) -> [(&'static str, u64); 12] {
+    fn fields(&self) -> [(&'static str, u64); 13] {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         [
             ("lost_packets", g(&self.lost_packets)),
@@ -198,6 +202,7 @@ impl LossCounts {
             ("abnormal_ends", g(&self.abnormal_ends)),
             ("muxer", g(&self.muxer)),
             ("reanchors", g(&self.reanchors)),
+            ("panics", g(&self.panics)),
         ]
     }
 }
@@ -254,6 +259,9 @@ pub(crate) struct Feed {
     counts: Arc<LossCounts>,
     /// The audio timeline's counters as the current event was taken.
     timeline: Timeline,
+    /// Test builds only: whether its panic hook is on ([`injected`]).
+    #[cfg(test)]
+    panic_hooks: bool,
 }
 
 /// The ingest task has gone.
@@ -276,6 +284,8 @@ impl Feed {
             keyframe: false,
             counts: Arc::new(LossCounts::default()),
             timeline: Timeline::default(),
+            #[cfg(test)]
+            panic_hooks: false,
         }
     }
 
@@ -310,12 +320,31 @@ impl Feed {
                 IncompleteReason::TransportTimeout
             }
             EndReason::Dtls(_) | EndReason::KeysExhausted => IncompleteReason::Protocol,
+            // Its state was dropped mid-call.
+            EndReason::Panicked => {
+                self.counts.panics.fetch_add(1, Ordering::Relaxed);
+                IncompleteReason::IngestError
+            }
             // Never connected, so nothing was recorded; or an orderly end:
             // DELETE, our close, or the publisher's close_notify.
             EndReason::HandshakeTimeout | EndReason::Closed | EndReason::PeerClosed => return,
         };
         self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
         self.loss.mark_incomplete(cause);
+    }
+
+    /// The UDP owner's code for this session panicked: the recording is
+    /// marked, as for a session that panicked.
+    pub(crate) fn panicked(&self) {
+        self.counts.panics.fetch_add(1, Ordering::Relaxed);
+        self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
+        self.loss.mark_incomplete(IncompleteReason::IngestError);
+    }
+
+    /// Whether the ingest task panicked (it sets the count before closing
+    /// its queue).
+    pub(crate) fn ingest_panicked(&self) -> bool {
+        self.counts.panics.load(Ordering::SeqCst) > 0
     }
 
     /// Passes one receiver event on. Loss is marked on the recording here.
@@ -352,6 +381,8 @@ impl Feed {
 
     /// Queues one media item for the ingest task.
     pub(crate) fn push(&mut self, media: Media) -> Result<(), Gone> {
+        #[cfg(test)]
+        injected::feed(self.panic_hooks, &media);
         let item = match media {
             Media::Video { pts, au } => {
                 if self.skip_video && !au.idr {
@@ -548,7 +579,82 @@ enum Command {
     },
     Close {
         id: SessionId,
+        cause: CloseCause,
     },
+    /// Whether a session is live, and when it last took media.
+    Liveness {
+        id: SessionId,
+        reply: oneshot::Sender<Option<Liveness>>,
+    },
+}
+
+/// Why the server closed a session, for its end-reason count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseCause {
+    /// The publisher's `DELETE`.
+    Delete,
+    /// A new `POST` took the path over (A3.3).
+    Superseded,
+    /// Its ingest task ended: the media was refused, it went over the
+    /// bitrate cap, or another publisher took the stream.
+    IngestEnded,
+    /// The UDP owner's code for it, or its ingest task, panicked (A3.4).
+    Panicked,
+}
+
+/// What `Command::Liveness` tells the listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Liveness {
+    /// When the last authenticated RTP packet the receiver took as new
+    /// media arrived (`Session::last_media`); `None` before any.
+    pub last_media: Option<Instant>,
+}
+
+/// Every way a WHIP session ends, counted since start: the session's own
+/// reasons, and the server's when it closed one. Logged as each session
+/// ends; none carries an address.
+#[derive(Debug, Default)]
+pub(crate) struct EndCounts {
+    counts: Mutex<HashMap<&'static str, u64>>,
+}
+
+impl EndCounts {
+    fn add(&self, name: &'static str) -> u64 {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let n = counts.entry(name).or_insert(0);
+        *n += 1;
+        *n
+    }
+
+    /// The count for one reason.
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &str) -> u64 {
+        self.counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// An end reason's name for its count: the server's cause when it closed
+/// the session, else the session's own.
+fn end_name(reason: EndReason, cause: Option<CloseCause>) -> &'static str {
+    match (reason, cause) {
+        (EndReason::Closed, Some(CloseCause::Delete)) => "deleted",
+        (EndReason::Closed, Some(CloseCause::Superseded)) => "superseded",
+        (EndReason::Closed, Some(CloseCause::IngestEnded)) => "ingest-ended",
+        (EndReason::Closed, Some(CloseCause::Panicked)) => "panicked",
+        (EndReason::Closed, None) => "closed",
+        (EndReason::HandshakeTimeout, _) => "handshake-timeout",
+        (EndReason::ConsentExpired, _) => "consent-expired",
+        (EndReason::Dtls(_), _) => "dtls-failed",
+        (EndReason::PeerClosed, _) => "peer-closed",
+        (EndReason::MediaTimeout, _) => "media-timeout",
+        (EndReason::KeysExhausted, _) => "keys-exhausted",
+        (EndReason::Panicked, _) => "panicked",
+    }
 }
 
 /// A live session's resource, for `DELETE`.
@@ -565,13 +671,27 @@ struct Resource {
 pub(crate) struct Whip {
     config: WhipConfig,
     identity: Arc<Identity>,
+    /// What each session is made with.
+    session: SessionConfig,
     commands: mpsc::Sender<Command>,
     resources: Mutex<HashMap<SessionId, Resource>>,
+    /// The WHIP session publishing to each event, for supersede.
+    paths: Mutex<HashMap<String, SessionId>>,
+    /// How sessions have ended.
+    ends: EndCounts,
+    /// Test builds only: whether a test has turned the feed's and the
+    /// ingest's panic hooks on ([`injected`]). The server never does.
+    #[cfg(test)]
+    panic_hooks: std::sync::atomic::AtomicBool,
 }
 
 impl Whip {
     fn resources(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Resource>> {
         self.resources.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn paths(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionId>> {
+        self.paths.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -641,6 +761,18 @@ fn prepare(app: &App, identity: Arc<Identity>) -> std::io::Result<Option<Prepare
     let Some(config) = app.config.whip.clone() else {
         return Ok(None);
     };
+    let session = session_config(&config);
+    prepare_with(app, identity, config, session).map(Some)
+}
+
+/// As [`prepare`], with the session settings given: tests shorten the
+/// handshake deadline.
+fn prepare_with(
+    app: &App,
+    identity: Arc<Identity>,
+    config: WhipConfig,
+    session: SessionConfig,
+) -> std::io::Result<Prepared> {
     let router = Router::new(RouterConfig {
         max_sessions: app.config.max_publishers,
         ..RouterConfig::default()
@@ -650,10 +782,15 @@ fn prepare(app: &App, identity: Arc<Identity>) -> std::io::Result<Option<Prepare
     let whip = Arc::new(Whip {
         config,
         identity,
+        session,
         commands,
         resources: Mutex::new(HashMap::new()),
+        paths: Mutex::new(HashMap::new()),
+        ends: EndCounts::default(),
+        #[cfg(test)]
+        panic_hooks: std::sync::atomic::AtomicBool::new(false),
     });
-    Ok(Some((whip, router, rx)))
+    Ok((whip, router, rx))
 }
 
 async fn run(
@@ -670,7 +807,7 @@ async fn run(
     );
     let (tcp, tcp_listener) = whip_tcp::link(sockets.tcp);
     tokio::select! {
-        r = own_udp(sockets.udp, router, rx, tcp) => r,
+        r = own_udp(sockets.udp, router, rx, whip.clone(), tcp) => r,
         r = listen(sockets.http, app, whip) => r,
         r = tcp_listener => r,
     }
@@ -679,20 +816,46 @@ async fn run(
 /// The UDP owner: the socket, the router, and each session's feed. Frames
 /// from ICE-TCP connections come in through `tcp`, and sends to a TCP tuple
 /// go out through it (`whip_tcp.rs`).
+///
+/// # Panics (A3.4)
+///
+/// The router guards every call into a session and every read of one
+/// (`sapflow_whip::router`). The owner's own code for a session runs under
+/// `catch_unwind` too, a block at a time ([`contained`]): what it does with
+/// each of the session's events (its feed, and the reads it makes of the
+/// session for it) and its end. A panic there drops that feed, marks the
+/// recording, and closes the session, counted as `panicked`; the ingest
+/// task does the same for its own steps ([`ingest`]). Every datagram and
+/// ICE-TCP frame comes in through [`receive`], and every send to a TCP
+/// tuple is queued under the same guard ([`whip_tcp::Link::transmit`]).
+/// Left bare are the routing of each datagram (the router's) and
+/// saturating arithmetic.
 async fn own_udp(
     socket: UdpSocket,
     mut router: Router,
     mut commands: mpsc::Receiver<Command>,
+    whip: Arc<Whip>,
     mut tcp: whip_tcp::Link,
 ) -> std::io::Result<()> {
-    let mut feeds: HashMap<SessionId, Feed> = HashMap::new();
+    let mut owner = Owner {
+        whip,
+        feeds: HashMap::new(),
+        closing: HashMap::new(),
+    };
     // One datagram; the session takes at most 1500 bytes of it.
     let mut buf = vec![0u8; 65_536];
     let timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(timer);
     let mut armed = None;
     loop {
+        owner.flush(&socket, &tcp, &mut router).await;
+        let panics = router.stats().panics;
         let deadline = router.poll_timeout();
+        if router.stats().panics != panics {
+            // A session's deadline panicked and it was dropped: take its
+            // end before waiting.
+            continue;
+        }
         if deadline != armed {
             if let Some(d) = deadline {
                 timer.as_mut().reset(d.into());
@@ -703,7 +866,7 @@ async fn own_udp(
             r = socket.recv_from(&mut buf) => match r {
                 Ok((n, peer)) => {
                     if let Some(datagram) = buf.get(..n) {
-                        receive(&mut router, &mut feeds, Tuple::udp(peer), datagram);
+                        receive(&mut router, &mut owner.feeds, Tuple::udp(peer), datagram);
                     }
                 }
                 // As for SRT: one failed receive is not the end of WHIP, and
@@ -711,95 +874,221 @@ async fn own_udp(
                 Err(error) => tracing::debug!(%error, "WHIP receive failed"),
             },
             Some(frame) = tcp.recv() => {
-                receive(&mut router, &mut feeds, frame.tuple, &frame.bytes);
+                receive(&mut router, &mut owner.feeds, frame.tuple, &frame.bytes);
             }
             () = &mut timer, if armed.is_some() => {
                 armed = None;
                 router.handle_timeout(Instant::now());
             }
-            Some(command) = commands.recv() => match command {
-                Command::Register { id, session, feed, reply } => {
-                    let result = router.insert(id, *session);
-                    if result.is_ok() {
-                        feeds.insert(id, feed);
-                    }
-                    let _ = reply.send(result);
-                }
-                Command::Close { id } => {
-                    router.close(&id, Instant::now());
-                }
-            },
+            Some(command) = commands.recv() => owner.command(&mut router, command),
         }
         if router.poll_timeout().is_some_and(|d| d <= Instant::now()) {
             router.handle_timeout(Instant::now());
         }
-        while let Some(t) = router.poll_transmit() {
-            tcp.transmit(&socket, t).await;
-        }
-        let mut gone = Vec::new();
-        let mut keyframes = Vec::new();
-        while let Some((id, event)) = router.poll_event() {
-            match event {
-                Event::Media(e) => {
-                    let timeline = audio_timeline(&router, &id);
-                    if let Some(feed) = feeds.get_mut(&id) {
-                        if feed.offer_with(e, timeline).is_err() {
-                            gone.push(id);
-                        } else if feed.take_keyframe_request() {
-                            keyframes.push(id);
-                        }
-                    }
-                }
-                Event::MediaDropped { count } => {
-                    if let Some(feed) = feeds.get_mut(&id) {
-                        let _ = feed.push(Media::Loss {
-                            path: LossPath::Dropped,
-                            packets: count,
-                        });
-                    }
-                }
-                Event::Connected(profile) => {
-                    tracing::info!(?profile, "WHIP session connected");
-                }
-                Event::Ended(reason) => {
-                    // Dropping the feed ends the ingest task, which
-                    // releases the publication.
-                    // The ingest task may still add muxer reports after this.
-                    if let Some(mut f) = feeds.remove(&id) {
-                        f.ended(reason);
-                        let (lost, losses) = (f.lost(), f.counts());
-                        tracing::info!(?reason, lost, %losses, "WHIP session ended");
-                    }
-                }
-                Event::Nominated => {}
-            }
-        }
-        // Video waits for an IDR after a full queue: ask for one now rather
-        // than at the next keyframe interval.
-        for id in keyframes {
-            router.request_keyframe(&id, Instant::now());
+    }
+}
+
+/// What the UDP owner keeps beside the router.
+struct Owner {
+    whip: Arc<Whip>,
+    feeds: HashMap<SessionId, Feed>,
+    /// Why the server closed a session, until its end is counted.
+    closing: HashMap<SessionId, CloseCause>,
+}
+
+/// What one round of events calls for once they are all taken.
+#[derive(Default)]
+struct Steps {
+    /// Video waits for an IDR after a full queue: ask for one now rather
+    /// than at the next keyframe interval.
+    keyframes: Vec<SessionId>,
+    /// Their ingest task has gone.
+    gone: Vec<SessionId>,
+    /// The owner's code for them panicked.
+    panicked: Vec<SessionId>,
+}
+
+/// Runs the UDP owner's own code for one session under `catch_unwind`;
+/// `None` if it panicked.
+fn contained<R>(f: impl FnOnce() -> R) -> Option<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
+impl Owner {
+    /// Sends what the router queued and takes its events, then the closes
+    /// and keyframe requests they call for, until nothing is left.
+    async fn flush(&mut self, socket: &UdpSocket, tcp: &whip_tcp::Link, router: &mut Router) {
+        loop {
             while let Some(t) = router.poll_transmit() {
-                tcp.transmit(&socket, t).await;
+                tcp.transmit(socket, t).await;
+            }
+            let mut steps = Steps::default();
+            let mut any = false;
+            while let Some((id, event)) = router.poll_event() {
+                any = true;
+                self.event(router, &mut steps, id, event);
+            }
+            if !any {
+                return;
+            }
+            for id in steps.keyframes {
+                router.request_keyframe(&id, Instant::now());
+            }
+            for id in steps.panicked {
+                self.feed_panicked(router, id);
+            }
+            for id in steps.gone {
+                let cause = self.ingest_cause(&id, CloseCause::IngestEnded);
+                self.close(router, id, cause);
             }
         }
-        for id in gone {
-            router.close(&id, Instant::now());
-            feeds.remove(&id);
+    }
+
+    fn event(&mut self, router: &mut Router, steps: &mut Steps, id: SessionId, event: Event) {
+        let feeds = &mut self.feeds;
+        let handled = match event {
+            Event::Media(e) => contained(|| {
+                let timeline = audio_timeline(router, &id);
+                let Some(feed) = feeds.get_mut(&id) else {
+                    return;
+                };
+                if feed.offer_with(e, timeline).is_err() {
+                    steps.gone.push(id);
+                } else if feed.take_keyframe_request() {
+                    steps.keyframes.push(id);
+                }
+            }),
+            Event::MediaDropped { count } => contained(|| {
+                if let Some(feed) = feeds.get_mut(&id) {
+                    let _ = feed.push(Media::Loss {
+                        path: LossPath::Dropped,
+                        packets: count,
+                    });
+                }
+            }),
+            Event::Connected(profile) => {
+                tracing::info!(?profile, "WHIP session connected");
+                Some(())
+            }
+            Event::Ended(reason) => {
+                self.ended(id, reason);
+                Some(())
+            }
+            Event::Nominated => Some(()),
+        };
+        if handled.is_none() {
+            steps.panicked.push(id);
+        }
+    }
+
+    /// The session ended. Dropping its feed ends the ingest task, which
+    /// releases the publication; that task may still add muxer reports
+    /// after this.
+    fn ended(&mut self, id: SessionId, reason: EndReason) {
+        let name = end_name(reason, self.closing.remove(&id));
+        let count = self.whip.ends.add(name);
+        let Some(mut feed) = self.feeds.remove(&id) else {
+            // Its feed panicked and was dropped, marking the recording.
+            tracing::info!(reason = name, count, "WHIP session ended");
+            return;
+        };
+        let logged = contained(|| {
+            feed.ended(reason);
+            let (lost, losses) = (feed.lost(), feed.counts());
+            tracing::info!(reason = name, count, lost, %losses, "WHIP session ended");
+        });
+        if logged.is_none() {
+            // The session has gone already: mark its recording still.
+            let _ = contained(|| feed.panicked());
+            tracing::warn!(
+                reason = name,
+                count,
+                "WHIP session ended; its feed panicked"
+            );
+        }
+    }
+
+    /// The owner's code for a session panicked: its feed is dropped, since
+    /// its state is not trusted after that, its recording is marked, and
+    /// the session is closed, counted as `panicked`. Dropping the feed ends
+    /// the ingest task, which releases the publication (held for a
+    /// reconnect, if it had published).
+    fn feed_panicked(&mut self, router: &mut Router, id: SessionId) {
+        let Some(feed) = self.feeds.remove(&id) else {
+            return;
+        };
+        let _ = contained(|| feed.panicked());
+        tracing::warn!("WHIP feed panicked; closing its session");
+        self.close(router, id, CloseCause::Panicked);
+    }
+
+    /// `cause`, or `Panicked` if the session's ingest task panicked: it says
+    /// so through the feed's counts before its queue closes, so the end is
+    /// named for it whichever way the owner hears the task has gone.
+    fn ingest_cause(&self, id: &SessionId, cause: CloseCause) -> CloseCause {
+        if self.feeds.get(id).is_some_and(Feed::ingest_panicked) {
+            CloseCause::Panicked
+        } else {
+            cause
+        }
+    }
+
+    /// Closes a live session. The first cause names its end, except that a
+    /// panic always does.
+    fn close(&mut self, router: &mut Router, id: SessionId, cause: CloseCause) {
+        if router.session(&id).is_none() {
+            return;
+        }
+        let named = self.closing.entry(id).or_insert(cause);
+        if cause == CloseCause::Panicked {
+            *named = cause;
+        }
+        router.close(&id, Instant::now());
+    }
+
+    fn command(&mut self, router: &mut Router, command: Command) {
+        match command {
+            Command::Register {
+                id,
+                session,
+                feed,
+                reply,
+            } => {
+                let result = router.insert(id, *session);
+                if result.is_ok() {
+                    self.feeds.insert(id, feed);
+                }
+                let _ = reply.send(result);
+            }
+            Command::Close { id, cause } => {
+                let cause = self.ingest_cause(&id, cause);
+                self.close(router, id, cause);
+            }
+            Command::Liveness { id, reply } => {
+                let live = router.inspect(&id, |s| Liveness {
+                    last_media: s.last_media(),
+                });
+                let _ = reply.send(live);
+            }
         }
     }
 }
 
 /// The session's audio timeline counters now, or zeros.
-fn audio_timeline(router: &Router, id: &SessionId) -> Timeline {
+fn audio_timeline(router: &mut Router, id: &SessionId) -> Timeline {
     router
-        .session(id)
-        .and_then(|s| s.receiver().zip(s.stream(MediaKind::Audio)))
-        .and_then(|(rx, stream)| rx.stats(stream))
-        .map_or_else(Timeline::default, |st| Timeline {
-            held: st.timeline_held,
-            clamps: st.timeline_clamps,
-            discontinuities: st.timeline_discontinuities,
+        .inspect(id, |s| {
+            s.receiver()
+                .zip(s.stream(MediaKind::Audio))
+                .and_then(|(rx, stream)| rx.stats(stream))
+                .map(|st| Timeline {
+                    held: st.timeline_held,
+                    clamps: st.timeline_clamps,
+                    discontinuities: st.timeline_discontinuities,
+                })
         })
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Explains a break the audio-only muxer reported at `pts`, against the
@@ -825,7 +1114,9 @@ fn explain_break(prev: (u64, AudioTrace), pts: u64, trace: AudioTrace) -> String
 
 /// One datagram into the router. Only SRTP and SRTCP the session
 /// authenticated count against its publisher's bitrate cap, so bytes
-/// spoofed from its tuple cannot push it over.
+/// spoofed from its tuple cannot push it over. Every read of the session
+/// here is guarded ([`Router::inspect`]); a datagram or frame from any
+/// transport should come in through this.
 fn receive(
     router: &mut Router,
     feeds: &mut HashMap<SessionId, Feed>,
@@ -839,15 +1130,15 @@ fn receive(
     let before = matches!(classify(datagram), Kind::Rtp | Kind::Rtcp)
         .then(|| router.owner(&tuple))
         .flatten()
-        .and_then(|id| router.session(&id).map(|s| (id, authenticated(s))));
+        .and_then(|id| router.inspect(&id, authenticated).map(|n| (id, n)));
     router.handle_datagram(Instant::now(), tuple, datagram);
     if let Some((id, count)) = before
         && router
-            .session(&id)
-            .is_some_and(|s| authenticated(s) > count)
+            .inspect(&id, authenticated)
+            .is_some_and(|n| n > count)
         && let Some(feed) = feeds.get_mut(&id)
     {
-        feed.received += datagram.len();
+        feed.received = feed.received.saturating_add(datagram.len());
     }
 }
 
@@ -1068,7 +1359,11 @@ async fn delete(whip: &Arc<Whip>, id: &str, authorization: Option<&str>) -> Repl
     if !same(&token, &digest(bearer)) {
         return Reply::refused(resource::Refusal::Unauthorised.into());
     }
-    if whip.commands.send(Command::Close { id }).await.is_err() {
+    let close = Command::Close {
+        id,
+        cause: CloseCause::Delete,
+    };
+    if whip.commands.send(close).await.is_err() {
         return Reply::refused(resource::Refusal::Unavailable.into());
     }
     // Answer once the path is released, so a POST that follows at once is
@@ -1083,12 +1378,51 @@ async fn delete(whip: &Arc<Whip>, id: &str, authorization: Option<&str>) -> Repl
     }
 }
 
+/// A3.3, before the claim: a WHIP session of ours publishing to this
+/// event that has taken no media yet (it is still checking or
+/// handshaking), or none for `SAPFLOW_WHIP_STALE`, is closed as if it had
+/// left, and the claim waits for its publication's release, so it takes
+/// the stream over (held, if it had published) without waiting for
+/// consent to expire. One still taking media is left alone, and the claim
+/// refuses 409. An SRT or RTMP publisher is never closed here.
+async fn supersede(whip: &Arc<Whip>, event: &str) {
+    let Some(old) = whip.paths().get(event).copied() else {
+        return;
+    };
+    let (reply, live) = oneshot::channel();
+    let ask = Command::Liveness { id: old, reply };
+    if whip.commands.send(ask).await.is_err() {
+        return;
+    }
+    let Ok(Some(live)) = live.await else {
+        return;
+    };
+    let stalled = live
+        .last_media
+        .is_none_or(|t| t.elapsed() >= whip.config.stale);
+    if !stalled {
+        return;
+    }
+    let released = whip.resources().get(&old).map(|r| r.released.clone());
+    let close = Command::Close {
+        id: old,
+        cause: CloseCause::Superseded,
+    };
+    if whip.commands.send(close).await.is_err() {
+        return;
+    }
+    if let Some(mut released) = released {
+        let _ = tokio::time::timeout(RELEASE_TIMEOUT, released.wait_for(|r| *r)).await;
+    }
+}
+
 fn admission_refusal(r: Refusal) -> Refused {
     let r = match r {
         Refusal::Request(PublishError::BadPath | PublishError::BadRequest) => {
             return Refused::new(404, "no such stream path");
         }
         Refusal::Request(PublishError::Unauthorized) => resource::Refusal::Unauthorised,
+        Refusal::Forbidden => resource::Refusal::Forbidden,
         Refusal::AlreadyLive => resource::Refusal::Conflict,
         Refusal::Throttled => resource::Refusal::Throttled,
         Refusal::PublisherLimit | Refusal::PresentationLimit | Refusal::AuthUnavailable => {
@@ -1135,18 +1469,27 @@ async fn publish(
         pass: Some(token.password.to_owned()),
         connection_attempt_id: None,
     };
-    let publication = Publication::begin_authorised(app, &req, SourceKind::Es, ip)
+    let refused = |r: Refusal| {
+        app.log_refusal("webrtc", &r);
+        admission_refusal(r)
+    };
+    let event = req.path.event_id().to_owned();
+    let admitted = Publication::admit(app, &req, SourceKind::Es, ip)
         .await
-        .map_err(|r| {
-            app.log_refusal("webrtc", &r);
-            admission_refusal(r)
-        })?;
+        .map_err(refused)?;
+    supersede(whip, &event).await;
+    let publication =
+        Publication::claim_admitted(app, &req, SourceKind::Es, admitted).map_err(refused)?;
+    // From here a later POST for the path can find this session.
+    whip.paths().insert(event, id);
     let setup = Setup {
         video: negotiated.video.is_some(),
         audio: negotiated.audio.is_some(),
+        #[cfg(test)]
+        panic_hooks: whip.panic_hooks.load(Ordering::Relaxed),
     };
     let session = Session::new(
-        session_config(&whip.config),
+        whip.session.clone(),
         whip.identity.clone(),
         credentials,
         negotiated,
@@ -1158,6 +1501,11 @@ async fn publish(
     let (tx, rx) = mpsc::channel(QUEUE);
     let (released_tx, released) = watch::channel(false);
     let feed = Feed::new(tx, publication.loss_notice());
+    #[cfg(test)]
+    let feed = Feed {
+        panic_hooks: setup.panic_hooks,
+        ..feed
+    };
     let (queued, counts) = (feed.queued(), feed.counts());
     whip.resources().insert(
         id,
@@ -1202,6 +1550,10 @@ async fn publish(
 struct Setup {
     video: bool,
     audio: bool,
+    /// Test builds only: whether the ingest's panic hook is on
+    /// ([`injected`]).
+    #[cfg(test)]
+    panic_hooks: bool,
 }
 
 /// Configures the ingest for the negotiated tracks: stereo Opus (the
@@ -1261,6 +1613,12 @@ fn reanchor(source: &mut Source, setup: Setup, now: SystemTime) -> Result<Update
 
 /// One session's ingest: owns its publication, and releases it when the
 /// session ends or the media is refused.
+///
+/// A3.4: each step on the publication runs under `catch_unwind`. A panic
+/// (in the ingest, the muxer or the recorder) marks the recording, ends
+/// the publication as any end does (held for a reconnect, if it had
+/// published), and has the owner close the session, counted as
+/// `panicked`. The stream's locks shrug off the poisoning.
 async fn ingest(
     whip: Arc<Whip>,
     id: SessionId,
@@ -1269,49 +1627,142 @@ async fn ingest(
     released: watch::Sender<bool>,
     setup: Setup,
 ) {
-    if let Err(error) = publication.push(|source, now| configure(source, setup, now)) {
-        tracing::warn!(%error, "WHIP ingest setup refused");
-    } else {
-        let mut last_audio: Option<(u64, AudioTrace)> = None;
-        while let Some(item) = rx.recv().await {
-            queued.fetch_sub(item.size(), Ordering::AcqRel);
-            let received = item.received();
-            if let Err(error) = publication.received(received) {
-                tracing::warn!(%error, "dropping WHIP publisher");
-                break;
-            }
-            let audio = item.audio_trace();
-            let mut broke = false;
-            let pushed = publication.push(|source, now| {
-                let update = match item {
-                    Item::Reanchor => reanchor(source, setup, now)?,
-                    item => feed_item(source, item, now)?,
-                };
-                if update.media_loss {
-                    counts.muxer.fetch_add(1, Ordering::Relaxed);
-                    broke = true;
-                }
-                Ok(update)
-            });
-            if let Err(error) = pushed {
-                tracing::warn!(%error, "dropping WHIP publisher");
-                break;
-            }
-            if let Some((pts, trace)) = audio {
-                if broke && let Some(before) = last_audio {
-                    let detail = explain_break(before, pts, trace);
-                    tracing::debug!(%detail, "WHIP audio muxer reported a break");
-                    *counts.muxer_break.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail);
-                }
-                last_audio = Some((pts, trace));
-            }
+    let configured = contained(|| publication.push(|source, now| configure(source, setup, now)));
+    let panicked = match configured {
+        None => true,
+        Some(Err(error)) => {
+            tracing::warn!(%error, "WHIP ingest setup refused");
+            false
         }
+        Some(Ok(())) => {
+            let mut last_audio = None;
+            let mut panicked = false;
+            while let Some(item) = rx.recv().await {
+                let step = contained(|| {
+                    take(
+                        &mut publication,
+                        (&queued, &counts),
+                        setup,
+                        &mut last_audio,
+                        item,
+                    )
+                });
+                match step {
+                    Some(true) => {}
+                    Some(false) => break,
+                    None => {
+                        panicked = true;
+                        break;
+                    }
+                }
+            }
+            panicked
+        }
+    };
+    if panicked {
+        // Before the queue closes: the owner reads it from the feed.
+        counts.panics.fetch_add(1, Ordering::SeqCst);
+        counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
+        let loss = publication.loss_notice();
+        let _ = contained(|| loss.mark_incomplete(IncompleteReason::IngestError));
+        tracing::warn!("WHIP ingest panicked; ending its session");
     }
     rx.close();
-    publication.end();
+    let event = publication.stream.path.event_id().to_owned();
+    if contained(|| publication.end()).is_none() {
+        tracing::warn!("WHIP publication panicked as it ended");
+    }
     whip.resources().remove(&id);
-    let _ = whip.commands.send(Command::Close { id }).await;
+    {
+        let mut paths = whip.paths();
+        if paths.get(&event) == Some(&id) {
+            paths.remove(&event);
+        }
+    }
+    let cause = if panicked {
+        CloseCause::Panicked
+    } else {
+        CloseCause::IngestEnded
+    };
+    let _ = whip.commands.send(Command::Close { id, cause }).await;
     let _ = released.send(true);
+}
+
+/// One queued item into the publication. `false` drops the publisher.
+fn take(
+    publication: &mut Publication,
+    (queued, counts): (&AtomicUsize, &LossCounts),
+    setup: Setup,
+    last_audio: &mut Option<(u64, AudioTrace)>,
+    item: Item,
+) -> bool {
+    queued.fetch_sub(item.size(), Ordering::AcqRel);
+    if let Err(error) = publication.received(item.received()) {
+        tracing::warn!(%error, "dropping WHIP publisher");
+        return false;
+    }
+    let audio = item.audio_trace();
+    let mut broke = false;
+    let pushed = publication.push(|source, now| {
+        #[cfg(test)]
+        injected::ingest(setup, &item);
+        let update = match item {
+            Item::Reanchor => reanchor(source, setup, now)?,
+            item => feed_item(source, item, now)?,
+        };
+        if update.media_loss {
+            counts.muxer.fetch_add(1, Ordering::Relaxed);
+            broke = true;
+        }
+        Ok(update)
+    });
+    if let Err(error) = pushed {
+        tracing::warn!(%error, "dropping WHIP publisher");
+        return false;
+    }
+    if let Some((pts, trace)) = audio {
+        if broke && let Some(before) = *last_audio {
+            let detail = explain_break(before, pts, trace);
+            tracing::debug!(%detail, "WHIP audio muxer reported a break");
+            *counts.muxer_break.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail);
+        }
+        *last_audio = Some((pts, trace));
+    }
+    true
+}
+
+/// Test builds only: Opus payloads that make the UDP owner's feed, or the
+/// ingest inside the publication (with the stream's locks held), panic,
+/// for the A3.4 tests, once a test has turned the hooks on
+/// (`Whip::panic_hooks`, which sessions take as they are made). Each
+/// starts with a 20 ms stereo CELT TOC byte, so the receiver passes it on
+/// as audio; with the hooks off it is only audio.
+#[cfg(test)]
+pub(crate) mod injected {
+    use super::{Item, Media, Setup};
+
+    pub(crate) const FEED_PANIC: &[u8] = b"\xfcsapflow test: panic in the feed";
+    pub(crate) const INGEST_PANIC: &[u8] = b"\xfcsapflow test: panic in the ingest";
+
+    /// In the feed, before the item is made.
+    pub(super) fn feed(on: bool, media: &Media) {
+        if on
+            && let Media::Audio { packet, .. } = media
+            && packet.as_slice() == FEED_PANIC
+        {
+            panic!("a test asked this feed to panic");
+        }
+    }
+
+    /// In the ingest, inside the publication.
+    pub(super) fn ingest(setup: Setup, item: &Item) {
+        if setup.panic_hooks
+            && let Item::Audio { packet, .. } = item
+            && packet.as_slice() == INGEST_PANIC
+        {
+            panic!("a test asked this ingest to panic");
+        }
+    }
 }
 
 #[cfg(test)]

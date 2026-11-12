@@ -180,6 +180,7 @@ impl Front {
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
+#[cfg_attr(not(test), allow(dead_code))] // The fuzz target includes this module directly.
 /// What a whole stream came to: the frames, the publisher's address, and
 /// the close, if any.
 #[derive(Debug, PartialEq, Eq)]
@@ -190,6 +191,7 @@ pub struct Outcome {
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
+#[cfg_attr(not(test), allow(dead_code))] // The fuzz target includes this module directly.
 /// Runs `stream` through a front in pushes of the sizes `cuts` gives in
 /// turn (0 is taken as 1), stopping at the first close.
 pub fn run(mut front: Front, stream: &[u8], cuts: &[usize]) -> Outcome {
@@ -219,6 +221,7 @@ pub fn run(mut front: Front, stream: &[u8], cuts: &[usize]) -> Outcome {
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
+#[cfg_attr(not(test), allow(dead_code))] // The fuzz target includes this module directly.
 /// The `whip_tcp_front` fuzz target's body: `data`'s first bytes choose the
 /// mode and two ways of cutting the rest; both must give the same outcome,
 /// and that outcome must keep every rule in the module docs.

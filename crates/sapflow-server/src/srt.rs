@@ -50,7 +50,8 @@ impl Refused {
     pub fn status(self) -> u16 {
         match self {
             Self::Policy(Refusal::Request(PublishError::BadRequest)) => 400,
-            Self::Policy(Refusal::Request(PublishError::Unauthorized)) => 401,
+            // SRT answers the app's 403 as it always has: 401.
+            Self::Policy(Refusal::Request(PublishError::Unauthorized) | Refusal::Forbidden) => 401,
             Self::Policy(Refusal::Request(PublishError::BadPath)) => 404,
             Self::Policy(Refusal::AlreadyLive) => 409,
             // The app that authorises publishers did not answer usably.

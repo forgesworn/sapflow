@@ -274,6 +274,9 @@ pub enum EndReason {
     Closed,
     /// The SRTCP index for our key is spent (2^31 packets).
     KeysExhausted,
+    /// A call into the session panicked. Set by [`crate::router::Router`],
+    /// which drops the session: its state is not trusted after that.
+    Panicked,
 }
 
 /// Where a session stands.
@@ -455,6 +458,14 @@ pub struct Session {
     cname: Vec<u8>,
     stats: SessionStats,
     scratch: Vec<u8>,
+    /// Test builds only: whether a test has turned this session's panic
+    /// hooks on ([`Session::enable_panic_hooks`]). Off, they do nothing.
+    #[cfg(any(test, feature = "test-panic"))]
+    panic_hooks: bool,
+    /// Test builds only: the read a datagram from `testing::arm` has made
+    /// panic.
+    #[cfg(any(test, feature = "test-panic"))]
+    armed: Option<crate::testing::Read>,
 }
 
 impl fmt::Debug for Session {
@@ -560,7 +571,22 @@ impl Session {
             cname,
             stats: SessionStats::default(),
             scratch: Vec::with_capacity(1500),
+            #[cfg(any(test, feature = "test-panic"))]
+            panic_hooks: false,
+            #[cfg(any(test, feature = "test-panic"))]
+            armed: None,
         })
+    }
+
+    /// Test builds only: turns this session's panic hooks on
+    /// ([`crate::testing::PANIC_DATAGRAM`], [`crate::testing::arm`]). The
+    /// `test-panic` feature compiles the hooks in, and a build of the
+    /// server's test targets unifies it into every build made with them;
+    /// until a test calls this (or [`crate::router::Router::enable_panic_hooks`]),
+    /// the hooks do nothing. The server never calls it.
+    #[cfg(any(test, feature = "test-panic"))]
+    pub fn enable_panic_hooks(&mut self) {
+        self.panic_hooks = true;
     }
 
     /// Where the session stands.
@@ -606,6 +632,8 @@ impl Session {
     /// owner uses it to keep a tuple with the session it is delivering
     /// media to ([`crate::router`]).
     pub fn media_from(&self, tuple: &Tuple) -> Option<Instant> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::MediaFrom);
         self.ice.media_from(tuple)
     }
 
@@ -613,6 +641,8 @@ impl Session {
     /// new media arrived (not a duplicate, padding or probe), for
     /// superseding a stalled session (`SAPFLOW_WHIP_STALE`).
     pub fn last_media(&self) -> Option<Instant> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::LastMedia);
         self.last_media
     }
 
@@ -644,11 +674,15 @@ impl Session {
 
     /// The receiver, once connected, for its per-stream counters.
     pub fn receiver(&self) -> Option<&Receiver> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::Receiver);
         self.media.as_ref().map(|m| &m.rx)
     }
 
     /// Counters.
     pub fn stats(&self) -> SessionStats {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::Stats);
         let mut s = self.stats;
         s.ice = self.ice.stats();
         s.dtls = self.dtls.stats();
@@ -677,8 +711,18 @@ impl Session {
         })
     }
 
+    /// Test builds only: panics if `read` is the one armed.
+    #[cfg(any(test, feature = "test-panic"))]
+    fn trip(&self, read: crate::testing::Read) {
+        if self.panic_hooks && self.armed == Some(read) {
+            crate::testing::injected_panic();
+        }
+    }
+
     /// When [`Session::handle_timeout`] should next be called.
     pub fn poll_timeout(&self) -> Option<Instant> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::PollTimeout);
         if matches!(self.state, State::Ended(_)) {
             return None;
         }
@@ -746,6 +790,20 @@ impl Session {
 
     /// One datagram (or RFC 4571 frame) from `tuple`.
     pub fn handle_datagram(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
+        // Test builds only, never the fuzz targets', and only once a test
+        // has turned the hooks on: a datagram that makes this call panic,
+        // or arms a read to, for the router's and the server's panic
+        // isolation tests.
+        #[cfg(any(test, feature = "test-panic"))]
+        if self.panic_hooks {
+            if bytes == crate::testing::PANIC_DATAGRAM {
+                crate::testing::injected_panic();
+            }
+            if let Some(read) = crate::testing::armed(bytes) {
+                self.armed = Some(read);
+                return;
+            }
+        }
         if matches!(self.state, State::Ended(_)) {
             self.stats.after_end += 1;
             return;
