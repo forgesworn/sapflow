@@ -367,8 +367,9 @@ bodies.
   - exposed header `Location`.
 
   Any other origin gets no CORS headers.
-- The offer is at most 16 KiB. The headers and body share the absolute
-  deadlines the control API already uses.
+- The offer is at most 16 KiB. The head and the offer must both be in
+  within 5 s of the connection; a request still arriving then gets `408`
+  (W3c part 2b).
 - Refusals, each with a short plain-text reason:
   - `415`: the content type is missing or not `application/sdp`.
   - `400`: the SDP does not parse.
@@ -377,8 +378,12 @@ bodies.
   - `409`: the path is live with another publisher, is not held for a
     reconnect, and is not a stalled WHIP session (see [Reconnects](#reconnects)).
   - `422`: a well-formed offer outside the profile, for example no H.264.
-  - `429`: throttled.
-  - `503`: the app did not answer usably, or a resource cap is reached.
+  - `429`: throttled. The failed-attempt throttle (10 failed attempts a
+    minute per address) is checked straight after the head, before the
+    offer is read, parsed or answered (W3c part 2b).
+  - `503`: the app did not answer usably, or a resource cap is reached:
+    among them, 8 sessions not yet connected in all, or 4 from the
+    publisher's address (W3c part 2b).
 - A session that has not completed ICE and DTLS within 10 s of its `201` is
   removed. It never accepted media, so its path is simply released: no
   callback is sent and nothing is held (see [Reconnects](#reconnects)).
@@ -1163,7 +1168,11 @@ There is no ICE restart in v1.
   under `panic = "unwind"`), and the session is then dropped. This is an
   acceptance check, not a hope.
 - Every cap is a stated setting with a refusal path:
-  - pending (not yet connected) sessions in total and per address;
+  - pending (not yet connected) sessions in total (8) and per publisher
+    address (4);
+  - signalling connections in total (32) and per peer address (8, the
+    trusted proxy excepted), and 5 s from the connection for the whole
+    request;
   - offer size;
   - packet size (1500 bytes for UDP, 1500 per RFC 4571 frame);
   - reorder buffer packets and bytes per stream;
@@ -1636,7 +1645,8 @@ Implementation notes (W3c part 1, 11 November 2026):
   elementary-stream source (`EsIngest`, stereo Opus as answered), so the
   stream is packaged and recorded by the same code as SRT's and RTMP's. A
   full queue marks the recording, asks the publisher for a keyframe at
-  once, and makes video wait for the next IDR. Only SRTP and SRTCP that
+  once, and makes video wait for the next IDR. (Since part 2b the owner's
+  marks travel in that queue, in order; see below.) Only SRTP and SRTCP that
   the session authenticated count against the bitrate cap, so bytes
   spoofed from a publisher's tuple cannot push it over. Health and publish
   callbacks go through the same `Publication`, untested for WHIP. A failed
@@ -1806,9 +1816,10 @@ Implementation notes (W3c part 2a, lifecycle):
   published. Every other session goes on. Three layers each run under
   `catch_unwind` (`panic = "unwind"`):
   - **The router.** It guards every call into a session, and every read
-    of one it makes between calls: each session's deadline in
-    `poll_timeout` and `handle_timeout`, and the tuple owner's state when
-    another session's check arrives from its tuple. A session whose call
+    of one it makes: each session's deadline, read as each of its calls
+    ends for the deadline index (part 2b; before it, in `poll_timeout`
+    and `handle_timeout`), and the tuple owner's state when another
+    session's check arrives from its tuple. A session whose call
     or read panics is dropped with its queued output, its ufrag and its
     tuples, and ends with `EndReason::Panicked`. The UDP owner reads
     sessions through `Router::inspect`, under the same guard.
@@ -1903,38 +1914,115 @@ Implementation notes (W3c part 2a, lifecycle):
 | End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
 | `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
-- **Left to W3c part 2b.**
-  - The throttle as a WHIP refusal path of its own, and pending-session
-    caps, in total and per address.
-  - A3.7's bounds and the packet-capture tests, as invariants on the
-    router and session harness.
-  - The UDP owner scans every session for due timers on each datagram
-    (`Router::poll_timeout` and `Router::handle_timeout`); a deadline
-    index would make that cost independent of the session count.
-  - Slow signalling clients: 32 of them can hold every slot for about
-    20 s each (5 s for the head, then 10 s and the drain), and a body
-    that arrives too slowly gets 503 rather than 408.
+- **Left to W3c part 2b.** Done in part 2b, below, apart from what it
+  leaves open.
+
+Implementation notes (W3c part 2b, limits, 12 November 2026):
+
+- **The signalling listener.** It holds at most 32 connections, and at
+  most 8 from one peer address, so a few addresses cannot hold every
+  slot. The trusted proxy is not limited, since every publisher behind
+  it shares its address. Past either, a connection is closed as it
+  arrives. The head and the offer share one deadline, 5 s from the
+  connection, so a slow client holds a slot for 5 s and then the time to
+  send its answer; before, the head had 5 s and then the offer,
+  admission and setup another 10 s, and a late offer got `503`. Now it
+  gets `408`. The listener counts what it refuses, with no addresses.
+- **The throttle** is its own refusal path. The failed-attempt throttle
+  (10 failed attempts a minute per address, shared with SRT and RTMP) is
+  checked straight after the head: a throttled address gets `429`
+  before its offer is read, parsed or answered, whatever it sends.
+  Admission still counts each failure.
+- **Pending sessions.** At most 8 sessions that have not connected (ICE
+  and DTLS) at once, and 4 from one publisher address (the
+  `X-Forwarded-For` address behind the trusted proxy). A `POST` past
+  either gets `503`. The place is taken after admission and supersede,
+  which may free one, and before the claim; a session gives it back when
+  it connects or ends. The two are half and a quarter of the default 16
+  publishers; neither is a setting, and neither follows
+  `SAPFLOW_MAX_PUBLISHERS`, which still caps sessions in all.
+- **The deadline index.** The router read every session's deadline for
+  each datagram, to find the next one and what was due. A session's
+  deadline changes only in its own calls, so the router now reads it as
+  each call ends, under the same guard as the call, and keys the session
+  by it in a sorted set. Finding the next deadline and what is due reads
+  no session. `Router::poll_timeout` takes `&self` again.
+- **Recording marks in order.** The UDP owner marked the recording at
+  once for receiver loss, a full queue, an abnormal end and a feed
+  panic, so a mark meant for the file a queued item was about to start
+  (a codec epoch change, #77) landed on the one before it, and the new
+  file finished complete. The marks now travel in the ingest queue
+  (`Item::Marks`), and the ingest applies each to the recording current
+  when it reaches it. A mark that finds no room waits in the feed and
+  goes ahead of the next item that fits. Any the feed still holds when
+  it goes are applied after the rest of the queue. Marks the ingest
+  raises itself (over the rate cap, a refused push, a panic) were in
+  order already.
+- **Accept errors.** RTMP and the scoped control API ended on a failed
+  accept, as WHIP did before part 1. Every tokio listener now takes
+  connections through `accept::next`, which logs the error and tries
+  again after 100 ms.
+- **The log-capture flake.** The publish-auth log test sometimes missed
+  its line with the server's tests running in parallel. Its subscriber
+  was the thread's own (`set_default`); while that is the only
+  dispatcher, tracing-core 0.1 caches a callsite's interest from
+  whichever thread reaches it first, and another test's thread, with no
+  subscriber, caches "never". Captures now go through one process-wide
+  subscriber, installed once, that writes only for threads holding one
+  (`log_capture`).
+- **`SAPFLOW_SEGMENT_COUNT`** in `--help` now says the playlist keeps
+  more while that many segments would last under three target
+  durations: up to 256 entries, with at most 64 MiB of media past the
+  count.
+- **A3.7 as invariants.** The session harness sends checks that fail
+  MESSAGE-INTEGRITY and holds that a tuple never validated gets nothing
+  for an unauthenticated datagram, and that a check re-sent from another
+  tuple while its ID is remembered draws nothing. A new router harness
+  and fuzz target (`whip_router`) runs two publishers' sessions in one
+  router with four strangers sending raw bytes, corrupted checks and
+  copies, and holds: every tuple at most four times what it sent, across
+  sessions; nothing to a stranger that has sent only its own bytes; the
+  deadline index exact; every owned tuple's owner live; a closed session
+  gone. Over real UDP, a fresh address sending unauthenticated STUN,
+  DTLS, RTP and random bytes, and a copy of a live check, draws nothing.
+  This is the packet-capture claim held in process, not a capture of the
+  wire.
+- **Checked by mutation.** With each change undone in turn, its test
+  fails: the per-address and slow-offer checks, the throttle's place,
+  the pending caps, a scanning `poll_timeout` (other sessions' deadline
+  reads went from 40 to 2040), and, in ICE, answering a copied check or
+  one that fails MESSAGE-INTEGRITY.
+
+| Claim | Test | Status |
+|---|---|---|
+| RTMP and the control API go on after an accept error | `rtmp::tests::an_accept_error_does_not_end_the_listener`, `publish_control::tests::an_accept_error_does_not_end_the_listener` | Met in process (an injected accept failure, not a real one) |
+| A test's log capture sees its thread's events whatever other threads reach first | `log_capture::tests::a_callsite_another_thread_reached_first_is_still_captured`; `publish_auth::tests::neither_the_password_nor_the_url_reaches_logs_or_refusals` | Met; the probe failed in 3 of 3 runs alone before the change |
+| A3.7: past 32 signalling connections one is closed at once; one address holds at most 8 | `whip::tests::past_the_signalling_connection_cap_a_connection_is_closed`, `whip::tests::one_address_holds_at_most_its_share_of_the_signalling_slots` | Met in process (caps set small) |
+| A request still arriving 5 s after the connection gets `408` | `whip::tests::an_offer_that_arrives_too_slowly_gets_408` | Met in process (1 s) |
+| A throttled address gets `429` before its offer is read or parsed | `whip::tests::a_throttled_address_is_refused_before_its_offer_is_read` | Met in process |
+| A3.7: pending sessions are capped in all and per publisher address; one that connects or ends gives its place back | `whip::tests::pending_sessions_are_capped_in_total_and_per_address`, `whip::tests::a_connected_session_no_longer_counts_as_pending` | Met in process (caps set small) |
+| Finding the next deadline and what is due reads no session | `router::tests::media_to_one_session_reads_no_other_sessions_deadline`, `router::tests::the_deadline_index_follows_every_session`, and the index checked after every step of the router tests and the router harness | Met |
+| A mark raised behind a queued item that rolls the recording lands on the new file; one with no room at the end still lands | `whip::tests::a_mark_raised_behind_a_queued_roll_lands_on_the_new_recording`, `whip::tests::a_mark_with_no_room_at_the_end_still_reaches_the_recording` | Met in process |
+| A3.7: unauthenticated STUN, DTLS and random datagrams from a fresh address draw nothing | `whip::tests::a_fresh_address_draws_nothing` (real UDP), the session and router harnesses (`fuzzing::tests::unauthenticated_checks_draw_nothing`, `router_scripts_hold_the_invariants`) | Met in process; no packet capture |
+| A3.7: a captured check re-sent from a fresh address draws nothing once its original has arrived, while its ID is remembered | `whip::tests::a_fresh_address_draws_nothing`; the session harness's oracle, over its seeds and mutations | Met in process |
+| A3.7: any mix of re-sent checks and copied SRTP from an address draws at most four times what it sent | the session harness (per tuple) and the router harness (per tuple, across sessions) | Met in the harnesses and the fuzz targets |
+| A3.7: a session with no completed handshake is gone 10 s after its `201`; one without consent checks 30 s after the last | `tests::handshake_deadline`, `tests::consent_expires_30_s_after_the_last_check` (sapflow-whip); `whip::tests::a_handshake_timeout_releases_with_no_callback` (server, 1 s) | Met in process |
+| A3.7: each cap in [Concurrency and resource bounds](#concurrency-and-resource-bounds) refuses at its limit | Mapped here: signalling and pending caps (above), ICE-TCP's (`whip::tcp_tests`), the offer size (`whip_request::tests::routes_and_methods`, 413), RFC 4571 frame size (`framing::tests::too_long_frame_ends_the_stream`, `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`), the router's session cap (`router::tests::insert_refuses_past_the_cap_and_duplicates`), the receiver's event queue (`sapflow-rtp`'s `the_event_queue_is_bounded`), the H.264 depacketiser's buffers (`buffers_never_pass_their_bounds`), DTLS flight faults (`sapflow-dtls`'s `client_flight_faults_are_refused`) | Partial: the reorder buffer, the start hold, RTCP size, queued feedback, transport-cc and DTLS message size are bounded in their crates but not mapped to a refusal test here |
+
+- **Left open after W3c part 2b.**
+  - The packet-capture form of A3.7, on the wire.
+  - The bounds the table above leaves unmapped.
   - The end-to-end privacy check (`scripts/whip-e2e.js`) does not look for
     127.0.0.1 on its own, since the server's listeners log it; it checks
     the publisher's address with its port. A run from a non-loopback
     address would check the address alone.
-  - `rtmp.rs` and `publish_control.rs` still end on an accept error, as
-    `whip.rs` did; they need the same fix.
-  - `publish_auth::tests::neither_the_password_nor_the_url_reaches_logs_or_refusals`
-    sometimes misses its log line when the server's tests run in
-    parallel (3 times in about 95 runs of the whole test binary on a
-    loaded host), probably because its subscriber is thread-local
-    (`set_default`). It predates W3c.
   - WHIP's recording marks are reported under the SRT- and RTMP-named
     callback codes (`srt-unrecovered-loss` is not used, but
     `srt-ingest-queue-full`, `srt-timeout` and `rtmp-protocol-error` are,
     beside `media-loss`). The codes are part of the v4v contract, so they
     stay as they are until the v4v integration.
-  - `SAPFLOW_SEGMENT_COUNT`: since the live-window fix in `sapflow-hls`
-    (#71), the playlist keeps at least three target durations and can
-    hold more than the count (up to 256 entries, or 64 MiB of media
-    beyond it); `--help` and any server doc that states the count as
-    exact should say so.
+  - A cap on how often a publisher may change codec epoch, which belongs
+    to the muxer.
   - A muted video section draws a PLI every second: `sapflow-rtp` asks
     again every `keyframe_retry` while it waits for an IDR. That case has
     no test yet. The per-tuple bound holds whatever happens, since a send
