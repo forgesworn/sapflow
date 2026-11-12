@@ -423,8 +423,12 @@ contract unchanged in shape:
   existing throttle (10 failed attempts a minute per address) applies. It
   counts each address in full, an IPv6 address to its /128, and is shared
   with SRT and RTMP, so an IPv6 host with a /64 can spread failed
-  attempts over many addresses. It is left as it is; WHIP's own
-  per-address caps count an IPv6 address by its /64.
+  attempts over many addresses. It is left as it is. WHIP's signalling
+  and pending caps count an IPv6 address by its /64; ICE-TCP's
+  per-address connection cap still counts the full address. Every
+  link-local peer (`fe80::/64`) shares one signalling and one pending
+  bucket, as the publishers on one NAT'd venue LAN share an IPv4
+  address.
 
 ## Connectivity
 
@@ -1088,8 +1092,11 @@ resolution either, so that is not proof that it prevents one.
 
 ### Which recording a loss marks
 
-One rule: a loss is marked on the recording that would have held the
-lost media.
+The rule is: a loss is marked on the recording current at the loss's
+place in stream order. That is usually the recording that would have held
+the lost media, but not always: near a cut, an audio loss stamped in the
+old epoch but reported after the cut's keyframe was queued lands on the new
+file.
 
 - **Transport losses**: receiver loss, a full ingest queue, an abnormal
   end, and a panic in the UDP owner's code for the session. The recording
@@ -1105,8 +1112,11 @@ lost media.
   codec epoch change) is the new file's, and one reported before it is
   the old file's.
 - **Media the muxer drops after a cut**, such as late audio stamped in
-  the old epoch and dropped once the recording has rolled, belongs to the
-  file its timestamp falls in.
+  the old epoch and dropped once the recording has rolled, marks the
+  recording current when the drop is reported, which is the new file. The
+  old file has already been replaced at the roll, so nothing marks it.
+  Marking the file the dropped media's timestamp falls in is left to the
+  muxer interrupt work.
 - **Marks the ingest raises itself** (over the bitrate cap, a refused
   push, an ingest panic) are in stream order already.
 - Where one ingest batch both rolls the recording and finds loss, with no
@@ -2075,6 +2085,13 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
     stay as they are until the v4v integration.
   - A cap on how often a publisher may change codec epoch, which belongs
     to the muxer.
+  - Marks cost queue room. Each mark is one ingest queue item (it carries no
+    bytes, and while the queue is full the held marks collapse to one per
+    reason), so continuous Opus loss-fill adds an item a packet. While the
+    ingest frees about one slot per push under saturation, each freed slot
+    goes to a mark and the media is refused, so a saturated session drops
+    more media while the queue drains, then resumes with it empty. That loss
+    is counted and marked.
   - A muted video section draws a PLI every second: `sapflow-rtp` asks
     again every `keyframe_retry` while it waits for an IDR. That case has
     no test yet. The per-tuple bound holds whatever happens, since a send
