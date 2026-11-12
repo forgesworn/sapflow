@@ -85,7 +85,14 @@ Notes for the release after 0.2.0-rc.1.
   include the stall's hole before the discontinuity. A recording's length
   (`segmentDuration` and the file's header) now comes from its parts' own
   timestamps (`fmp4::rebase_part_for_file_timed`), not their spans, which
-  over-reported a file by a clamped stall's hole at such a break.
+  over-reported a file by a clamped stall's hole at such a break. Parts
+  are held one part target past their three target durations after their
+  tag leaves, since one call can seal more media after the muxer stamps
+  the removal (an interrupt's short final part of audio). The first
+  segment whose part tags the playlist lists never goes back, so a part
+  tag once removed is never listed again (RFC 8216bis 6.2.1), even where
+  the edge steps back at such a run end; `RetentionCheck` now fails on a
+  tag listed again.
 
 ## sapflow
 

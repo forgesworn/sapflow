@@ -509,7 +509,8 @@ pub fn multivariant(m: &Muxer) -> String {
 /// ([`Muxer::with_retention_pool`]); without one, media leaves with the
 /// window and this check fails wherever the window is short.
 ///
-/// A part whose tag a render stops listing must be served by
+/// A part whose tag a render stops listing must not be listed again, and
+/// must be served by
 /// [`Muxer::part`] until the published media is three target durations
 /// further on, and a segment that has left the window must be served by
 /// [`Muxer::segment`] until its Availability Duration has passed, unless
@@ -582,6 +583,11 @@ impl RetentionCheck {
         for &id in &listed {
             if !matches!(m.part(id), crate::PartLookup::Found(_)) {
                 return Err(format!("part {id} listed but not served"));
+            }
+            // RFC 8216bis 6.2.1 lets a server remove a part tag, never add it
+            // back; its retention runs from the first removal.
+            if self.removed.contains_key(&id) {
+                return Err(format!("part {id} listed again after its tag left"));
             }
         }
         for &id in self.listed.difference(&listed) {

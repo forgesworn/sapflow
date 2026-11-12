@@ -1184,9 +1184,19 @@ Left open:
   several calls. Parts are now held a part target past the three target
   durations, which covers one call; a batch with more than a part
   target's media after the stamp still gives a client less. A batch is
-  normally one frame (WHIP) or one SRT datagram's worth. A tag listed
-  again (a run that ended with its media gave back a clamped part's hole)
-  has its stamp cleared, to be taken again when it leaves.
+  normally one frame (WHIP) or one SRT datagram's worth.
+- While a clamped stall's part is open, the edge counts the hole in its
+  span, so older part tags can leave the playlist; when the run then ends
+  with its media, the edge steps back by the hole. RFC 8216bis 6.2.1
+  (draft 22) lets a server only "Remove EXT-X-PART tags no longer at the
+  live edge", never add them back, so the first parent whose part tags
+  are listed never goes back (`Muxer::part_tags_from`): a parent whose
+  tags have left stays out, and the stamp taken when they left stays
+  valid (on the stepped-back clock retention only runs longer).
+  `RetentionCheck` fails on a part tag listed again, and
+  `part_tags_removed_before_a_run_end_are_never_listed_again` sweeps
+  stalls of 50 to 900 ms before a 1.5 s break: on the muxer before this,
+  128 of its 288 cases listed the first segment's parts again.
 - A cut's own losses (the held frame, or audio past the part and segment
   limits at a reconnect-style cut) are still in the new run's
   `media_loss`, and the server still marks both files for them, as for

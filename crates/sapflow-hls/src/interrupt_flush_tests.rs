@@ -536,6 +536,61 @@ fn a_break_after_a_clamped_stall_ends_the_segment_with_its_media() {
     assert_eq!(resumed, None, "no hole in output time: {spans:?}");
 }
 
+/// A short stall clamped into an open part, then a break: while the open
+/// part's span counts the stall's hole, older part tags leave the playlist;
+/// the run then ends with its media and the edge steps back by the hole.
+/// The tags must not be listed again (RFC 8216bis 6.2.1), and each part
+/// must stay served three target durations after its tag first left.
+/// Rendered after every push, across stall lengths (up to the break gap)
+/// and positions.
+#[test]
+fn part_tags_removed_before_a_run_end_are_never_listed_again() {
+    use crate::muxer::tests::{aac, video};
+    let mut failures = Vec::new();
+    for stall_ms in (50..=900).step_by(50) {
+        for at in 186..202 {
+            let pool = Arc::new(sapflow_core::fragment::FragmentQuota::new(
+                crate::muxer::RETENTION_POOL_BYTES,
+            ));
+            let mut m =
+                Muxer::new(MuxerConfig::default(), video(), Some(aac())).with_retention_pool(pool);
+            let mut retention = playlist::RetentionCheck::default();
+            let mut audio = 0i64;
+            let mut dts = 0i64;
+            let mut result = Ok(());
+            for i in 0..300i64 {
+                while audio <= dts {
+                    m.push_audio(audio, Bytes::from_static(b"aac"))
+                        .expect("audio");
+                    audio += 1920;
+                    result = result.and_then(|()| retention.check(&m));
+                }
+                m.push_video(dts, dts, i % 30 == 0, Bytes::from(vec![0u8; 100]), NOW)
+                    .expect("video");
+                result = result.and_then(|()| retention.check(&m));
+                dts += 3000;
+                if i == at {
+                    dts += stall_ms * 90;
+                } else if i == at + 1 {
+                    // A break: the frame before it is dropped and the run
+                    // ends with its media.
+                    dts += 135_000;
+                    audio = dts;
+                }
+            }
+            if let Err(e) = result {
+                failures.push(format!("{stall_ms} ms at {at}: {e}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 288: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+}
+
 /// A timestamp at the edge of `i64` after an interrupt rebases without
 /// overflowing.
 #[test]

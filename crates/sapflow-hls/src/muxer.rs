@@ -535,6 +535,12 @@ pub struct Muxer {
     late_lost: Vec<u64>,
     /// Late audio frames dropped, ever.
     late_dropped: u64,
+    /// The media sequence number from which renders list part tags. It
+    /// never goes back, so a part tag a render removed is never listed
+    /// again (RFC 8216bis 6.2.1), even when the edge steps back at a run
+    /// that ended with its media after a clamped part. Atomic because the
+    /// renders that move it read the muxer.
+    part_tags_floor: std::sync::atomic::AtomicU64,
     /// Test bookkeeping: the segments a run end closed, since the last
     /// [`Muxer::take_run_ends`].
     #[cfg(any(test, feature = "testing"))]
@@ -773,6 +779,7 @@ impl Muxer {
             late_audio: None,
             late_lost: Vec::new(),
             late_dropped: 0,
+            part_tags_floor: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             run_ends: Vec::new(),
             cut_end: None,
@@ -831,6 +838,7 @@ impl Muxer {
             late_audio,
             late_lost,
             late_dropped,
+            part_tags_floor,
             run_ends: _,
             cut_end,
             placed_audio,
@@ -964,7 +972,7 @@ impl Muxer {
              {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
              {presented_end:?} {audio_floor} {discontinuity_next} \
              {discontinuity_sequence} {breaks} {hold_gap} {window_byte_capped} \
-             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_lost:?} {late_dropped} \
+             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_lost:?} {late_dropped} {part_tags_floor:?} \
              {cut_end:?} {placed_audio:?}",
             init.id,
             init.data.len(),
@@ -2922,7 +2930,9 @@ impl Muxer {
     /// lies within three target durations of the published edge
     /// (inclusive), counting published open-part spans, decode-time gaps
     /// included. The playlist and part retention both use this.
+    /// Never before an entry whose tags an earlier render left out.
     pub(crate) fn part_tags_from(&self) -> usize {
+        use std::sync::atomic::Ordering;
         let window = self.part_window();
         let mut age = self
             .open_parts()
@@ -2936,7 +2946,12 @@ impl Muxer {
             from = i;
             age = age.saturating_add(entry.duration());
         }
-        from
+        let msn = (self.media_sequence + from as u64).max(
+            self.part_tags_floor
+                .fetch_max(self.media_sequence + from as u64, Ordering::Relaxed),
+        );
+        usize::try_from(msn - self.media_sequence)
+            .map_or(self.entries.len(), |from| from.min(self.entries.len()))
     }
 
     /// RFC 8216bis 6.2.2 (drafts 19 and 22): "Clients MUST be able to
@@ -2959,15 +2974,10 @@ impl Muxer {
         let edge = self.edge();
         let listed_from = self.media_sequence + self.part_tags_from() as u64;
         for t in &mut self.tagged {
-            if t.msn < listed_from {
-                t.left.get_or_insert(edge);
-            } else if !t.parts_freed {
-                // Listed again: a run that ended with its media after a
-                // clamped part gave back the hole the open parts' spans had
-                // counted, so a stamp taken while they did (before the run
-                // ended, inside the same call) is not when the tags left.
-                t.left = None;
+            if t.msn >= listed_from {
+                break;
             }
+            t.left.get_or_insert(edge);
         }
         self.keep_in_pool();
         // A stamp is taken as a part is sealed, and one call can seal
