@@ -37,8 +37,9 @@ pub async fn listen(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
 
 async fn serve(app: Arc<App>, listener: impl crate::accept::Accept) -> std::io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (sock, peer) = crate::accept::next(&listener, "RTMP").await;
+        let (sock, peer) = crate::accept::next(&listener, "RTMP", &mut warnings).await;
         // Connections, not publishers: a flood of idle sockets is bounded
         // by SETUP and this cap.
         if active.load(Ordering::Relaxed) >= app.config.max_publishers * 4 {

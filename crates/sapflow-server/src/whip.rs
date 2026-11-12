@@ -1341,8 +1341,9 @@ async fn listen(listener: TcpListener, app: Arc<App>, whip: Arc<Whip>) -> std::i
     let limits = whip.limits;
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let addresses = Addresses::default();
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (socket, peer) = crate::accept::next(&listener, "WHIP").await;
+        let (socket, peer) = crate::accept::next(&listener, "WHIP", &mut warnings).await;
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             whip.signalling.over_total.fetch_add(1, Ordering::Relaxed);
             continue;

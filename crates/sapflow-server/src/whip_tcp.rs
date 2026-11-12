@@ -320,8 +320,9 @@ async fn listen(listener: TcpListener, shared: Arc<Shared>) -> std::io::Result<(
         tracing::info!(tcp = %addr, proxy_protocol = shared.proxy.is_some(), "WHIP ICE-TCP listening");
     }
     let slots = Arc::new(Semaphore::new(shared.limits.connections));
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (socket, peer) = crate::accept::next(&listener, "WHIP ICE-TCP").await;
+        let (socket, peer) = crate::accept::next(&listener, "WHIP ICE-TCP", &mut warnings).await;
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             shared.stats.over_total.fetch_add(1, Ordering::Relaxed);
             continue;
