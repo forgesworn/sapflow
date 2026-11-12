@@ -13,6 +13,12 @@ alignment, source offset and lateness; every cost run) are in
 `a42-runs.tsv` and `a42-summary.tsv` (the driver's own summary, low to high
 per cell).
 
+**Later the same day:** see the second round,
+[whip-qualification-2-2026-11-12.md](whip-qualification-2-2026-11-12.md).
+A3.8 was met once the owner raised the start hold to 4 s. A3.9 passed in
+CI. The owner accepted A4.2's memory cost, and its CPU was measured again in
+a Linux container. The results below are as they stood before that.
+
 ## Summary
 
 | Gate | Result | Status |

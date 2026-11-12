@@ -31,7 +31,7 @@ The owner's written decisions of 12 November 2026, as given:
 | A3.8 sync, 4 s start hold | Chrome 157: 20 of 20 runs within (UDP and ICE-TCP 10 each), audio -0.6 to +17.5 ms against the video, every run aligned by sender reports. FFmpeg: 10 of 10 at 0 to 0.5 ms, aligned at once | **Met** |
 | A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%. A decision point: the default `SAPFLOW_WHIP_JITTER` (200 ms) and the NACK schedule |
 | A4.2 memory | accepted by the owner in writing (decision 4) | Accepted |
-| A4.2 CPU, Linux container | Run under way | Pending |
+| A4.2 CPU, Linux container | 27 of 27 runs under the load gate, none skipped. WHIP's CPU per stream against SRT's: 0.74 to 0.84 at 1 stream, 0.83 to 0.96 at 50, and at 10 streams 0.75 and 0.83 with one round at 1.11. WHIP was below SRT in 8 of 9 rounds | **Met** at 1 and 50 streams by the rule. At 10 the rounds disagree (one of three above), so the call there is the owner's |
 
 ## Host and versions
 
@@ -393,8 +393,121 @@ changed for it; see What is left open.
 
 ## A4.2 CPU in a Linux container
 
-Run under way; this section is filled when it ends.
+### Method
+
+The same driver and rule as the first round's A4.2 (`scripts/whip-cost.py`,
+benchmarks.md section B), now inside a Linux container on the test host.
+`scripts/whip-cost-linux.sh` builds it:
+
+- **Sapflow.** Built for Linux inside the container (Rust 1.94.1 on Debian
+  bookworm, `cargo build --locked --release -p sapflow`) from this branch
+  after merging main (`b5a130a`). The build went into a scratch target
+  directory of its own, since a Linux build cannot share the host's.
+- **Tools.** FFmpeg is the pinned FFmpeg-Builds n8.1.3 static build for
+  arm64, checked by its SHA-256 (`a08c0ee6...fcb525`), since Debian's has
+  no WHIP muxer. srt-live-transmit 1.5.1 and procps come from Debian.
+- **Container.** The repository is mounted read-only, and the container
+  is removed when the run ends. Docker Desktop's VM gives 16 CPUs and
+  16 GB, running Linux 6.12.
+- **CPU time.** The driver now reads it from `/proc/<pid>/stat`, in clock
+  ticks, because procps prints CPU time in whole seconds.
+- **Load gate.** It is the container's own one-minute load average, below
+  8. The macOS host's own load was 21.6 at the start and 7.9 at the end,
+  from other sessions.
+
+The Docker lock was taken over as the owner directed: the stale lock went
+to the Trash, and a new one named this session.
+
+```sh
+scripts/whip-cost-linux.sh <scratch> --streams 1,10,50 --rounds 3 --gate-wait 600
+```
+
+**The rule, unchanged.** For each N, in each round where both runs are
+results, take the WHIP/SRT ratio of CPU per stream. WHIP passes at that N
+if every ratio is at most 1, and fails if every ratio is above 1.
+Otherwise the rounds disagree, and the call is the owner's.
+
+### Results
+
+Three rounds, 12:15 to 12:52 UTC. All 27 runs were results. Only one waited
+for the gate (25 s), and no round was skipped. The container's load
+averages were 1.1 to 7.8 at the start of each run.
+
+| Protocol | Streams | Server CPU, % of a core (three rounds) | CPU per stream, % | Peak RSS, MB | RSS per stream, MB | Publishers' CPU, % |
+|---|---|---|---|---|---|---|
+| SRT | 1 | 2.33, 1.82, 1.26 | 1.26 to 2.33 | 13.4 to 13.8 | 13.4 to 13.8 | 2.7 to 5.1 |
+| RTMP | 1 | 1.37, 0.93, 0.82 | 0.82 to 1.37 | 13.3 to 13.6 | 13.3 to 13.6 | 0.7 to 1.3 |
+| WHIP | 1 | 1.86, 1.35, 1.06 | 1.06 to 1.86 | 13.5 to 13.9 | 13.5 to 13.9 | 1.8 to 3.2 |
+| SRT | 10 | 11.85, 8.63, 8.97 | 0.86 to 1.19 | 124.7 to 135.4 | 12.5 to 13.5 | 22.8 to 30.8 |
+| RTMP | 10 | 7.21, 5.99, 5.64 | 0.56 to 0.72 | 121.4 to 138.1 | 12.1 to 13.8 | 6.4 to 7.5 |
+| WHIP | 10 | 13.18, 6.50, 7.41 | 0.65 to 1.32 | 118.8 to 126.5 | 11.9 to 12.7 | 14.3 to 27.5 |
+| SRT | 50 | 31.59, 33.84, 32.06 | 0.63 to 0.68 | 618 to 717 | 12.4 to 14.3 | 88.7 to 99.1 |
+| RTMP | 50 | 30.30, 23.28, 27.12 | 0.47 to 0.61 | 667 to 736 | 13.3 to 14.7 | 24.8 to 30.7 |
+| WHIP | 50 | 26.13, 30.93, 30.73 | 0.52 to 0.62 | 531 to 573 | 10.6 to 11.5 | 64.2 to 78.6 |
+
+| Streams | Round | WHIP/SRT CPU | WHIP/SRT RSS | WHIP/RTMP CPU |
+|---|---|---|---|---|
+| 1 | 1 | 0.80 | 0.98 | 1.36 |
+| 1 | 2 | 0.74 | 1.04 | 1.45 |
+| 1 | 3 | 0.84 | 1.00 | 1.30 |
+| 10 | 1 | **1.11** | 0.92 | 1.83 |
+| 10 | 2 | 0.75 | 0.93 | 1.09 |
+| 10 | 3 | 0.83 | 0.95 | 1.31 |
+| 50 | 1 | 0.83 | 0.93 | 0.86 |
+| 50 | 2 | 0.91 | 0.74 | 1.33 |
+| 50 | 3 | 0.96 | 0.81 | 1.13 |
+
+**Verdict.** By the rule, WHIP's CPU is no higher than SRT's at 1 stream
+and at 50. At 10 the rounds disagree: two at 0.75 and 0.83, and one at 1.11,
+where WHIP's own CPU per stream (1.32%) was twice its other two rounds'.
+That call is the owner's. WHIP was below SRT in 8 of the 9 rounds, and
+above RTMP in 8 of 9.
+
+The container's spread is much smaller than the macOS host's. SRT at 50
+streams was 31.6 to 33.8% here, against 17.2 to 31.4% in the first round.
+On Linux, WHIP's memory per stream was at or below SRT's in 8 of 9 rounds,
+not above as on macOS; the owner has accepted it either way.
 
 ## What is left open
 
-Filled when the A4.2 run ends.
+- **A4.1's decision.** At its 200 ms wait, WHIP leaves more frames
+  unrecovered than SRT at 5% loss. The default `SAPFLOW_WHIP_JITTER` and
+  the NACK schedule (how many attempts, how soon) are the owner's to
+  choose. The wait is compiled in (`SAPFLOW_WHIP_JITTER` is not a setting
+  yet), so no other value was measured.
+- **A stream that never goes live.** Under loss that is not repaired, video
+  skips from a loss to the next keyframe. Sapflow's muxer then logs
+  "timestamps broke before the first segment was complete; starting over"
+  and can keep starting over, so the stream is never ready and nothing is
+  recorded. Seen with FFmpeg's WHIP muxer at 5% and 10% loss, with OBS at
+  5% (10 s keyframes, PLI ignored), and with Chrome at a very low rate on
+  a noise source. Not investigated; it belongs with the muxer and the
+  timeline's re-anchoring.
+- **WHIP audio is not repaired.** Browsers offer no NACK for Opus, so loss
+  is filled with silence: 84 Opus packets at 5% in one run. Opus in-band
+  FEC is negotiated, but Sapflow does not decode, so it cannot use it.
+- **The hold's margin.** 3 of 20 Chrome runs were aligned by reports only
+  at the 4 s hold's end, so a slower Chrome would fall back to arrival
+  time. Other browsers' report timing is not known. OBS and FFmpeg were
+  aligned by reports in every run.
+- **FFmpeg's WHIP muxer** does not retransmit. In a clean run it lost the
+  first GOP (32 frames): one incomplete frame at the start, then 29
+  skipped to the next keyframe. Why that frame was incomplete was not
+  looked into.
+- **A3.10's scope.** One OBS version, x264 only, and one level of each
+  stimulus (25% claimed loss, REMB at 500 kbit/s) on loopback. Hardware
+  encoders and OBS's own dynamic bitrate setting were not tried.
+- **A4.2 at 10 streams** is the owner's call (above). The macOS figures
+  from the first round stand beside these.
+- **Docker, left on the test host.** The images pulled or built for this
+  work were removed: `rust:1.94.1-slim-bookworm`,
+  `sapflow-cost-linux:local`, and `ubuntu:24.04` from the first round. The
+  amd64 variant of `debian:bookworm-slim` pulled in the first round is
+  still there. That tag predates this work, and removing one variant needs
+  `--force`, which acts on every image that refers to it. The lock this
+  session took went to the Trash at the end.
+- **The VM was shared.** When the A4.2 run ended, another session's
+  containers were running in the same Docker VM. Whether they overlapped
+  the measurement windows is not known. The container's load gate was below
+  8 at the start of every run, and its load was at most 11.8 at the end of
+  one.
