@@ -148,9 +148,10 @@ async fn run(config: Config) -> std::io::Result<()> {
         recording_limits: Arc::new(recorder::RecordingLimits::new(config.max_publishers)),
         publish_sessions,
         callbacks: Callbacks::start(config.callback_url.clone(), config.callback_secret.clone()),
-        streams: Arc::new(Registry::with_limits(
+        streams: Arc::new(Registry::with_budgets(
             config.max_presentations,
             config.max_fragment_bytes,
+            config.max_retained_bytes,
         )),
         refusal_log: std::sync::Mutex::new(sapflow_core::limits::LogLimiter::new(
             20,
