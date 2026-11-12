@@ -340,6 +340,7 @@ fn init(
     Bytes::from(init_buffer(video, audio, duration_ms))
 }
 
+#[cfg(test)]
 pub(crate) fn init_with_quota(
     video: Option<&H264Config>,
     audio: Option<&AudioConfig>,
@@ -347,6 +348,19 @@ pub(crate) fn init_with_quota(
     quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
 ) -> Result<Bytes, sapflow_core::fragment::FragmentLimit> {
     crate::fragment::retain(init_buffer(video, audio, duration_ms), quota)
+}
+
+/// Builds an init, as `init_with_quota` does, with its allocation's charge.
+pub(crate) fn init_charged(
+    video: Option<&H264Config>,
+    audio: Option<&AudioConfig>,
+    duration_ms: Option<u64>,
+    quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
+) -> Result<
+    (Bytes, Option<std::sync::Arc<crate::fragment::Charge>>),
+    sapflow_core::fragment::FragmentLimit,
+> {
+    crate::fragment::retain_charged(init_buffer(video, audio, duration_ms), quota)
 }
 
 fn init_buffer(
@@ -652,12 +666,25 @@ fn encode_part_inner(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn encode_part_with_quota(
     sequence_number: u32,
     runs: &[TrackRun<'_>],
     quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
 ) -> Result<Bytes, sapflow_core::fragment::FragmentLimit> {
-    crate::fragment::retain(
+    encode_part_charged(sequence_number, runs, quota).map(|(bytes, _)| bytes)
+}
+
+/// Encodes a part, as `encode_part_with_quota` does, with its allocation's charge.
+pub(crate) fn encode_part_charged(
+    sequence_number: u32,
+    runs: &[TrackRun<'_>],
+    quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
+) -> Result<
+    (Bytes, Option<std::sync::Arc<crate::fragment::Charge>>),
+    sapflow_core::fragment::FragmentLimit,
+> {
+    crate::fragment::retain_charged(
         encode_part_buffer(sequence_number, runs, false, None),
         quota,
     )

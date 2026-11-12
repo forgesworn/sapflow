@@ -471,8 +471,11 @@ pub fn multivariant(m: &Muxer) -> String {
 /// Playlist distributed by the server containing that segment".
 ///
 /// Time is the published media: every `EXTINF` the window has listed, once
-/// each, plus the open parts' spans. A segment first appears at the end of
-/// its own `EXTINF`; a playlist's duration is its `EXTINF` total. Call
+/// each, plus the open parts' spans. That is the muxer's own clock, read
+/// from what it lists, so this check is not independent of how the muxer
+/// measures time; a test should also measure on its input timestamps, as
+/// `part_retention_tests` does. A segment first appears at the end of its
+/// own `EXTINF`; a playlist's duration is its `EXTINF` total. Call
 /// [`RetentionCheck::check`] after every push, so that no entry joins and
 /// leaves the window between calls.
 ///

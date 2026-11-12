@@ -269,6 +269,29 @@ fn opus_video_led() -> Case {
     }
 }
 
+/// Steady AAC-only, 48 kHz, for 60 s: segments of 47 frames, 1.0027 s.
+fn aac_steady(name: &'static str, segment_count: usize) -> Case {
+    let cfg = MuxerConfig {
+        segment_count,
+        ..MuxerConfig::default()
+    };
+    let config = AacConfig::from_audio_specific_config(&[0x11, 0x88]).expect("AAC");
+    let mut m = Muxer::audio_only(cfg, config).expect("AAC");
+    let mut retention = Retention::default();
+    let mut pts = 0;
+    while pts < 60 * 90_000 {
+        m.push_audio_at(pts, Bytes::from_static(&[1, 2]), NOW)
+            .expect("AAC");
+        pts += 1920;
+        retention.observe(&m, pts);
+    }
+    Case {
+        name,
+        target: m.target_duration(),
+        retention,
+    }
+}
+
 /// AAC-only at the default window, the publisher reconnecting every
 /// `every` frames.
 fn aac_reconnects(name: &'static str, every: i64) -> Case {
@@ -369,11 +392,14 @@ fn epochs() -> Case {
     }
 }
 
-fn cases() -> [Case; 9] {
+fn cases() -> [Case; 12] {
     [
         steady("steady, segment_count 7", 7),
         steady("steady, segment_count 12", 12),
         steady("steady, segment_count 24", 24),
+        aac_steady("AAC steady, segment_count 7", 7),
+        aac_steady("AAC steady, segment_count 12", 12),
+        aac_steady("AAC steady, segment_count 24", 24),
         aac_reconnects("AAC, reconnect every 10 frames", 10),
         aac_reconnects("AAC, reconnect every 20 frames", 20),
         epochs(),
@@ -587,10 +613,10 @@ fn kept_segments_stop_at_their_count_cap() {
 
 /// A fragment budget that holds the window but not three more target
 /// durations of parts, and the segments' Availability Durations, past it:
-/// what is kept gives way to new media, which is never refused, and each
-/// part and segment that went early is counted.
+/// what is kept is charged to the retention pool, not this budget, so it
+/// neither refuses new media nor has to go early.
 #[test]
-fn kept_parts_and_segments_give_way_under_the_fragment_budget() {
+fn kept_parts_and_segments_stay_under_a_tight_fragment_budget() {
     let cfg = MuxerConfig {
         segment_count: 7,
         ..MuxerConfig::default()
@@ -613,10 +639,10 @@ fn kept_parts_and_segments_give_way_under_the_fragment_budget() {
             .check(&m)
             .expect("a part or segment goes early only when counted");
     }
-    assert!(m.parts_released_early() > 0, "the budget was reached");
-    assert!(
-        m.segments_released_early() > 0,
-        "kept segments gave way too"
+    assert_eq!(
+        (m.parts_released_early(), m.segments_released_early()),
+        (0, 0)
     );
+    assert!(kept_past_the_window(&m).parts > 0);
     assert!(quota.used() <= 6 << 20);
 }

@@ -43,6 +43,9 @@ mod live_window_tests;
 mod part_retention_tests;
 
 #[cfg(test)]
+mod budget_retention_tests;
+
+#[cfg(test)]
 mod terminal_ts_tests;
 
 #[cfg(test)]
