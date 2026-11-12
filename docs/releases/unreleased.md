@@ -147,14 +147,6 @@ Notes for the release after 0.2.0-rc.1.
   `SAPFLOW_TEST_WHIP_FEEDBACK` make WHIP sessions claim loss in their
   receiver reports or send REMB, for A3.10. Not for production use.
 
-## sapflow-srt
-
-- `receiver::Stats` gains `reordered`: packets reported missing that then
-  arrived as originals, not retransmissions (counted correctly only when
-  the caller sets the retransmission flag, as libsrt does). `Stats` is not
-  `#[non_exhaustive]`, so code that builds one with a struct literal needs
-  `..Default::default()`.
-
 ## sapflow-dtls
 
 - A connected server now refuses every renegotiation with one warning-level
@@ -199,3 +191,11 @@ Notes for the release after 0.2.0-rc.1.
   server's end log line now carries the DTLS error for a `dtls-failed`
   end.
 - The public API changes only by the addition of `Server::refused`.
+
+## sapflow-srt
+
+- `receiver::Stats` gains `reordered`: packets reported missing that then
+  arrived as originals, not retransmissions (counted correctly only when
+  the caller sets the retransmission flag, as libsrt does). `Stats` is not
+  `#[non_exhaustive]`, so code that builds one with a struct literal needs
+  `..Default::default()`.
