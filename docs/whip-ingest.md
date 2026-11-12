@@ -857,11 +857,43 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
 
 ### Format changes
 
-A sender may change resolution mid-stream under CPU or bandwidth pressure. A
-new SPS then reaches `EsIngest` as it would from an RTMP encoder, and starts a
-new initialisation epoch (`restarted`) on the retained muxer. Pages that
-publish from a browser should hold resolution and let frame rate drop instead
-(`degradationPreference: "maintain-resolution"` where supported).
+A sender may change resolution mid-stream under CPU or bandwidth pressure,
+and a browser often starts low and ramps up (Chrome 157 went from 480x270 to
+640x360 a few seconds in). A new SPS or PPS reaches `EsIngest` as an RTMP
+sequence header or an SRT encoder's in-band sets do, and the same rule
+applies to all three:
+
+- At the next IDR whose parameter sets differ from the current epoch's (byte
+  for byte, ignoring trailing zero bytes), the ingest starts a new codec
+  epoch on the same muxer: a new init segment with the new avcC, after an
+  `EXT-X-DISCONTINUITY` and a new `EXT-X-MAP`, with `TARGETDURATION` and
+  `PART-TARGET` unchanged and the timeline carried straight on. The update
+  says `restarted`, so the recording rolls to a new file there.
+- A PPS change alone starts an epoch too, since samples carry no parameter
+  sets of their own. Sets repeated unchanged at every IDR start nothing. A
+  changed SPS that does not parse keeps the current epoch, and is logged once.
+- Before the recording rolls, the old file takes its epoch's last parts,
+  which the change sealed.
+
+Before this, the first init stayed while frames of the new size were
+written under it, so players failed to decode them (hls.js stalled after a
+few frames) and the recording, though marked complete, did not decode past
+the change.
+
+Left open:
+
+- At the change the muxer drops its pending video frame and pending audio
+  (in the fixture test, 1 video frame and 3 AAC frames of 60 and 96), as it
+  does at any interrupt, and the recording is not marked for it.
+- hls.js 1.7.1 stalled 0.42 to 0.51 s at the boundary in the end-to-end runs.
+  Once, in the diagnosis, it stalled about 7 s on a 0.37 s buffer hole
+  before stepping over it; that was not seen again.
+
+Pages that publish from a browser should still hold resolution and let frame
+rate drop (`degradationPreference: "maintain-resolution"` where supported):
+an epoch change costs viewers a discontinuity. In one run with it set,
+Chrome held 640x360 throughout, but a run without it did not change
+resolution either, so that is not proof that it prevents one.
 
 ### Loss
 

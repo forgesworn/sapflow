@@ -169,9 +169,10 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   (`Muxer::interrupt`), and the new connection's first keyframe, from
   whatever clock it brings, carries output time straight on after an
   `EXT-X-DISCONTINUITY`. Its parameter sets and AAC config must match the
-  stream's: the init segment is fixed. If they do not (a new resolution),
-  the stream starts afresh in place under new chunk names, and a new
-  recording begins. v4v still hears `unpublish` at the drop (its stage
+  stream's. If they do not (a new resolution), the stream carries on in a
+  new codec epoch, with a new init segment after a discontinuity, and a new
+  recording begins. An encoder that changes resolution without
+  reconnecting gets the same at its next keyframe. v4v still hears `unpublish` at the drop (its stage
   reads "reconnecting") and `publish` on the return; `recordSegmentComplete`
   comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
   equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. An encoder that
