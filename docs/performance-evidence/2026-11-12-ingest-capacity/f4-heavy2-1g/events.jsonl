@@ -1,0 +1,6 @@
+{"e": "start", "name": "event-cap-rtmp-0", "proto": "rtmp", "t": 0.0}
+{"e": "start", "name": "event-cap-rtmp-1", "proto": "rtmp", "t": 5.51}
+{"e": "ready", "name": "event-cap-rtmp-0", "after": 10.02, "t": 10.02}
+{"e": "ready", "name": "event-cap-rtmp-1", "after": 7.01, "t": 13.17}
+{"e": "exit", "name": "event-cap-rtmp-0", "code": 224, "t": 109.01}
+{"e": "exit", "name": "event-cap-rtmp-1", "code": 224, "t": 109.51}

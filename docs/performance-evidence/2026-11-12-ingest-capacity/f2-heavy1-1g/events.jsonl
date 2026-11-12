@@ -1,0 +1,2 @@
+{"e": "start", "name": "event-cap-rtmp-0", "proto": "rtmp", "t": 0.0}
+{"e": "ready", "name": "event-cap-rtmp-0", "after": 8.03, "t": 8.03}

@@ -1,0 +1,58 @@
+{
+ "label": "f1-heavy1-ref",
+ "env": {
+  "SAPFLOW_OPEN_PUBLISH": "1",
+  "SAPFLOW_SRT_ADDR": "0.0.0.0:8890",
+  "SAPFLOW_RTMP_ADDR": "0.0.0.0:1935",
+  "SAPFLOW_HTTP_ADDR": "0.0.0.0:8888",
+  "SAPFLOW_SEGMENT_COUNT": "24",
+  "SAPFLOW_RECONNECT_GRACE": "90",
+  "SAPFLOW_RECORDINGS": "/recordings",
+  "SAPFLOW_HLS_MODE": "whole",
+  "SAPFLOW_SRT_ENCRYPTION": "optional",
+  "SAPFLOW_SRT_PBKEYLEN": "32",
+  "SAPFLOW_HEALTH_INTERVAL": "0",
+  "RUST_LOG": "info"
+ },
+ "mem": "384m",
+ "cpus": "1",
+ "server_state": "exited true 137 0",
+ "peak_mib": 384.1,
+ "max_cur_mib": 383.8,
+ "max_anon_mib": 377.8,
+ "oom_kill": 0,
+ "recordings": [
+  "1",
+  "375"
+ ],
+ "udp_rcvbuf_err": 0,
+ "nr_throttled": 0,
+ "throttled_ms": 0,
+ "pub": {
+  "profile": "heavy",
+  "srt": 0,
+  "rtmp": 1,
+  "step": 5.0,
+  "hold": 300.0,
+  "clip": {
+   "format": {
+    "duration": "600.021333",
+    "bit_rate": "20684250"
+   }
+  },
+  "started": 1,
+  "ready": 1,
+  "exited_early": [
+   [
+    "event-cap-rtmp-0",
+    155.6
+   ]
+  ],
+  "advancing": 0,
+  "ready_s": [
+   8.02
+  ]
+ },
+ "load": "{ 6.54 11.35 16.45 }",
+ "bin": "main 88e5979 (before)"
+}

@@ -1707,6 +1707,96 @@ run on it. Each server's figures include its RTMP ingest and LL-HLS
 packaging as well as its HTTP; between the two sapflow columns only the HTTP
 path differs.
 
+## Ingest memory in a small container (2026-11-12)
+
+How many SRT and RTMP streams sapflow takes inside the reference
+deployment's container (1 CPU, 384 MiB, 128 pids), what happens past that,
+and what the window bound and admission in `feat/window-time-cap` change.
+**Memory and outcomes only:** the host was shared (load 5 to 50 across the
+runs), so no CPU figure here is a claim. Raw results are in
+[`performance-evidence/2026-11-12-ingest-capacity`](performance-evidence/2026-11-12-ingest-capacity/),
+and the harness is `scripts/ingest-capacity-linux.sh`.
+
+### Setup
+
+- **Server.** sapflow built for Linux (arm64), alone in a container with
+  `--cpus 1 --memory 384m` (or `1g`), swap the same, `--pids-limit 128`,
+  `nofile` 65536, and the reference settings that bear on memory:
+  `SAPFLOW_SEGMENT_COUNT=24`, `SAPFLOW_HLS_MODE=whole`, recording on (a
+  Docker volume), `SAPFLOW_RECONNECT_GRACE=90`, SRT encryption optional
+  with an AES-256 passphrase, and the default 512 MiB fragment budget and
+  128 MiB retention pool unless stated. Docker's VM had `net.core.rmem_max`
+  at 4 MiB, as the reference host has. Memory is the server cgroup's
+  `anon`, once a second: page cache from the recordings is reclaimable and
+  is left out.
+- **Publishers.** A second container (pinned FFmpeg n8.1.3, `srt-live-transmit`
+  1.5.1 at 2000 ms latency and AES-256), playing clips in real time:
+  *720p*, v4v's settings (1280x720, 30 fps, x264 CBR 2.5 Mbit/s with
+  filler, 1 s keyframes, AAC 128k; 2.76 Mbit/s); *1080p* (6 Mbit/s, 2 s
+  keyframes; 6.37 Mbit/s); and *heavy*, a misconfigured encoder (1080p at
+  20 Mbit/s with 8 s keyframes; 20.7 Mbit/s). Half SRT and half RTMP,
+  started 5 s apart or all at once, held 180 to 300 s. "Reconnecting"
+  publishers restart 2 s after any end, as an encoder's auto-reconnect does.
+- **Outcome.** Killed means the kernel killed the container for memory
+  (every stream and recording at once). A drop is a publisher sapflow ended
+  with "shared encoded fragment budget exhausted"; a refusal is a new
+  stream sapflow turned away before it started.
+
+### Before: main at 88e5979
+
+| Run | Container | Load | Outcome |
+|-----|-----------|------|---------|
+| s1 | 384 MiB | 32 x 720p | all live, 299 MiB |
+| s3 | 384 MiB | 32 x 1080p | killed at 70 s, 14 live |
+| f1 | 384 MiB | 1 heavy | killed at 156 s |
+| s5 | 384 MiB | 2 heavy | killed at 77 s |
+| x1 | 384 MiB | 1 heavy + 8 x 720p, reconnecting | 377 MiB at 121 s, then the container died (the harness failed reading it, so no kill was recorded) |
+| s2 | 384 MiB, budgets 224 + 64 MiB | 32 x 720p | 30 of 32 dropped within 10 s |
+| s4 | 384 MiB, budgets 224 + 64 MiB | 32 x 1080p | 29 of 32 dropped |
+| f5 | 384 MiB, budgets 224 + 64 MiB | 32 x 720p, reconnecting | 483 drops and 1,122 reconnects in 6 min |
+| f2 | 1 GiB | 1 heavy | survived, 509 MiB |
+| f4 | 1 GiB | 2 heavy | both dropped |
+| x2 | 1 GiB | 1 heavy + 8 x 720p, reconnecting | 9 drops |
+| f3 | 1 GiB | 32 x 1080p | all 32 dropped once about 20 were live |
+
+Two things decide these. The window holds `SAPFLOW_SEGMENT_COUNT` segments,
+and segments follow the keyframe interval, so a stream holds bitrate times
+24 keyframe intervals: the heavy encoder held 192 s of media. And every part
+is charged to one shared budget as it is encoded, while a segment's charge
+leaves only when the segment leaves the window, so once the budget is full
+the next part any stream seals is refused and nearly every publisher goes
+at once; their reconnects land in the same full budget.
+
+### After: window bound and projected admission
+
+With `SAPFLOW_WINDOW_SECONDS` at its default (2 s a segment, 48 s) and
+admission on projected windows (24f633a):
+
+| Run | Container | Load | Outcome |
+|-----|-----------|------|---------|
+| p6 | 384 MiB | 32 x 720p | all live, 24 segments each, 300 MiB (as s1) |
+| p1 | 384 MiB | 1 heavy + 8 x 720p, reconnecting | all live, no drops, 263 MiB; the heavy stream keeps 7 segments, the 720p ones 24 |
+| p3 | 1 GiB | 32 x 1080p, reconnecting | no drops; 11 live, the rest refused while they retried |
+| p4 | 1 GiB | 32 x 1080p all at once, reconnecting | no drops; 11 live |
+| p5 | 384 MiB, budgets 224 + 64 MiB | 32 x 720p, reconnecting | no drops; 22 live, 10 refused |
+
+The intermediate gate on the budget in use (509eedd) is in the evidence as
+the `a` runs: it held the 720p case (a5: no drops, 26 live) but not a 1080p
+ramp (a3: 479 drops) or a crowd (a4: 2,080 drops, nothing advancing),
+because a new stream holds almost nothing when it is admitted. With the
+window bound alone, a1 and a2 (1 heavy + 8 x 720p) had no drops at 384 MiB
+and 1 GiB.
+
+### What this does not show
+
+- RTMPS through a TLS front, a real encoder, network loss or reordering, or
+  a phone: the publishers are generated clips on one host.
+- A publisher whose bitrate rises after it is admitted: admission estimates
+  each window from its first segments and can still be overrun.
+- CPU per stream (see section B above for that), or how long refused
+  encoders take to get in once room appears: readiness was polled every
+  0.5 s and the host was busy.
+
 ## Decision
 
 2026-10-20, the user: **keep experimenting.** Before any production
