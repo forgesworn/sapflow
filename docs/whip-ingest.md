@@ -1026,11 +1026,52 @@ written under it, so players failed to decode them (hls.js stalled after a
 few frames) and the recording, though marked complete, did not decode past
 the change.
 
+The cut itself loses nothing the muxer holds:
+
+- **On a change mid-stream the clock carries on.** The ingest passes the
+  new keyframe's time (`Muxer::reconfigure_with_audio_at`), and the old run
+  ends exactly there: the held video frame lasts until it, the held audio
+  frame keeps its own duration, and output time is not moved. A frame
+  longer than the open part has room for is cut to fit it, as a stall
+  inside a run is, so the part and segment durations stay those of the
+  media; audio in the rest of that time, and audio stamped past the
+  keyframe that arrived before it, go to the new run's first part.
+- **The new run's first part opens at its keyframe,** so audio that
+  arrives before its second frame, or stamped before the keyframe and
+  arriving just after it, has a part to join. Audio stamped before the
+  keyframe that arrives once that part has closed fits no part (in a
+  recording it would come before the file's first video): it is dropped,
+  and the next update says `media_loss`.
+- **At a reconnect or the end of a stream** no clock carries on. The held
+  video frame lasts as long as the frame before it did (with no frame
+  before it, the SPS frame rate's interval, else 1/30 s), or until the end
+  of the audio already received if that is later, so the last picture
+  holds while that audio plays. Audio past a full part goes in one short
+  final part of the segment. What does not fit a part target and the
+  segment limit is dropped, with `media_loss`.
+- **Audio-only runs** already kept every frame, each with its known
+  duration, and are unchanged.
+
+In the resolution-change fixture the change used to lose 1 of 60 video
+frames and 3 of 96 AAC frames, and 19 AAC frames after a 300 ms video
+pause, all unmarked. In time order every frame now comes out; in the
+fixture's own order, whose AAC PES arrive up to 200 ms behind their video,
+one AAC frame arrives after the new run's first part and is reported. The
+end of every video-led stream also kept its last frame and audio back
+before; it now writes them.
+
 Left open:
 
-- At the change the muxer drops its pending video frame and pending audio
-  (in the fixture test, 1 video frame and 3 AAC frames of 60 and 96), as it
-  does at any interrupt, and the recording is not marked for it.
+- At the start of a stream, before the first part opens at its second
+  video frame, audio that arrives is kept only as the frame held, so of
+  two frames there the first is lost; and an interrupt before the first
+  segment closes starts the stream over, serving and recording nothing of
+  it. Neither is marked. Changing either would move outputs that no
+  interrupt touches.
+- A break inside a run (a timestamp jump or a segment about to outrun its
+  target) still drops the frame before it without saying so.
+- A video pause longer than the open part's room at a change leaves a gap
+  in video, under continuous audio, at the start of the new run.
 - Two writers a path (`PATH_WRITERS`): epochs that change faster than a
   finished file can be written out leave a later recording without a
   writer, which fails it. A late-started file for a short epoch takes one
@@ -1049,6 +1090,9 @@ Left open:
   0.10 to 0.82 s, and 0.52 s in the review. Once, in the diagnosis, it
   stalled about 7 s on a 0.37 s buffer hole before stepping over it; that
   was not seen again.
+
+The cut's log line (`codec change cut`, at debug) gives the gap to the new
+keyframe and how far the audio received ran past the held frame.
 
 Pages that publish from a browser should still hold resolution and let frame
 rate drop (`degradationPreference: "maintain-resolution"` where supported):

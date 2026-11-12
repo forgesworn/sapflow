@@ -49,3 +49,16 @@ Notes for the release after 0.2.0-rc.1.
   hold past the end.
 - Opus audio beside AAC (#66), with timeline slew carried in audio-only
   Opus and the refusal order tested (#68). See `docs/whip-ingest.md`.
+- An interrupt no longer drops what the muxer holds. At a codec epoch
+  change, a reconnect or the end of a stream, the held video frame and the
+  held audio frame are written into the run, and audio at or past that
+  frame's time is kept: the video frame lasts as long as the frame before
+  it, or until the end of the audio received, and audio past a full part
+  goes in one short final part. What cannot fit is dropped and reported as
+  `media_loss`, where rc.1 dropped it silently. New and additive:
+  `Muxer::reconfigure_with_audio_at` ends a run at the next keyframe on a
+  clock that carries on, without moving output time; `EsIngest` uses it for
+  a mid-stream parameter-set change. A run after a cut opens its first part
+  at its keyframe, so its program date is that keyframe's arrival.
+  Video-led output changes at every interrupt, including the end of each
+  stream; audio-only output and output with no interrupt are unchanged.

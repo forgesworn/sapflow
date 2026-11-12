@@ -1628,6 +1628,7 @@ impl Muxer {
         next: i64,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        let held = cur.dts;
         self.open_video_part(cur.dts, now);
         let mut lost = self.flush_held_audio();
         let audio = self.open_audio_span();
@@ -1670,13 +1671,12 @@ impl Muxer {
         if let Some(part) = leftover {
             self.carried_audio = part.audio_times.into_iter().zip(part.audio).collect();
         }
-        if !self.carried_audio.is_empty() {
-            tracing::debug!(
-                carried = self.carried_audio.len(),
-                gap_ms = (next - (cur.dts)) / 90,
-                "codec change: audio past the old run's end goes to the new run"
-            );
-        }
+        tracing::debug!(
+            gap_ms = (next - held) / 90,
+            audio_past_ms = audio.map_or(0, |(_, end)| (end - held) / 90),
+            carried = self.carried_audio.len(),
+            "codec change cut: the old run ends at the new keyframe"
+        );
         self.pending_video = None;
         self.discontinuity_next = true;
         self.breaks += 1;
