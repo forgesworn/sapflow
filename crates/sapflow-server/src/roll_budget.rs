@@ -337,7 +337,7 @@ mod tests {
         let clock = WallClock::manual();
         let mut b = RollBudget::with_clock(limit, clock.clone());
         let mut files = 0;
-        let mut step = |b: &mut RollBudget, media: Duration, wall: Duration| {
+        let step = |b: &mut RollBudget, media: Duration, wall: Duration| {
             clock.set(wall);
             if b.is_out() {
                 if b.may_resume(media) {
