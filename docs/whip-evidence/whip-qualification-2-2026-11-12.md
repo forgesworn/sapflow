@@ -6,6 +6,11 @@ which this note follows. It reports against
 [the WHIP ingest design](../whip-ingest.md) (A3.8, A3.9, A3.10, A4.1, A4.2).
 Raw results are in `fixtures/whip/qualification-2-2026-11-12/`.
 
+**Builds.** A3.8, A3.10 and A4.1 ran on builds made before main
+(`b5a130a`, with the muxer changes of #79) was merged into this branch;
+A4.2's Linux run and the final gate ran after. One A4.1 trial was rerun on
+the merged build (see "A stream that never goes live").
+
 ## The owner's decisions
 
 The owner's written decisions of 12 November 2026, as given:
@@ -164,12 +169,18 @@ it, 60 s each.
 | OBS | none | REMB not echoed, no transport-cc (OBS offers none) | 5.4 | 2523 | 2519 | 2500 |
 | OBS | `loss:0:0` | reports only | 19.0 | 2523 | 2519 | 2514 |
 | OBS | `loss:64:20` (25% claimed from 20 s) | reports only | 10.0 | 2524 | 2507 | 2526 |
-| OBS | `remb:500000:20` | `goog-remb` | 7.6 | 2531 | 2520 | 2512 |
+| OBS | `remb:500000:20` | `goog-remb` (see below) | 7.6 | 2531 | 2520 | 2512 |
 | Chrome | none | transport-cc | 18.6 | target 2083 | 2180 | 2251 |
 | Chrome | `loss:0:0` | reports only | 17.1 | target 631 (ramping) | 2023 | 2295 |
 | Chrome | `loss:64:20` | reports only | 11.0 | target 631 | **107** | **30** |
 | Chrome | `remb:20000000:0` (no limit) | `goog-remb` | 11.2 | target 2083 | 2382 | 2305 |
 | Chrome | `remb:500000:20` | `goog-remb` | 7.9 | target 631; available 757 | **416**; available **500** | **416**; available **500** |
+
+No OBS answer was captured. That the REMB run's answer to OBS carried
+`goog-remb` rests on two things. One is the unit test on OBS 32.0.4's W0
+offer (`the_remb_hook_answers_goog_remb_without_transport_cc`). The other
+is Chrome's run with the same build and variable, whose answer did
+(`answer_remb: true`).
 
 Chrome's target fell within 1 to 2 s of each stimulus. With the claimed
 loss it went 1113 kbit/s at 21 s, then 860, 664, 513, 395, and on down to
@@ -267,6 +278,15 @@ hold's end, with reports for both streams already in. Those runs were ready
 6.6 to 7.6 s after connecting. FFmpeg, whose reports come with its first
 packets, is not delayed at all.
 
+**What the longer hold costs.**
+
+- A publisher that sends no sender reports now waits 4 s for its first
+  media, up from 1.5 s.
+- Above about 8 Mbit/s, the 4 MiB bound ends the hold before 4 s, by
+  arrival time as before.
+- Live latency was not measured in either round; the first round listed
+  that as a limit too.
+
 **Margin.** Three of the 20 Chrome runs were aligned by reports only at the
 hold's end. The other 17 had their reports by 3.46 to 3.80 s. A Chrome
 whose reports come later than 4 s would fall back to arrival time, as every
@@ -318,11 +338,13 @@ scripts/whip-loss.py --bin <sapflow> --proxy target/<triple>/release/srt-loss-pr
   --protocols srt,whip --losses 1,5,10 --seeds 5 --clean 3
 ```
 
-**The reading.** The driver computed each protocol's mean and standard
-deviation, the difference and a Welch t before the runs. The rule applied
-to them is the method's: with five seeds, a |t| below about 2.3 is not a
-difference worth claiming. The gate fails at a profile where WHIP's mean is
-higher with |t| at or above that.
+**The reading.** The driver's summary columns were set before the runs:
+each protocol's mean and standard deviation, the difference and a Welch t.
+The pass and fail reading was written after the numbers. It is the
+method's rule: with five seeds, a |t| below about 2.3 is not a difference
+worth claiming. So the gate fails at a profile where WHIP's mean is higher
+with |t| at or above that. The 5% result fails under any reading of the
+numbers.
 
 ### Results
 
@@ -381,11 +403,11 @@ of the gate):
 |---|---|---|
 | none | 32 (the first GOP: one incomplete frame at the start and 29 skipped to the next keyframe) | yes |
 | 1% | 716 | yes |
-| 5% | 900 | **no**: no stream, no recording |
+| 5% | 900 | **no**: no stream, no recording. On the merged build: ready after 20.95 s, 7 frames recorded (893 unrecovered) |
 | 10% | 900 | **no** |
 
-**Found on the way.** At 5% and 10% with FFmpeg, Sapflow never made the
-stream ready. Its muxer logged "timestamps broke before the first segment
+**Found on the way.** At 5% and 10% with FFmpeg, Sapflow (before the
+merge) never made the stream ready. Its muxer logged "timestamps broke before the first segment
 was complete; starting over" as video skipped from loss to keyframe. The
 same happened with Chrome at a low rate (A3.10) and with OBS at 5% (above).
 A publisher whose first segment keeps breaking never goes live. Nothing was
@@ -475,14 +497,18 @@ not above as on macOS; the owner has accepted it either way.
   the NACK schedule (how many attempts, how soon) are the owner's to
   choose. The wait is compiled in (`SAPFLOW_WHIP_JITTER` is not a setting
   yet), so no other value was measured.
-- **A stream that never goes live.** Under loss that is not repaired, video
-  skips from a loss to the next keyframe. Sapflow's muxer then logs
-  "timestamps broke before the first segment was complete; starting over"
-  and can keep starting over, so the stream is never ready and nothing is
-  recorded. Seen with FFmpeg's WHIP muxer at 5% and 10% loss, with OBS at
-  5% (10 s keyframes, PLI ignored), and with Chrome at a very low rate on
-  a noise source. Not investigated; it belongs with the muxer and the
-  timeline's re-anchoring.
+- **A stream that never goes live, or goes live late.** Under loss that is
+  not repaired, video skips from a loss to the next keyframe. Sapflow's
+  muxer then logs "timestamps broke before the first segment was complete;
+  starting over", and can keep starting over.
+  - **Before the merge.** The stream was never ready and nothing was
+    recorded. That was seen with FFmpeg's WHIP muxer at 5% and 10% loss,
+    with OBS at 5% (10 s keyframes, PLI ignored), and with Chrome at a very
+    low rate on a noise source.
+  - **On the merged build.** FFmpeg at 5% (seed 1) restarted three times
+    and was ready only after 20.95 s, with 7 of 900 frames recorded.
+  - **Not investigated.** It belongs with the muxer and the timeline's
+    re-anchoring.
 - **WHIP audio is not repaired.** Browsers offer no NACK for Opus, so loss
   is filled with silence: 84 Opus packets at 5% in one run. Opus in-band
   FEC is negotiated, but Sapflow does not decode, so it cannot use it.

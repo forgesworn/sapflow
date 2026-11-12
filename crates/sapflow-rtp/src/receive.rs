@@ -44,7 +44,7 @@
 //!   [`ReceiverConfig::transport_cc`] is set, for every packet with the
 //!   extension, whatever stream it belongs to;
 //! - one 90 kHz timeline ([`crate::timeline`]): media is held at the start
-//!   until every stream's first sender report, for at most 1.5 s, then
+//!   until every stream's first sender report, for at most 4 s, then
 //!   [`Event::Aligned`] says how the streams were aligned, and every
 //!   [`Event::AccessUnit`] and [`Event::Audio`] carries its `pts`. The
 //!   receiver stamps them itself, rather than leaving a mapper to the

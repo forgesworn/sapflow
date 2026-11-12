@@ -1004,9 +1004,11 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
 - It then asks for a keyframe every `SAPFLOW_WHIP_KEYFRAME_INTERVAL`
   (proposed 2 s), sending PLI (or FIR where only FIR is negotiated). That keeps
   segments near the target that was fixed from the first one.
-- A sender may not act on keyframe requests. Whether OBS does is checked in
-  A3.10. OBS's offer has no `ccm fir`, so only PLI is used with it. Until it is shown to, OBS guidance sets its own keyframe interval to
-  match.
+- A sender may not act on keyframe requests. OBS 32 does not: in A3.10 its
+  keyframes followed its own interval whether Sapflow asked every 2 s or
+  not at all. OBS's offer has no `ccm fir`, so only PLI is used with it.
+  So OBS guidance sets its own keyframe interval to match (2 s), which also
+  bounds how long video waits after a loss NACKs cannot repair.
 
 ### Format changes
 
@@ -1819,7 +1821,7 @@ Implementation notes (W3a, 11 November 2026):
     - ICE nominated at about 120 ms after the `201`;
     - DTLS connected 4 to 6 ms later, with `SRTP_AEAD_AES_128_GCM`;
     - first SRTP packet decrypted;
-    - first Opus at about 1.65 s, after the 1.5 s start hold, and the
+    - first Opus at about 1.65 s, after the start hold (then 1.5 s), and the
       first H.264 keyframe at 1.64 to 3.14 s. The hold ended by arrival
       time (`Fallback::Timeout`): not every stream had a sender report
       within it;
@@ -2507,7 +2509,7 @@ they describe what ships.
 | `transport-cc` in v1 | Provisionally yes from desktop Chrome; A0.4 on the other targets |
 | Whether ICE-TCP is worth carrying | A0.3 against a public address on 443 |
 | Default `SAPFLOW_WHIP_JITTER` | A4.1: at 200 ms WHIP leaves more frames unrecovered than SRT at 5% loss; open, with the NACK schedule |
-| RustCrypto or `ring` | A4.2 |
+| RustCrypto or `ring` | A4.2, measured 12 November 2026 (CPU met at 1 and 50 streams in a Linux container, the owner's call at 10; memory accepted). Not decided here |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
 | Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |
 | ICE restart via `PATCH` | Physical results in A4.3 |
