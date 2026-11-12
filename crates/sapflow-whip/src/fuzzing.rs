@@ -338,7 +338,10 @@ struct Oracle {
     /// delivered then. The session records at most one ID per authentic
     /// check it is handed (it may record one whose answer the per-tuple
     /// budget then drops), so an ID is surely still remembered while fewer
-    /// than `max_transactions` authentic checks have arrived since.
+    /// than `max_transactions` authentic checks have arrived since. A
+    /// retransmission it answers from the tuple that first sent the ID is
+    /// not recorded again and does not move the ID's place, so it starts no
+    /// entry here.
     remembered: Vec<([u8; 12], Tuple, u64)>,
     /// Authentic checks delivered so far.
     authentic_delivered: u64,
@@ -360,6 +363,7 @@ impl Oracle {
         let (selected, sending) = (s.selected(), s.send_tuple());
         let media = |s: &Session| s.stats().srtp_packets + s.stats().srtcp_packets;
         let media_before = media(s);
+        let repeats_before = s.stats().ice.repeats;
         *self.from.entry(t).or_default() += d.len() as u64;
         s.handle_datagram(now, t, d);
         let after: Vec<bool> = self.known.iter().map(|k| s.accepts(k)).collect();
@@ -426,8 +430,12 @@ impl Oracle {
                 "a re-sent check drew bytes while its ID was remembered"
             );
         }
+        // Answered as a retransmission: the session kept the ID where it
+        // was, so its memory of it is not renewed.
+        let repeat = s.stats().ice.repeats > repeats_before;
         if let Some(id) = id
             && answered.contains(&t)
+            && !repeat
             && !self.remembered.iter().any(|(seen, _, _)| *seen == id)
         {
             self.remembered.push((id, t, since));

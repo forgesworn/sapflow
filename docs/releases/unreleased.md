@@ -119,3 +119,48 @@ Notes for the release after 0.2.0-rc.1.
   taken): they log it and try again after 100 ms, as WHIP's listeners do.
 - `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
   segments, as above.
+
+## sapflow-dtls
+
+- A connected server now refuses every renegotiation with one warning-level
+  `no_renegotiation`. It used to answer only a ClientHello whose
+  `message_seq` was above the last Finished's, but DTLS 1.2 starts each
+  handshake's messages at 0 (RFC 6347 section 4.2.2), so a conforming
+  peer's request was silently dropped.
+- Unauthenticated (epoch 0) input no longer ends a handshake, or holds it
+  until the deadline, in the ways rounds 2 and 3 of the A4.4 review found.
+  Round 4 found four more that are still open, two of them single packets
+  (see the crate README and
+  `docs/whip-evidence/a4.4-security-review-2026-11-12.md`):
+  - Every alert at epoch 0 is dropped.
+  - Fragments are admitted by `message_seq`, type, epoch and a length the
+    parser could accept before anything is kept, so a Finished is kept
+    only at epoch 1.
+  - A fragment over `max_message_len`, `max_buffered` or `max_fragments`,
+    and an empty fragment of a non-empty message, allocate nothing.
+  - A fragment that disagrees with bytes already received starts its own
+    candidate instead of overwriting them.
+  - Room in reassembly is reclaimed from stalled or younger unauthenticated
+    candidates, paced by `initial_retransmit`. No limit changes.
+  - A complete epoch 0 message that fails a check made before any ECDH or
+    verification is refused without moving the handshake on.
+
+  Each is counted in `Stats::records_dropped`.
+- So these errors no longer come from `handle_datagram` for epoch 0 input,
+  and no alert is sent for them: a hello outside the profile (`Version`,
+  `NoCipherSuite` and the rest, or `Decode`), `Limit::HelloVerify`,
+  `NoCertificate`, `FingerprintMismatch`, `BadKeyShare` before ECDH,
+  `VerifyScheme`, `UnexpectedMessage`, `PeerAlert`, and the reassembly
+  `Limit`s. A client that really sends one is ended by the caller's
+  handshake deadline. The new `Server::refused` (additive) gives the reason
+  for the last refused message. Errors under the read keys, from a
+  certificate that matches the offer, and from a failed verification still
+  end the handshake with their alert.
+- In WHIP, a publisher whose certificate does not match its offer now ends
+  at the 10 s handshake deadline, not at once. It still ends as
+  `EndReason::Dtls(FingerprintMismatch)` and is counted as `dtls-failed`:
+  at the deadline a session reports the reason `sapflow-dtls` last refused
+  a message, and is `HandshakeTimeout` only when nothing was refused. The
+  server's end log line now carries the DTLS error for a `dtls-failed`
+  end.
+- The public API changes only by the addition of `Server::refused`.

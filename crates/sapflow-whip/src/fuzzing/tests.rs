@@ -63,6 +63,21 @@ fn session_seeds_reach_their_stage() {
 
 /// The forgotten-and-copied seed does what it says: forgotten checks
 /// validate the third tuple, copies draw sends to it, and the budget holds.
+/// Inputs the fuzzer once failed on (`fuzz/regressions/whip_session`) hold
+/// the invariants.
+#[test]
+fn session_regressions_hold_the_invariants() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fuzz/regressions/whip_session");
+    let mut n = 0;
+    for e in std::fs::read_dir(&dir).expect("regressions") {
+        let path = e.expect("entry").path();
+        let _ = whip_session(&std::fs::read(&path).expect("input"));
+        n += 1;
+    }
+    assert!(n > 0, "regressions for whip_session");
+}
+
 #[test]
 fn forgotten_and_copied_reaches_the_third_tuple() {
     let (_, bytes) = seeds("whip_session")

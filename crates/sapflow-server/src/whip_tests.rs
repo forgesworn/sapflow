@@ -1659,11 +1659,44 @@ async fn a_handshake_timeout_releases_with_no_callback() {
         "released at the deadline"
     );
     assert_eq!(server.whip.ends.get("handshake-timeout"), 1);
+    assert_eq!(server.whip.ends.get("dtls-failed"), 0, "it went quiet");
     assert!(
         callback_events(&mut rx, Duration::from_millis(300))
             .await
             .is_empty()
     );
+}
+
+/// A publisher whose certificate does not match its offer: sapflow-dtls
+/// refuses the certificate without ending the handshake (at epoch 0 a
+/// forger could have sent it), so the session ends at its deadline, and is
+/// counted as the DTLS failure it was, not as a plain timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fingerprint_mismatch_is_a_dtls_failure_at_the_deadline() {
+    let server = start_with(&[], |s| s.handshake_timeout = Duration::from_secs(1), None).await;
+    let mut phone = Phone::new(37, &server).await;
+    let other = sapflow_dtls::Fingerprint::from_bytes([0xab; 32]);
+    let offer = sapflow_whip::testing::synthetic_offer(&other, &phone.p.ufrag);
+    let a = send(
+        server.http,
+        &sdp_post("/whip/live/event-mismatch", TOKEN, &offer),
+    )
+    .await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    phone.answered(&a.body);
+    let c = phone.p.check(true);
+    phone.send(&c).await;
+    for d in phone.p.client.start() {
+        phone.send(&d).await;
+    }
+    phone.receive(Duration::from_millis(300)).await;
+    assert!(!phone.p.has_keys(), "never connects");
+    assert!(
+        eventually(|| server.app.streams.get("event-mismatch").is_none()).await,
+        "released at the deadline"
+    );
+    assert_eq!(server.whip.ends.get("dtls-failed"), 1);
+    assert_eq!(server.whip.ends.get("handshake-timeout"), 0);
 }
 
 /// A3.2: every refusal in Resources, with its status and its reason, the

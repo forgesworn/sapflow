@@ -25,7 +25,7 @@ use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// The wall clock the seeded test identities use: 2026-10-27.
@@ -254,11 +254,14 @@ impl Client {
             random,
             hello_seq: 0,
             hello: Vec::new(),
+            // No reclaiming: the client keeps no clock, and its peer is ours.
             reassembler: Reassembler::new(Limits {
                 max_message: 1 << 16,
                 max_fragments: 64,
                 max_buffered: 1 << 17,
                 ahead: 8,
+                expire_after: None,
+                reclaim_every: None,
             }),
             seqs: Sequences::default(),
             transcript: Sha256::new(),
@@ -363,7 +366,7 @@ impl Client {
                         let epoch = rec.epoch;
                         match self
                             .reassembler
-                            .push(epoch, &f)
+                            .push(epoch, &f, Instant::now())
                             .map_err(|e| format!("{e}"))?
                         {
                             Push::Stored => {
@@ -372,6 +375,11 @@ impl Client {
                                 }
                             }
                             Push::Old { .. } | Push::Dropped => {}
+                            // The test client keeps no state worth saving:
+                            // a bound broken by the server is an error.
+                            Push::Over(limit) => {
+                                return Err(format!("{}", crate::Error::Limit(limit)));
+                            }
                         }
                     }
                 }
@@ -708,11 +716,14 @@ pub fn capture_hello(dir: &str, stem: &str) -> Vec<u8> {
         max_fragments: 64,
         max_buffered: 1 << 17,
         ahead: 1,
+        expire_after: None,
+        reclaim_every: None,
     });
     for g in capture(dir, stem) {
         for rec in record::records(&g) {
             for f in message::fragments(rec.body) {
-                r.push(0, &f).expect("fragment");
+                let pushed = r.push(0, &f, Instant::now()).expect("fragment");
+                assert!(!matches!(pushed, Push::Over(_)), "within the bounds");
             }
         }
     }
