@@ -316,6 +316,15 @@ echo "ok   SRT optional encryption: with and without the passphrase play; a wron
 # right one plays as LL-HLS with H.264 and Opus and sends the publish
 # callback. FFmpeg's DELETE at the end is a deliberate leave: the unpublish
 # callback, then the recording once the grace is over.
+# A file decodes with no decoder error. The null muxer's own complaints
+# about the timestamps it is handed ("[null @ ...] ... non monotonically
+# increasing dts") are not the media's, so they do not count; anything else
+# at error level does.
+decodes() {
+  local errors
+  errors=$(ffmpeg -hide_banner -nostdin -v error -i "$1" -f null - 2>&1 | grep -v '^\[null @' || true)
+  [ -z "$errors" ] || { printf '%s\n' "$errors" | head -5 >&2; return 1; }
+}
 whip_smoke() {
   local W=event-whip WHTTP=127.0.0.1:18885 WSIG=127.0.0.1:18884 WUDP=127.0.0.1:18913 code wpub winit wrec
   # grep reads the whole list: an early exit would fail the pipe (pipefail).
@@ -363,7 +372,7 @@ whip_smoke() {
   winit=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/whip.m3u8" | tail -1)
   curl -s "$WB/$winit" > "$WORK/whip.mp4"
   for s in $(grep '_seg' "$WORK/whip.m3u8"); do curl -s "$WB/$s" >> "$WORK/whip.mp4"; done
-  ffmpeg -hide_banner -v error -xerror -i "$WORK/whip.mp4" -f null - || fail "WHIP segments do not decode"
+  decodes "$WORK/whip.mp4" || fail "WHIP segments do not decode"
   ffprobe -v error -show_streams -of json "$WORK/whip.mp4" | python3 -c '
 import json, sys
 streams = json.load(sys.stdin)["streams"]
@@ -383,7 +392,7 @@ assert (audio[0]["codec_name"], int(audio[0]["sample_rate"]), audio[0]["channels
   for _ in $(seq 1 30); do grep -q "recordSegmentComplete\",\"path\":\"live/$W\"" "$WORK/cb.log" && break; sleep 0.5; done
   wrec=$(grep "recordSegmentComplete\",\"path\":\"live/$W\"" "$WORK/cb.log" | grep -o '"segmentPath":"[^"]*"' | head -1 | cut -d'"' -f4)
   case "$wrec" in "$WORK/rec/live/$W/"[0-9]*.mp4) ;; *) fail "WHIP recordSegmentComplete path: $wrec" ;; esac
-  ffmpeg -hide_banner -v error -xerror -i "$wrec" -f null - || fail "WHIP recording does not decode"
+  decodes "$wrec" || fail "WHIP recording does not decode"
   echo "ok   WHIP DELETE: session ended, unpublish callback, recording ($(basename "$wrec"))"
 }
 whip_smoke
