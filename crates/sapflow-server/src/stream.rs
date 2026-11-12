@@ -165,6 +165,14 @@ impl Source {
         }
     }
 
+    fn muxer_mut(&mut self) -> Option<&mut Muxer> {
+        match self {
+            Self::Ts(t) => t.muxer_mut(),
+            Self::Flv(f) => f.muxer_mut(),
+            Self::Es(e) => e.muxer_mut(),
+        }
+    }
+
     fn trimmed_audio_tail(&self) -> bool {
         matches!(self, Self::Ts(ts) if ts.trimmed_audio_tail())
     }
@@ -200,6 +208,10 @@ pub struct Session {
     fresh_part_floor: u64,
     /// Kept across a reconnect: one recording per show.
     pub recorder: Option<Recorder>,
+    /// The recording of the codec epoch before the current one, with that
+    /// epoch's id, while audio stamped before the cut may still arrive and
+    /// be dropped ([`LiveStream::roll_recording`]). Finished after.
+    outgoing: Option<(u64, Recorder)>,
     pub recorder_factory: Option<RecorderFactory>,
     outage_deadline: Option<Instant>,
     /// The generation whose transport reported an orderly, lossless close.
@@ -207,6 +219,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Whether an outgoing recording is held for its late audio.
+    #[cfg(test)]
+    pub(crate) fn holds_outgoing(&self) -> bool {
+        self.outgoing.is_some()
+    }
+
     pub fn owns_connection(&self, generation: u64) -> bool {
         self.generation == generation && self.attached
     }
@@ -333,6 +351,7 @@ impl LiveStream {
                 publication_permit,
                 fresh_part_floor: 0,
                 recorder: None,
+                outgoing: None,
                 recorder_factory: None,
                 outage_deadline: None,
                 clean_close: None,
@@ -537,15 +556,9 @@ impl LiveStream {
         if loss {
             session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
         }
-        if result.is_ok_and(|update| update.restarted) {
-            let unrecorded = session
-                .recorder
-                .as_mut()
-                .is_some_and(|outgoing| !self.feed_outgoing(outgoing));
-            session.recorder = session
-                .recorder_factory
-                .as_ref()
-                .map(RecorderFactory::start);
+        let restarted = result.is_ok_and(|update| update.restarted);
+        let unrecorded = self.roll_recording(session, restarted);
+        if restarted {
             if unrecorded {
                 session.mark_recording_incomplete(
                     session.generation,
@@ -566,6 +579,83 @@ impl LiveStream {
         }
         self.version.send_modify(|v| *v += 1);
         crate::own_http::notify();
+    }
+
+    /// After every push or finish, with the session held: rolls the
+    /// recording to a new codec epoch if the push began one (`restarted`),
+    /// and settles late audio. Returns whether the old epoch's served media
+    /// went unrecorded ([`LiveStream::feed_outgoing`]); the caller marks the
+    /// new recording for that, and for any loss the push reported.
+    ///
+    /// - On a roll, the old recording is fed the rest of its epoch and a new
+    ///   one starts.
+    /// - Audio stamped before a cut's keyframe can arrive after the cut
+    ///   (FFmpeg's TS muxing leaves it up to 200 ms behind its video in
+    ///   file order). What the muxer had to drop of it is the one loss
+    ///   marked by its timestamp, not its place in stream order: it is
+    ///   charged to the epoch the cut ended ([`Muxer::take_late_audio_loss`])
+    ///   and marks that epoch's recording. With audio more than a whole
+    ///   epoch behind, the later epoch can be charged with an earlier one's
+    ///   audio; the earlier file is then marked as well, as its window
+    ///   closed short.
+    /// - So a recording whose epoch may still lose late audio
+    ///   ([`Muxer::late_audio_epoch`]) is held, not finished, until that
+    ///   window closes: at the latest two seconds of video after the cut,
+    ///   or at the next cut or the end of the connection.
+    pub fn roll_recording(&self, session: &mut Session, restarted: bool) -> bool {
+        let (lost, open) = {
+            let mut st = self.lock();
+            st.ingest.muxer_mut().map_or_else(Default::default, |m| {
+                (m.take_late_audio_loss(), m.late_audio_epoch())
+            })
+        };
+        if let Some((epoch, held)) = &session.outgoing
+            && lost.contains(epoch)
+        {
+            held.mark_incomplete(IncompleteReason::MediaLoss);
+        }
+        if session
+            .outgoing
+            .as_ref()
+            .is_some_and(|(epoch, _)| open != Some(*epoch))
+        {
+            // Finished: nothing more of its epoch can come.
+            session.outgoing = None;
+        }
+        if !restarted {
+            return false;
+        }
+        let mut outgoing = session.recorder.take();
+        let unrecorded = outgoing
+            .as_mut()
+            .is_some_and(|recorder| !self.feed_outgoing(recorder));
+        let epoch = outgoing
+            .as_ref()
+            .and_then(|recorder| self.recorded_epoch(recorder));
+        if let (Some(recorder), Some(epoch)) = (&outgoing, epoch)
+            && lost.contains(&epoch)
+        {
+            recorder.mark_incomplete(IncompleteReason::MediaLoss);
+        }
+        session.recorder = session
+            .recorder_factory
+            .as_ref()
+            .map(RecorderFactory::start);
+        if let (Some(recorder), Some(epoch)) = (outgoing, epoch)
+            && open == Some(epoch)
+        {
+            session.outgoing = Some((epoch, recorder));
+        }
+        unrecorded
+    }
+
+    /// The codec epoch of the parts `recorder` has had, if any.
+    fn recorded_epoch(&self, recorder: &Recorder) -> Option<u64> {
+        let last = recorder.last_part()?;
+        match self.lock().ingest.muxer()?.part(last) {
+            PartLookup::Found(part) => Some(part.initialization.id),
+            _ => None,
+        }
     }
 
     /// Before a recording rolls to a new codec epoch: gives the outgoing
@@ -1047,7 +1137,7 @@ impl Registry {
             stream.close();
             // Actual writer completion follows channel closure, not removal
             // from the registry or a requested transport shutdown.
-            session.recorder.take()
+            (session.outgoing.take(), session.recorder.take())
         };
         drop(recorder);
     }
@@ -1269,6 +1359,7 @@ mod grace_tests {
             publication_permit: None,
             fresh_part_floor: 0,
             recorder: None,
+            outgoing: None,
             recorder_factory: None,
             outage_deadline: None,
             clean_close: None,

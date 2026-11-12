@@ -824,6 +824,18 @@ pub fn rebase_part_for_file(
     audio_rate: Option<u32>,
     origin: &mut Option<FileTimeBase>,
 ) -> Result<Bytes, InvalidFileFragment> {
+    rebase_part_for_file_timed(data, audio_rate, origin).map(|(output, _)| output)
+}
+
+/// [`rebase_part_for_file`], also returning where the part's media ends in
+/// the file: its video's decode time plus its samples' durations, or its
+/// audio's if it has no video. A recording lasts until the latest of these,
+/// which, unlike the parts' spans, holds no hole a run did not keep.
+pub fn rebase_part_for_file_timed(
+    data: &Bytes,
+    audio_rate: Option<u32>,
+    origin: &mut Option<FileTimeBase>,
+) -> Result<(Bytes, std::time::Duration), InvalidFileFragment> {
     if data.len() > MAX_FILE_FRAGMENT_BYTES {
         return Err(InvalidFileFragment);
     }
@@ -865,6 +877,7 @@ pub fn rebase_part_for_file(
             let mut child = at + 8;
             let mut track = None;
             let mut field = None;
+            let mut length = 0u64;
             let mut children = 0;
             while child < end {
                 children += 1;
@@ -898,7 +911,33 @@ pub fn rebase_part_for_file(
                         };
                         field = Some((child + 12, version != 0, ticks));
                     }
-                    b"trun" => {}
+                    b"trun" => {
+                        // Per sample: duration, size, flags, composition
+                        // offset, each if its flag is set; duration first.
+                        let flags = u32_at(data, child + 8)? & 0x00ff_ffff;
+                        let count = u32_at(data, child + 12)? as usize;
+                        let mut first = child + 16;
+                        if flags & 0x1 != 0 {
+                            first += 4;
+                        }
+                        if flags & 0x4 != 0 {
+                            first += 4;
+                        }
+                        let per = [0x100, 0x200, 0x400, 0x800]
+                            .iter()
+                            .filter(|&&f| flags & f != 0)
+                            .count()
+                            * 4;
+                        let table = count.checked_mul(per).ok_or(InvalidFileFragment)?;
+                        if first.checked_add(table).is_none_or(|end| end > next) {
+                            return Err(InvalidFileFragment);
+                        }
+                        if flags & 0x100 != 0 {
+                            for i in 0..count {
+                                length += u64::from(u32_at(data, first + i * per)?);
+                            }
+                        }
+                    }
                     _ => return Err(InvalidFileFragment),
                 }
                 child = next;
@@ -917,7 +956,7 @@ pub fn rebase_part_for_file(
             }
             seen |= bit;
             let (offset, wide, ticks) = field.ok_or(InvalidFileFragment)?;
-            fields.push((offset, wide, ticks, rate));
+            fields.push((offset, wide, ticks, rate, track, length));
         } else if kind != b"mfhd" {
             return Err(InvalidFileFragment);
         }
@@ -929,7 +968,7 @@ pub fn rebase_part_for_file(
     let base = match *origin {
         Some(base) => base,
         None => {
-            let (_, _, ticks, rate) = fields
+            let (_, _, ticks, rate, _, _) = fields
                 .iter()
                 .min_by(|a, b| {
                     (u128::from(a.2) * u128::from(b.3)).cmp(&(u128::from(b.2) * u128::from(a.3)))
@@ -942,11 +981,24 @@ pub fn rebase_part_for_file(
         }
     };
     let mut output = data.to_vec();
-    for (offset, wide, ticks, rate) in fields {
+    let lead = if fields.iter().any(|f| f.4 == VIDEO_TRACK) {
+        VIDEO_TRACK
+    } else {
+        AUDIO_TRACK
+    };
+    let mut end = std::time::Duration::ZERO;
+    for (offset, wide, ticks, rate, track, length) in fields {
         let shift =
             u64::try_from(u128::from(base.ticks) * u128::from(rate) / u128::from(base.timescale))
                 .map_err(|_| InvalidFileFragment)?;
         let value = ticks.checked_sub(shift).ok_or(InvalidFileFragment)?;
+        if track == lead {
+            let ticks = value.checked_add(length).ok_or(InvalidFileFragment)?;
+            let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(rate);
+            end = std::time::Duration::from_nanos(
+                u64::try_from(nanos).map_err(|_| InvalidFileFragment)?,
+            );
+        }
         if wide {
             output[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
         } else {
@@ -958,7 +1010,7 @@ pub fn rebase_part_for_file(
         }
     }
     *origin = Some(base);
-    Ok(Bytes::from(output))
+    Ok((Bytes::from(output), end))
 }
 
 #[cfg(test)]

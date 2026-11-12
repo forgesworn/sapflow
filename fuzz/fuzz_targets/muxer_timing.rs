@@ -5,10 +5,16 @@
 //! the target, the part rules, consistent discontinuities. Every part must
 //! stay served for three target durations after its tag leaves the
 //! playlist (`playlist::RetentionCheck`), unless the muxer counts it.
+//! Every segment a run end closes (a break, an interrupt, a codec cut, a
+//! refusal) ends with its media: its `EXTINF` is its parts' spans with the
+//! last part's duration, so no hole is left at a run's end. Inputs starting
+//! `CUT1` drive codec changes on a clock that carries on
+//! (`Muxer::reconfigure_with_audio_at`) with audio running behind, so late
+//! audio after a cut is placed or dropped and counted against its epoch.
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use sapflow_hls::codec::{AacConfig, H264Config};
+use sapflow_hls::codec::{AacConfig, AudioConfig, H264Config};
 use sapflow_hls::{Muxer, MuxerConfig, playlist};
 use sapflow_hls::{fmp4, recording_timing as recording};
 
@@ -240,6 +246,133 @@ fn native_recording(data: &[u8]) {
     }
 }
 
+/// Every segment a run end closed since the last call ends with its media.
+fn check_run_ends(m: &mut Muxer) {
+    for id in m.take_run_ends() {
+        let Some(segment) = m.entries().iter().find_map(|e| match e {
+            sapflow_hls::muxer::Entry::Segment(s) if s.id == id => Some(s.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some((last, rest)) = segment.parts.split_last() else {
+            continue;
+        };
+        let media = rest
+            .iter()
+            .fold(last.duration, |sum, part| sum.saturating_add(part.span));
+        // A tick (11.1 us) a part of rounding between durations and ticks.
+        let slack = std::time::Duration::from_nanos(11_200 * segment.parts.len() as u64);
+        assert!(
+            segment.duration.abs_diff(media) <= slack,
+            "segment {id} ends a run lasting {:?}, its media {media:?}",
+            segment.duration
+        );
+    }
+}
+
+/// Late audio is only ever charged to an epoch the stream has left.
+fn check_late_audio(m: &mut Muxer) {
+    let current = m.current_initialization_id();
+    if let Some(epoch) = m.late_audio_epoch() {
+        assert!(epoch < current, "late audio for epoch {epoch} in {current}");
+    }
+    for epoch in m.take_late_audio_loss() {
+        assert!(epoch < current, "late loss for epoch {epoch} in {current}");
+    }
+}
+
+/// Codec changes on a clock that carries on, with audio behind its video.
+/// Each record: a step in ticks (2 bytes), flags (bit 0 keyframe, bit 1 the
+/// step is a stall x 16, bit 2 a codec change cuts here and the frame is
+/// its keyframe, bit 3 an interrupt after the frame, bits 4-6 AAC frames
+/// before it), then bits 0-3 AAC frames after it and bit 4 a change of
+/// AAC configuration at the cut.
+fn continuing_cuts(data: &[u8]) {
+    let Some(video) = H264Config::new(SPS, PPS) else {
+        return;
+    };
+    let aac = |stereo: bool| AacConfig {
+        object_type: 2,
+        sample_rate_index: 3,
+        sample_rate: 48000,
+        channels: if stereo { 2 } else { 1 },
+    };
+    let mut stereo = true;
+    let mut m = Muxer::new(MuxerConfig::default(), video.clone(), Some(aac(stereo)))
+        .with_retention_pool(pool());
+    let (mut dts, mut audio) = (0i64, 0i64);
+    let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
+    let now = std::time::UNIX_EPOCH;
+    // After every call into the muxer, as RetentionCheck requires.
+    let mut check = |m: &mut Muxer| {
+        check_run_ends(m);
+        check_late_audio(m);
+        if let Err(e) = retention.check(m) {
+            panic!("{e}");
+        }
+        if m.has_content() {
+            let pl = playlist::media(m, "p");
+            if let Err(e) = rules.check_with_byte_cap(&pl, m.window_byte_capped()) {
+                panic!("{e}\n{pl}");
+            }
+        }
+    };
+    let push_audio = |m: &mut Muxer, audio: &mut i64, n: u8, check: &mut dyn FnMut(&mut Muxer)| {
+        for _ in 0..n {
+            if m.push_audio(*audio, Bytes::from_static(b"aac")).is_err() {
+                return false;
+            }
+            *audio += 1920;
+            check(m);
+        }
+        true
+    };
+    for rec in data.chunks_exact(4) {
+        let step = i64::from(u16::from_le_bytes([rec[0], rec[1]]));
+        let (flags, more) = (rec[2], rec[3]);
+        dts += if flags & 2 != 0 { step * 16 } else { step };
+        if !push_audio(&mut m, &mut audio, (flags >> 4) & 7, &mut check) {
+            return;
+        }
+        let cut = flags & 4 != 0;
+        if cut {
+            if more & 0x10 != 0 {
+                stereo = !stereo;
+            }
+            let _ = m.reconfigure_with_audio_at(
+                Some(video.clone()),
+                Some(AudioConfig::Aac(aac(stereo))),
+                dts,
+                now,
+            );
+            check(&mut m);
+        }
+        if m.push_video(
+            dts,
+            dts,
+            cut || flags & 1 != 0,
+            Bytes::from_static(&[0; 8]),
+            now,
+        )
+        .is_err()
+        {
+            return;
+        }
+        check(&mut m);
+        if !push_audio(&mut m, &mut audio, more & 0x0f, &mut check) {
+            return;
+        }
+        if flags & 8 != 0 {
+            m.interrupt(now);
+            check(&mut m);
+        }
+    }
+    m.interrupt(now);
+    check(&mut m);
+}
+
 fn audio_timing(data: &[u8]) {
     let Some((&head, records)) = data.split_first() else {
         return;
@@ -271,6 +404,7 @@ fn audio_timing(data: &[u8]) {
             let _ = muxer.reconfigure_tracks(None, Some(config(stereo)), std::time::UNIX_EPOCH);
             pts = 0;
         }
+        check_run_ends(&mut muxer);
         if muxer.has_content() {
             let rendered = playlist::media(&muxer, "p");
             if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
@@ -390,6 +524,7 @@ fn fragment_budget(data: &[u8]) {
             }
             _ => {}
         }
+        check_run_ends(&mut muxer);
         assert!(quota.used() <= maximum);
         for (bytes, expected) in &held {
             assert_eq!(bytes.as_ref(), expected.as_slice());
@@ -427,6 +562,10 @@ fuzz_target!(|data: &[u8]| {
     // exact AAC frame clocks, interruptions and retained codec epochs.
     if let Some(records) = data.strip_prefix(b"AAC1") {
         audio_timing(records);
+        return;
+    }
+    if let Some(records) = data.strip_prefix(b"CUT1") {
+        continuing_cuts(records);
         return;
     }
     let Some(video) = H264Config::new(SPS, PPS) else {
@@ -474,6 +613,7 @@ fuzz_target!(|data: &[u8]| {
         if let Err(e) = retention.check(&m) {
             panic!("{e}");
         }
+        check_run_ends(&mut m);
         if !m.has_content() {
             continue;
         }

@@ -505,19 +505,13 @@ impl Publication {
             );
             self.callbacks.send(&self.stream.path, StreamEvent::Publish);
         }
+        // A new init segment: the old recording ends here (its file is
+        // finished and reported once its late audio is settled) and a new
+        // one starts. The old file first takes its epoch's last parts,
+        // sealed by this push, or starts with them if the epoch was shorter
+        // than one part.
+        let unrecorded = self.stream.roll_recording(&mut session, applied.restarted);
         if applied.restarted {
-            // A new init segment: the old recording ends here (its file is
-            // finished and reported) and a new one starts. The old file
-            // first takes its epoch's last parts, sealed by this push, or
-            // starts with them if the epoch was shorter than one part.
-            let unrecorded = session
-                .recorder
-                .as_mut()
-                .is_some_and(|outgoing| !self.stream.feed_outgoing(outgoing));
-            session.recorder = session
-                .recorder_factory
-                .as_ref()
-                .map(RecorderFactory::start);
             if unrecorded {
                 // Served media with no file: say so on the next one.
                 session

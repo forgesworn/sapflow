@@ -190,7 +190,7 @@ fn an_empty_retention_pool_releases_each_segment_as_it_leaves() {
     // hold cannot move to the empty pool, and goes as on main.
     assert_eq!(
         epochs_live_use(Some(Arc::new(FragmentQuota::new(0)))).0,
-        "3d95a9f7a1f4acaa432668ac10b2e175d02ca2df57b6d2a1fec5b87f420f09cf"
+        "7b326c77f0f7683e4f18e6b136936c1faf5a1a3d69aae85ab74a4b64741353de"
     );
 }
 
@@ -345,9 +345,11 @@ fn the_live_budget_holds_what_main_held() {
             "steady, segment_count 24",
             "882c3b7017d268115cbbdfd8264a6901b723bcd10cd4e7d986336b3773fe9e97",
         ),
+        // Changed with the interrupt flush: each reconnect now writes the
+        // held video frame and AAC frame where it dropped them.
         (
             "epochs, segment_count 8",
-            "3d95a9f7a1f4acaa432668ac10b2e175d02ca2df57b6d2a1fec5b87f420f09cf",
+            "7b326c77f0f7683e4f18e6b136936c1faf5a1a3d69aae85ab74a4b64741353de",
         ),
     ];
     let actual: Vec<(&str, &str)> = actual.iter().map(|(n, (d, _))| (*n, d.as_str())).collect();

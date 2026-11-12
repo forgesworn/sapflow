@@ -8,6 +8,10 @@ Rules (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9, 6.2.2;
 docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
   - TARGETDURATION and PART-TARGET never change while the stream runs;
   - every EXTINF, rounded to the nearest second, is at most TARGETDURATION;
+  - a segment whose parts are listed lasts, by its EXTINF, as long as they
+    do together, except within a continuous run after a part cut to exactly
+    PART-TARGET (a clamped stall, whose hole the next part's time carries),
+    with two units of the fifth decimal a part for tick rounding;
   - no EXT-X-PART DURATION is above PART-TARGET;
   - every part but the last of its segment is at least 85% of PART-TARGET;
     4.4.4.9 also exempts INDEPENDENT=YES parts, allowed here only in a
@@ -74,6 +78,15 @@ def check(text, live_window=True, byte_capped=False):
             target = head.get("#EXT-X-TARGETDURATION:")
             if target is not None and int(d + Decimal("0.5")) > target:
                 bad.append(f"segment {msn} lasts {d}, over TARGETDURATION {target}")
+            # Each part's duration is a whole number of 90 kHz ticks (an
+            # audio-only part's rounded up), up to 1.2 units from its span,
+            # and each printed is rounded by up to half a unit.
+            total = sum(p for _, p, _ in run)
+            if run and abs(total - d) > len(run) * Decimal("0.00002"):
+                # Only the decode-time hole after a part cut to PART-TARGET
+                # (a clamped stall).
+                if not (d > total and any(p == head.get("PART-TARGET") for _, p, _ in run)):
+                    bad.append(f"segment {msn} lasts {d}, but its parts sum to {total}")
             dseqs[msn] = dseq
             msn += 1
             parts.append((run, False))
