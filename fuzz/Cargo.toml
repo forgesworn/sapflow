@@ -285,6 +285,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "whip_tcp_front"
+path = "fuzz_targets/whip_tcp_front.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "opus_packaging"
 path = "fuzz_targets/opus_packaging.rs"
 test = false

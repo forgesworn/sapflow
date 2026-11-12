@@ -1,8 +1,9 @@
 //! WHIP ingest (docs/whip-ingest.md): the signalling listener on
 //! `SAPFLOW_WHIP_ADDR`, and one task that owns the media socket on
 //! `SAPFLOW_WHIP_UDP_ADDR` and every session's sans-IO state through
-//! `sapflow_whip::router::Router`. Nothing is bound unless WHIP is
-//! configured.
+//! `sapflow_whip::router::Router`, which also takes the frames of the
+//! ICE-TCP listener on `SAPFLOW_WHIP_TCP_ADDR` (`whip_tcp.rs`). Nothing is
+//! bound unless WHIP is configured.
 //!
 //! A `POST` is checked in this order, and a refusal at any step is sent
 //! without going further (`whip_request.rs` holds the rules):
@@ -55,6 +56,7 @@ use crate::publish::{Publication, PublicationLoss, Refusal};
 use crate::recorder::IncompleteReason;
 use crate::stream::{Source, SourceKind};
 use crate::whip_request::{self, Action, Refused};
+use crate::whip_tcp;
 
 /// Signalling connections served at once; more are closed as they arrive.
 const CONNECTIONS: usize = 32;
@@ -573,10 +575,12 @@ impl Whip {
     }
 }
 
-/// The two WHIP sockets, bound at start so a bad address stops the server.
+/// The WHIP sockets, bound at start so a bad address stops the server.
 pub(crate) struct Sockets {
     pub http: TcpListener,
     pub udp: UdpSocket,
+    /// The ICE-TCP listener, when `SAPFLOW_WHIP_TCP_ADDR` is set.
+    pub tcp: Option<whip_tcp::Bound>,
 }
 
 impl Sockets {
@@ -584,6 +588,7 @@ impl Sockets {
         Ok(Self {
             http: TcpListener::bind(config.addr).await?,
             udp: UdpSocket::bind(config.udp_addr).await?,
+            tcp: whip_tcp::Bound::bind(config).await?,
         })
     }
 }
@@ -663,17 +668,22 @@ async fn run(
         udp = %whip.config.udp_addr,
         "WHIP listening"
     );
+    let (tcp, tcp_listener) = whip_tcp::link(sockets.tcp);
     tokio::select! {
-        r = own_udp(sockets.udp, router, rx) => r,
+        r = own_udp(sockets.udp, router, rx, tcp) => r,
         r = listen(sockets.http, app, whip) => r,
+        r = tcp_listener => r,
     }
 }
 
-/// The UDP owner: the socket, the router, and each session's feed.
+/// The UDP owner: the socket, the router, and each session's feed. Frames
+/// from ICE-TCP connections come in through `tcp`, and sends to a TCP tuple
+/// go out through it (`whip_tcp.rs`).
 async fn own_udp(
     socket: UdpSocket,
     mut router: Router,
     mut commands: mpsc::Receiver<Command>,
+    mut tcp: whip_tcp::Link,
 ) -> std::io::Result<()> {
     let mut feeds: HashMap<SessionId, Feed> = HashMap::new();
     // One datagram; the session takes at most 1500 bytes of it.
@@ -700,6 +710,9 @@ async fn own_udp(
                 // never of the server.
                 Err(error) => tracing::debug!(%error, "WHIP receive failed"),
             },
+            Some(frame) = tcp.recv() => {
+                receive(&mut router, &mut feeds, frame.tuple, &frame.bytes);
+            }
             () = &mut timer, if armed.is_some() => {
                 armed = None;
                 router.handle_timeout(Instant::now());
@@ -721,9 +734,7 @@ async fn own_udp(
             router.handle_timeout(Instant::now());
         }
         while let Some(t) = router.poll_transmit() {
-            if socket.send_to(&t.bytes, t.tuple.remote).await.is_err() {
-                tracing::debug!("WHIP send failed");
-            }
+            tcp.transmit(&socket, t).await;
         }
         let mut gone = Vec::new();
         let mut keyframes = Vec::new();
@@ -768,9 +779,7 @@ async fn own_udp(
         for id in keyframes {
             router.request_keyframe(&id, Instant::now());
             while let Some(t) = router.poll_transmit() {
-                if socket.send_to(&t.bytes, t.tuple.remote).await.is_err() {
-                    tracing::debug!("WHIP send failed");
-                }
+                tcp.transmit(&socket, t).await;
             }
         }
         for id in gone {
@@ -1308,3 +1317,7 @@ async fn ingest(
 #[cfg(test)]
 #[path = "whip_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "whip_tcp_tests.rs"]
+mod tcp_tests;

@@ -4,10 +4,26 @@
 //
 //   cargo build -p sapflow [--target <triple>]
 //   node scripts/whip-e2e.js --bin <sapflow> --vendor <dir with hls.min.js> --out <scratch dir> \
-//     [--base 47300] [--seconds 10]
+//     [--base 47300] [--seconds 10] [--transport udp|tcp|proxy]
 //
 // Ports: base+1 HLS, base+2 SRT, base+3 WHIP signalling, base+4 WHIP media,
-// base+5 this script's page server. CHROME picks the browser binary.
+// base+5 this script's page server, base+6 the ICE-TCP listener, base+7 the
+// PROXY relay. CHROME picks the browser binary.
+//
+// --transport picks the only candidate the answer advertises, so the
+// browser has one way in:
+//   udp    the media UDP socket (the default);
+//   tcp    the ICE-TCP listener on 127.0.0.1 (passive, RFC 6544), so the
+//          browser must use ICE-TCP;
+//   proxy  a layer-4 relay on 127.0.0.1 that prefixes each connection with a
+//          PROXY protocol v2 header and forwards it from ::1 to the ICE-TCP
+//          listener on [::1], which believes headers only from ::1
+//          (SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2, SAPFLOW_WHIP_TRUSTED_PROXY=::1).
+//          The browser's POST still comes from 127.0.0.1, so it is not taken
+//          as the proxy's.
+// The nominated pair's protocol, from the browser's statistics, must match.
+// Ports are 1024 or above: Chrome 157 starts no ICE-TCP to a private address
+// below that (W0).
 //
 // 1. A3.6 default: sapflow without SAPFLOW_WHIP_ADDR binds neither WHIP
 //    port (lsof on its PID), and SAPFLOW_WHIP_UDP_ADDR alone is refused at
@@ -19,7 +35,9 @@
 // 3. A3.6 privacy: sapflow ran with RUST_LOG=trace; its log must not hold
 //    the token, any address, port or mDNS name from the offer, or the
 //    publisher's address or port. The check is first shown to catch a
-//    planted token.
+//    planted token. Over TCP the publisher's real source port is not in the
+//    offer (active candidates say 9): it is taken from sapflow's established
+//    connections (lsof) or from the relay, and the run fails without it.
 //
 // Everything a run writes (logs, the offer, the recording, frames) stays in
 // --out, which is scratch, never the repository.
@@ -27,6 +45,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -34,8 +53,10 @@ const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const bin = opt('bin'), vendor = opt('vendor'), out = opt('out');
 const base = +opt('base', 47300), seconds = +opt('seconds', 10);
+const transport = opt('transport', 'udp');
+if (!['udp', 'tcp', 'proxy'].includes(transport)) { console.error('--transport udp|tcp|proxy'); process.exit(2); }
 const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const port = { hls: base + 1, srt: base + 2, whip: base + 3, media: base + 4, page: base + 5 };
+const port = { hls: base + 1, srt: base + 2, whip: base + 3, media: base + 4, page: base + 5, tcp: base + 6, relay: base + 7 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 const check = (name, ok, detail = '') => { results.push({ name, ok: !!ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`); };
@@ -110,7 +131,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     out.connection = pc.connectionState;
     const stats = await pc.getStats();
     stats.forEach((s) => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
-      const local = stats.get(s.localCandidateId); if (local) out.publisher = { address: local.address, port: local.port }; } });
+      const local = stats.get(s.localCandidateId), remote = stats.get(s.remoteCandidateId);
+      if (local) out.publisher = { address: local.address, port: local.port };
+      out.pair = { local: local && { protocol: local.protocol, tcpType: local.tcpType, type: local.candidateType },
+        remote: remote && { protocol: remote.protocol, tcpType: remote.tcpType, port: remote.port } }; } });
     // The playlist exists once the first part is out, after the start hold.
     const playlist = 'http://127.0.0.1:${port.hls}/live/${EVENT}/index.m3u8';
     for (let i = 0; i < 150; i++) { const p = await fetch(playlist).catch(() => null); if (p && p.ok) break; await sleep(100); }
@@ -164,8 +188,51 @@ function launchChrome(url) {
   return { child, profile };
 }
 
+// A PROXY protocol v2 header (the specification's section 2.2) for a TCP
+// connection over IPv4: the 12-byte signature, version 2 with the PROXY
+// command (0x21), TCP over IPv4 (0x11), the address block's length (12),
+// then source address, destination address, source port and destination
+// port, all in network order.
+function proxyV2(src, srcPort, dst, dstPort) {
+  const v4 = (ip) => Buffer.from(ip.replace(/^::ffff:/, '').split('.').map(Number));
+  const b = Buffer.alloc(28);
+  Buffer.from([0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]).copy(b, 0);
+  b[12] = 0x21; b[13] = 0x11; b.writeUInt16BE(12, 14);
+  v4(src).copy(b, 16); v4(dst).copy(b, 20);
+  b.writeUInt16BE(srcPort, 24); b.writeUInt16BE(dstPort, 26);
+  return b;
+}
+
+// A test-only layer-4 relay: each connection to 127.0.0.1:listen is opened
+// again from ::1 to [::1]:target, the header sent first, then bytes copied
+// both ways unchanged. `clients` collects each browser end it accepted.
+function relay(listen, target, clients) {
+  const sockets = new Set();
+  const server = net.createServer((client) => {
+    clients.push({ address: client.remoteAddress.replace(/^::ffff:/, ''), port: client.remotePort });
+    const up = net.connect({ host: '::1', port: target, localAddress: '::1' }, () => {
+      up.write(proxyV2(client.remoteAddress, client.remotePort, client.localAddress, client.localPort));
+      client.pipe(up); up.pipe(client);
+    });
+    for (const s of [client, up]) { sockets.add(s); s.on('close', () => { sockets.delete(s); client.destroy(); up.destroy(); }); s.on('error', () => {}); }
+  });
+  server.stop = () => { for (const s of sockets) s.destroy(); server.close(); };
+  return new Promise((r) => server.listen(listen, '127.0.0.1', () => r(server)));
+}
+
+// The far ends of sapflow's established connections to its ICE-TCP port.
+function tcpPeers(pid, local) {
+  const r = spawnSync('lsof', ['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:ESTABLISHED'], { encoding: 'utf8' });
+  const found = [];
+  for (const l of r.stdout.split('\n')) {
+    const m = new RegExp(`:${local}->\\[?([^\\]\\s]+?)\\]?:(\\d+) `).exec(l);
+    if (m) found.push({ address: m[1], port: +m[2] });
+  }
+  return found;
+}
+
 // Every literal a privacy check looks for, from the offer and the publisher.
-function secrets(offer, publisher) {
+function secrets(offer, publisher, extra = []) {
   const found = new Set([TOKEN, TOKEN.split(':')[1]]);
   for (const line of offer.split(/\r?\n/)) {
     const cand = /^a=candidate:\S+ \d+ \S+ \d+ (\S+) (\d+) typ (\S+)(?: raddr (\S+) rport (\d+))?/.exec(line);
@@ -176,7 +243,9 @@ function secrets(offer, publisher) {
     const c = /^c=IN IP[46] (\S+)/.exec(line); if (c && c[1] !== '0.0.0.0') found.add(c[1]);
     const pwd = /^a=ice-pwd:(\S+)/.exec(line); if (pwd) found.add(pwd[1]);
   }
-  if (publisher) { found.add(`${publisher.address}:${publisher.port}`); found.add(String(publisher.port)); if (publisher.address !== '127.0.0.1') found.add(publisher.address); }
+  for (const p of [publisher, ...extra].filter(Boolean)) {
+    found.add(`${p.address}:${p.port}`); found.add(String(p.port)); if (p.address !== '127.0.0.1') found.add(p.address);
+  }
   // The server's own loopback address appears in its listen lines; it is
   // the publisher's only with the publisher's port, checked above.
   found.delete('127.0.0.1');
@@ -215,20 +284,38 @@ function hits(text, s) {
     SAPFLOW_RECONNECT_GRACE: '2',
     SAPFLOW_WHIP_ADDR: `127.0.0.1:${port.whip}`,
     SAPFLOW_WHIP_UDP_ADDR: `127.0.0.1:${port.media}`,
-    SAPFLOW_WHIP_CANDIDATES: `udp 127.0.0.1:${port.media}`,
     SAPFLOW_WHIP_PUBLIC_URL: `http://127.0.0.1:${port.whip}`,
     SAPFLOW_WHIP_ALLOW_ORIGINS: `http://127.0.0.1:${port.page}`,
-  }, log, 'WHIP listening');
+    ...{
+      udp: { SAPFLOW_WHIP_CANDIDATES: `udp 127.0.0.1:${port.media}` },
+      tcp: { SAPFLOW_WHIP_CANDIDATES: `tcp 127.0.0.1:${port.tcp}`, SAPFLOW_WHIP_TCP_ADDR: `127.0.0.1:${port.tcp}` },
+      proxy: {
+        SAPFLOW_WHIP_CANDIDATES: `tcp 127.0.0.1:${port.relay}`, SAPFLOW_WHIP_TCP_ADDR: `[::1]:${port.tcp}`,
+        SAPFLOW_WHIP_TCP_PROXY_PROTOCOL: 'v2', SAPFLOW_WHIP_TRUSTED_PROXY: '::1',
+      },
+    }[transport],
+  }, log, transport === 'udp' ? 'WHIP listening' : 'WHIP ICE-TCP listening');
   const on = sockets(s.child.pid);
   fs.writeFileSync(path.join(out, 'on-sockets.txt'), on.join('\n') + '\n');
   check('WHIP on: signalling and media sockets bound', bound(on, port.whip) && bound(on, port.media));
+  if (transport !== 'udp') check('WHIP on: the ICE-TCP listener is bound', bound(on, port.tcp));
+  // Over TCP, the publisher's real ends: sapflow's peers (direct), or the
+  // browser ends the relay accepted (proxy), whose addresses the PROXY
+  // headers gave sapflow.
+  const peers = [];
+  const proxy = transport === 'proxy' ? await relay(port.relay, port.tcp, peers) : null;
+  const watch = transport === 'tcp' ? setInterval(() => {
+    for (const p of tcpPeers(s.child.pid, port.tcp)) if (!peers.some((q) => q.port === p.port)) peers.push(p);
+  }, 250) : null;
   let report;
   const done = new Promise((r) => { report = r; });
   const page = await pageServer(report);
   const browser = launchChrome(`http://127.0.0.1:${port.page}/`);
   const r = await Promise.race([done, sleep((seconds + 60) * 1000).then(() => null)]);
+  if (watch) clearInterval(watch);
   await stopGroup(browser.child.pid);
   page.close();
+  if (proxy) proxy.stop();
   trash(browser.profile);
   if (!r) { check('page reported', false, 'timeout'); }
   else {
@@ -236,6 +323,10 @@ function hits(text, s) {
     if (r.frame) fs.writeFileSync(path.join(out, 'hls-frame.png'), Buffer.from(r.frame.split(',')[1], 'base64'));
     check('POST 201 with an absolute Location', r.post === 201 && /^http:\/\/127\.0\.0\.1:\d+\/whip\/session\/[0-9a-f]{32}$/.test(r.location || ''), `${r.post}`);
     check('ICE and DTLS connected', r.connection === 'connected', r.connection);
+    const want = transport === 'udp' ? 'udp' : 'tcp';
+    const pair = r.pair || {};
+    check(`the nominated pair is ${want.toUpperCase()}`, pair.local && pair.local.protocol === want && pair.remote && pair.remote.protocol === want
+      && (want === 'udp' || pair.remote.tcpType === 'passive'), JSON.stringify(pair));
     check('hls.js played the stream', r.played >= seconds && r.width > 0 && r.decoded >= seconds * 10, `${(r.played || 0).toFixed(1)} s at ${r.width}x${r.height}, ${r.decoded} frames decoded, ${r.dropped} dropped`);
     check('DELETE 200', r.delete === 200, `${r.delete}`);
     check('no page errors', r.errors.length === 0, r.errors.join('; '));
@@ -263,14 +354,21 @@ function hits(text, s) {
   const plain = logText.replace(/\x1b\[[0-9;]*m/g, '');
   check('the session ended with nothing lost', /WHIP session ended reason=Closed lost=0/.test(plain));
   check('the recording finished complete', /recording finished .*complete=true/.test(plain));
-  const list = r ? secrets(r.offer || '', r.publisher) : [TOKEN];
+  if (transport !== 'udp') {
+    check('the publisher\'s real TCP ends were seen', peers.length > 0 && peers.every((p) => p.port >= 1024 && p.port !== port.tcp),
+      `${peers.length} connection(s)`);
+  }
+  const list = r ? secrets(r.offer || '', r.publisher, peers) : [TOKEN];
   const planted = logText + `\nplanted ${TOKEN}\n`;
   check('privacy check catches a planted token', hits(planted, TOKEN).length === 1);
-  check('trace log is non-trivial', logText.split('\n').length > 100 && logText.includes('TRACE'), `${logText.split('\n').length} lines`);
+  // Trace logging was on: the runtime's own trace lines are there. A TCP run
+  // logs fewer lines than a UDP one, so the count is a floor, not a target.
+  const traces = logText.split('\n').filter((l) => l.includes('TRACE')).length;
+  check('trace log is non-trivial', logText.split('\n').length > 50 && traces >= 10, `${logText.split('\n').length} lines, ${traces} at trace`);
   const leaks = list.map((x) => ({ x, lines: hits(logText, x) })).filter((h) => h.lines.length);
   fs.writeFileSync(path.join(out, 'privacy.json'), JSON.stringify({ checked: list.length, leaks: leaks.map((l) => ({ lines: l.lines.slice(0, 5) })) }, null, 1));
   check('trace log holds no token, offer address, port or mDNS name, or publisher address', leaks.length === 0,
-    `${list.length} literals checked (publisher seen: ${!!(r && r.publisher)})${leaks.length ? '; see privacy.json' : ''}`);
+    `${list.length} literals checked (publisher seen: ${!!(r && r.publisher)}, ${peers.length} TCP ends)${leaks.length ? '; see privacy.json' : ''}`);
 
   fs.writeFileSync(path.join(out, 'results.json'), JSON.stringify(results, null, 1));
   const failed = results.filter((x) => !x.ok).length;

@@ -6,7 +6,9 @@
 //! A frame longer than [`Framing::max_frame`] (1500 bytes, the same cap as
 //! a UDP datagram) ends the stream: the framing cannot be trusted after it.
 //! Empty frames carry nothing and are skipped. [`encode`] frames one packet
-//! for sending. The TCP listener and PROXY protocol come in W3d.
+//! for sending. The server's ICE-TCP listener (`whip_tcp.rs`) and PROXY
+//! protocol are outside this crate; each frame goes to the session with a
+//! [`crate::Tuple::tcp`] that names its connection.
 
 use std::fmt;
 

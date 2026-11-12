@@ -120,7 +120,7 @@ publisher (browser, OBS)
 | `sapflow-dtls` | DTLS 1.2 server in the browser profile: records, handshake, retransmission, DTLS-SRTP key export, certificate fingerprints | New, sans-IO |
 | `sapflow-whip` | ICE-lite and STUN, SDP offer parsing and answer building, the session that composes ICE, DTLS, SRTP and RTP, and the WHIP resource rules | New, sans-IO |
 | `sapflow-hls` | An Opus audio track beside AAC (see [Opus](#opus)) | Changed |
-| `sapflow-server` (package and binary `sapflow`) | `whip.rs`: signalling listener, UDP owner task, TCP listener, wiring into `Publication` and `EsIngest`. `Protocol` in `publish_auth.rs` gains `Webrtc` | Changed |
+| `sapflow-server` (package and binary `sapflow`) | `whip.rs`: signalling listener, UDP owner task; `whip_tcp.rs`: the ICE-TCP listener; wiring into `Publication` and `EsIngest`. `Protocol` in `publish_auth.rs` gains `Webrtc` | Changed |
 
 `sapflow-core` is not expected to change: a WHIP request fills the existing
 `PublishRequest` (path, user, password).
@@ -445,10 +445,27 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   Attribute` (RFC 8489).
 - **TCP.** A passive candidate (`tcptype passive`) on a listener
   (`SAPFLOW_WHIP_TCP_ADDR`) that a layer-4 front proxy can forward to, so the
-  media can use TCP 443 when UDP is blocked. When the proxy sends PROXY
-  protocol v2 (`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2`), the header is accepted
-  only from the trusted proxy address and gives the publisher's real address.
-  RFC 4571 frames carry STUN, DTLS and SRTP exactly as datagrams do.
+  media can use TCP 443 when UDP is blocked. RFC 4571 frames carry STUN,
+  DTLS, SRTP and SRTCP exactly as datagrams do, at most 1500 bytes each, and
+  feed the same router and sessions as the UDP socket (W3d):
+  - Each connection is its own tuple: the publisher's address and the
+    listener's number for the connection, never reused. A UDP path, or
+    another connection, from the same address is another tuple. A
+    session's rules are the same on TCP, the per-tuple budget included
+    (see below), counting packets, not their two-byte length prefixes.
+  - When the proxy sends PROXY protocol v2
+    (`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2`), each connection must start with
+    the header, and only from `SAPFLOW_WHIP_TRUSTED_PROXY`: any other peer
+    is dropped before a byte is read. The header's source, in canonical
+    form, is then the publisher's address: it keys the per-address cap and
+    is what a check's XOR-MAPPED-ADDRESS reports. Admission and the
+    failed-attempt throttle stay at the `POST`, with its own address rules.
+    The trust check compares addresses, not ports, so any process on the
+    proxy's host is trusted.
+  - A LOCAL header is the proxy's own connection, such as a health check,
+    with no publisher behind it: once its header is in, the connection is
+    closed and no frame on it is read. Taking the proxy as the publisher
+    would put every such connection on the proxy's address.
   Chrome 157 did not start ICE-TCP to a private address on a port below 1024
   (80, 443 and 1023 were tried). It did at 1024 and 8443, and it started
   checks to a public-range address on 443. A public deployment advertises a
@@ -1063,6 +1080,12 @@ There is no ICE restart in v1.
   pattern of `srt_own.rs`. Depacketised media goes to each publication's
   ingest task over a bounded queue. A full queue is media loss for that
   publisher, never back-pressure on the socket.
+- The ICE-TCP listener (`whip_tcp.rs`) runs one task per connection. Their
+  frames reach the UDP owner over one queue of 1024; a full queue makes the
+  readers wait, which TCP's flow control carries back to the publishers.
+  What a session sends to a TCP tuple goes into that connection's queue
+  without waiting: a full queue drops the packet, as a lost datagram would
+  be, and never holds up the owner.
 - A panic while handling one session's packet ends that session only. Each
   call into a session runs under `catch_unwind` (safe Rust under
   `panic = "unwind"`), and the session is then dropped. This is an
@@ -1077,7 +1100,10 @@ There is no ICE restart in v1.
   - transport-cc packets awaiting feedback (1024) and feedback packet size
     (1000 bytes);
   - DTLS handshake message size and number of flights;
-  - TCP connections per address;
+  - ICE-TCP connections in total (128) and per publisher address (32),
+    the PROXY header's time (5 s), the time to a first frame sent back
+    (10 s) and between frames sent back (30 s), and each connection's send
+    queue (256 frames, 256 KiB);
   - and the existing publisher and presentation caps.
 - Nothing is sent to an address before a STUN check from it passes
   MESSAGE-INTEGRITY, and STUN answers are no larger than the requests that
@@ -1155,7 +1181,10 @@ There is no ICE restart in v1.
   - Offers carry the publisher's addresses in their candidates. They are
     parsed in memory and never logged or stored.
   - The token is never logged, and neither are publisher addresses. A3.6
-    checks both. The address is used only for the throttle, in memory.
+    checks both. The address is used only for the throttle, in memory, and
+    on the ICE-TCP listener for the per-address cap and the check's
+    XOR-MAPPED-ADDRESS. Behind PROXY protocol v2 that is the header's
+    source; the ICE-TCP listener logs a connection only by its number.
 - **One server certificate per process.** It is generated at start (ECDSA
   P-256) and its fingerprint is put in every answer. It identifies the server,
   not the publisher.
@@ -1167,22 +1196,27 @@ There is no ICE restart in v1.
 ## Configuration
 
 W3c built `SAPFLOW_WHIP_ADDR`, `SAPFLOW_WHIP_PUBLIC_URL`,
-`SAPFLOW_WHIP_UDP_ADDR` and `SAPFLOW_WHIP_CANDIDATES` (required together,
-UDP candidates only), and `SAPFLOW_WHIP_ALLOW_ORIGINS`,
-`SAPFLOW_WHIP_TRUSTED_PROXY`, `SAPFLOW_WHIP_KEYFRAME_INTERVAL` (seconds, 0
-for none) and `SAPFLOW_WHIP_OPUS_MAX_BITRATE`. Any WHIP setting without
-`SAPFLOW_WHIP_ADDR`, `SAPFLOW_WHIP_TCP_ADDR` (W3d), and WHIP with the scoped
-control API are refused at start. `SAPFLOW_WHIP_JITTER` and
-`SAPFLOW_WHIP_STALE` are still proposals.
+`SAPFLOW_WHIP_UDP_ADDR` and `SAPFLOW_WHIP_CANDIDATES` (required together),
+and `SAPFLOW_WHIP_ALLOW_ORIGINS`, `SAPFLOW_WHIP_TRUSTED_PROXY`,
+`SAPFLOW_WHIP_KEYFRAME_INTERVAL` (seconds, 0 for none) and
+`SAPFLOW_WHIP_OPUS_MAX_BITRATE`. W3d built `SAPFLOW_WHIP_TCP_ADDR` and
+`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL`, and `tcp` candidates. Refused at start:
+any WHIP setting without `SAPFLOW_WHIP_ADDR`; WHIP with the scoped control
+API; a `tcp` candidate without `SAPFLOW_WHIP_TCP_ADDR`, and
+`SAPFLOW_WHIP_TCP_ADDR` with no `tcp` candidate or on the signalling
+address; `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` other than `v2`, or `v2` without
+`SAPFLOW_WHIP_TCP_ADDR` or `SAPFLOW_WHIP_TRUSTED_PROXY`. The UDP socket is
+bound even when only `tcp` candidates are advertised.
+`SAPFLOW_WHIP_JITTER` and `SAPFLOW_WHIP_STALE` are still proposals.
 
 | Variable | Meaning |
 |---|---|
 | `SAPFLOW_WHIP_ADDR` | Signalling listener. Unset means WHIP is off |
 | `SAPFLOW_WHIP_PUBLIC_URL` | Public base URL of the signalling listener, for `Location` |
 | `SAPFLOW_WHIP_UDP_ADDR` | Media UDP bind address |
-| `SAPFLOW_WHIP_TCP_ADDR` | Passive ICE-TCP listener, for a front proxy. Optional |
-| `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` | `v2` to accept PROXY protocol v2 from the trusted proxy |
-| `SAPFLOW_WHIP_CANDIDATES` | Advertised candidates, as above |
+| `SAPFLOW_WHIP_TCP_ADDR` | Passive ICE-TCP listener, for a front proxy. Optional; needs a `tcp` candidate |
+| `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` | `v2`: every ICE-TCP connection starts with a PROXY protocol v2 header from `SAPFLOW_WHIP_TRUSTED_PROXY`, whose source is the publisher; any other peer is dropped. Unset: no header, and the TCP peer is the publisher |
+| `SAPFLOW_WHIP_CANDIDATES` | Advertised candidates, as above: `udp <ip>:<port>` and `tcp <ip>:<port>`, 1 to 8 |
 | `SAPFLOW_WHIP_TRUSTED_PROXY` | Address whose `X-Forwarded-For` and PROXY headers are believed |
 | `SAPFLOW_WHIP_ALLOW_ORIGINS` | Origins allowed by CORS for browser publishing |
 | `SAPFLOW_WHIP_KEYFRAME_INTERVAL` | Keyframe request cadence, proposed 2 s |
@@ -1719,14 +1753,153 @@ Implementation notes (W3c part 1, 11 November 2026):
     selected tuple but sent to the send tuple, so once they differ a
     `close_notify` from the media tuple is dropped. A graceful end should
     rely on `DELETE` and the media timeout, not on it.
-- **Left to W3d.** PROXY protocol v2 and the TCP listener. The v2 header
-  parser and trusted-proxy check exist (`sapflow_core::proxy_protocol`); the
-  listener that uses them is still to come. For that listener:
-  - It needs a timeout for a partial header.
-  - Decide what LOCAL means on the ICE-TCP port.
-  - The trust check compares addresses, not ports, so any process on the
-    proxy host is trusted.
-  - Call `parse_trusted`, not `parse`, on every connection.
+- **Left to W3d.** PROXY protocol v2 and the TCP listener: built in W3d,
+  below, with the partial-header timeout, a decision on LOCAL, the note on
+  ports, and `parse_trusted` on every connection.
+
+Implementation notes (W3d, 11 November 2026):
+
+- **Tuples.** `sapflow_whip::Tuple` gained `connection`: 0 for UDP, and for
+  TCP the listener's number for the connection, never reused while the
+  process runs. A TCP tuple is `Tuple::tcp(publisher address, number)`.
+  The address alone could not name a connection: a PROXY header can repeat
+  one, and a port is reused after a close. Tuples compare transport,
+  address and number, so a TCP tuple never equals a UDP one.
+- **Session and router unchanged.** TCP has its own handshake, so a source
+  cannot be spoofed on it except through the trusted proxy; the rules are
+  kept anyway, the 4x per-tuple budget included. A copy of a check or of
+  SRTP sent on another connection lands on that connection's own tuple, so
+  it cannot take or pollute the publisher's. The budget counts packets on
+  both sides, not their length prefixes.
+- **The listener** (`whip_tcp.rs`, with the sans-IO front in
+  `whip_tcp_front.rs`):
+  - one task accepts; past 128 connections a new one is closed at once;
+  - one task per connection reads 4 KiB at a time. With PROXY protocol v2,
+    a peer other than the trusted proxy is closed before a read, and
+    `parse_trusted` reads the header within 5 s of accept. A PROXY header
+    gives the publisher's address; LOCAL is closed. Then the per-address
+    cap (32) applies, keyed on that address. Frames (at most 1500 bytes; a
+    longer one ends the connection) go to the UDP owner as
+    `Tuple::tcp(address, number)`;
+  - the UDP owner takes them through `whip.rs`'s own receive path, so only
+    authenticated SRTP and SRTCP count against the bitrate cap, as for UDP.
+    Its sends to a TCP tuple go into that connection's queue (256 frames,
+    256 KiB, framed) with `try_send`; a full queue, or a connection that
+    has gone, drops the packet and counts it. A TCP tuple never falls
+    through to the UDP socket;
+  - a connection closes when nothing has been sent back to it within 10 s
+    of its start, or within 30 s of the last frame sent back. Sapflow sends
+    nothing to a tuple whose check has not passed MESSAGE-INTEGRITY, so
+    these judge by what the session answered, not by what the peer sent.
+    One write may take 5 s;
+  - a failed accept is logged and retried after 100 ms, as on the
+    signalling listener.
+
+  The hook in `whip.rs` is one `select!` arm, the send dispatch and the
+  bound listener in `Sockets`. The limits are constants (`whip_tcp::Limits`),
+  not settings; tests set them small.
+- **LOCAL.** Closed once its header is in, no frame read (see Connectivity).
+- **Fuzzing.** `whip_tcp_front`: a mode byte picks a direct connection or
+  PROXY v2 from the trusted proxy (as itself or IPv4-mapped) or another
+  peer, and the stream is cut two ways in pushes of at most 4096 bytes.
+  Both must give the same frames, address and close; another peer is
+  refused unread; frames are non-empty and at most 1500 bytes; a direct
+  connection's frames are exactly the RFC 4571 decoder's; behind the proxy,
+  frames come only after a PROXY header, whose canonical source is the
+  address, and LOCAL or a refused header gives none. Eight synthetic seeds;
+  a seed replay test and a fixed-seed mutation pass run with the unit
+  tests. On the test host, built with `-s none` and
+  `RUSTFLAGS="-Clink-arg=-undefined -Clink-arg=dynamic_lookup"`, it ran
+  7,474,458 times in 121 s from the seeds with no crash. Every fuzz
+  target builds that way (38).
+- **End to end** (`scripts/whip-e2e.js --transport tcp|proxy`, headless
+  Google Chrome 157 on the test host, loopback, ports 47400 to 47447). The
+  answer advertised only a TCP candidate, so ICE-TCP was the only way in:
+  - **Direct** (`tcp 127.0.0.1:47406`): the nominated pair was Chrome's
+    active TCP candidate (peer-reflexive) to our passive one. Chrome opened
+    5 connections, one per local candidate. hls.js played 10.1 s at
+    640x360 (206 frames decoded, none dropped). The recording decoded 246
+    H.264 frames at 640x360 and 609 stereo Opus frames, and was finished
+    complete; the session ended `Closed` with `lost=0`.
+  - **Longer than the timeouts** (`--seconds 60`, direct): the session ran
+    about 79 s (3,944 Opus frames recorded) and ended `Closed`, `lost=0`,
+    complete. All 5 connections stayed open until Chrome closed them: none
+    closed idle, so Chrome kept checking its spare pairs and they were
+    answered. hls.js stalled in that run on the SPS change below.
+  - **Through a PROXY v2 relay** (`tcp 127.0.0.1:47427`): a test-only Node
+    relay, written from the specification, prefixed each connection with a
+    PROXY v2 header and forwarded it from `::1` to the listener on
+    `[::1]:47426`, which trusted only `::1`. The browser's `POST` came from
+    127.0.0.1, so it was not taken as the proxy's. The pair was again
+    active to passive TCP. 10.1 s played at 640x360 (205 decoded, none
+    dropped); the recording decoded 247 H.264 frames at 640x360 and 613
+    Opus frames, complete, `lost=0`.
+  - **Privacy** in both: the trace log held none of 54 literals: the
+    token, the offer's addresses, ports and mDNS names, and the
+    publisher's 5 real TCP ends (address and source port, from `lsof` on
+    sapflow or from the relay; the run fails without them, since the
+    offer's active candidates say port 9). The check first caught a
+    planted token.
+  - **UDP** still passes after the change: 10.0 s at 640x360, 205 frames
+    decoded, none dropped; recording 243 H.264 and 609 Opus frames.
+
+  These figures are from the final build; earlier builds of the branch
+  gave the same results.
+  - **Runs that failed.** Chrome changed its SPS mid-stream to 480x270 in
+    3 of 6 direct runs, 2 of 4 relay runs and 1 of 4 UDP runs, mostly
+    while the test host's load average was up to 331 from other jobs, once
+    at about 8. `sapflow-hls` keeps the first SPS (its warning says so),
+    and hls.js decoded 4 frames and stalled. The recordings still decoded
+    (249 to 584 frames at 480x270) and were complete. It happened over UDP
+    too, so it is not the transport's, and it belongs to `sapflow-hls`;
+    whether TCP makes Chrome lower its resolution more often is not
+    settled by so few runs.
+  - **Loopback artefact.** Over UDP on loopback, about 200 sends a run fail
+    with `Can't assign requested address`: Chrome's checks from its
+    non-loopback host candidates reach the socket bound to 127.0.0.1,
+    which cannot answer them. This predates W3d; the debug line now gives
+    the error.
+
+| Claim | Test | Status |
+|---|---|---|
+| A TCP tuple names its connection: a UDP path or another connection from the same address is another tuple, is not validated, and its media reaches no session | `tcp_tests::a_session_over_framed_tcp_aead_aes_128_gcm` (sapflow-whip), `tcp_tests::a_second_connection_is_its_own_pair` | Met in process |
+| A whole session over RFC 4571 frames cut at awkward offsets both ways, both SRTP profiles: exactly the access units and audio sent, feedback back over the connection, the check's XOR-MAPPED-ADDRESS the connection's address, the budget dropping nothing | `tcp_tests::a_session_over_framed_tcp_aead_aes_128_gcm`, `tcp_tests::a_session_over_framed_tcp_aes_cm_hmac_sha1_80` | Met |
+| The server over ICE-TCP: `POST`, ICE, DTLS and SRTP on one connection, media in the playlist, `DELETE` 200, and nothing sent over UDP to the publisher's address | `whip::tcp_tests::a_publisher_reaches_the_stream_over_ice_tcp` | Met in process (GCM) |
+| PROXY v2 from the trusted proxy: the header's source is the publisher's address, canonical, and the session connects | `whip::tcp_tests::a_proxy_v2_header_from_the_trusted_proxy_gives_the_publisher_address`, `whip_tcp_front::tests::the_header_source_is_the_client_and_frames_follow_it`, `whip_tcp_front::tests::an_ipv4_mapped_proxy_is_still_the_proxy_and_its_source_canonical` | Met |
+| Any other peer is dropped before a byte is read | `whip::tcp_tests::any_other_peer_is_dropped_unread`, `whip_tcp_front::tests::any_other_peer_is_refused_unread`, the `whip_tcp_front` target | Met |
+| LOCAL is closed and no frame on it read | `whip::tcp_tests::a_local_header_is_closed_without_reading_frames`, `whip_tcp_front::tests::local_is_refused_once_its_header_is_in` | Met |
+| A partial header closes at the header timeout (5 s) | `whip::tcp_tests::a_partial_header_times_out` (at 300 ms) | Met |
+| Past the connection cap (128) a connection is closed at accept, and a slot frees when one closes | `whip::tcp_tests::past_the_connection_cap_a_connection_is_closed` (at 2) | Met |
+| Past the per-address cap (32), keyed on the PROXY header's source, a connection is closed; another address is not. A direct connection is keyed on its TCP peer by the same code, untested | `whip::tcp_tests::past_the_per_address_cap_a_connection_is_closed` (at 1) | Met |
+| A connection never answered closes at 10 s, whatever it sends; one answered then left quiet, at 30 s | `whip::tcp_tests::unanswered_and_idle_connections_close` (at 300 ms each) | Met |
+| A frame over 1500 bytes ends the connection | `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`, `whip_tcp_front::tests::a_frame_over_the_cap_ends_the_connection` | Met |
+| A connection's send queue is bounded in frames (256) and bytes (256 KiB); past either, and for a connection that has gone or a packet over 1500 bytes, the packet is dropped and counted | `whip_tcp::tests::the_send_queue_is_bounded_in_bytes_and_frames` (at 4 frames, 3006 bytes) | Met. That the owner never waits on a connection follows from `try_send`; no test stalls a reader to show it |
+| The front's outcome does not depend on how the stream is cut | the `whip_tcp_front` target; `whip_tcp_front::tests::seeds_hold_the_fuzz_checks` (6 inline seeds, 500 mutations each), `whip_tcp_front::tests::committed_seeds_hold_the_fuzz_checks` | Met for a 121 s run (7,474,458 inputs, no crash); CI's fuzz job has not run it yet |
+| Configuration refusals and the TCP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
+| A3.1 over ICE-TCP: headless Chrome publishes with only a TCP candidate, directly and through a PROXY v2 relay; hls.js plays; the recording opens | `scripts/whip-e2e.js --transport tcp`, `--transport proxy` | Partial: Chrome 157 on loopback, figures above. Other browsers, and A0.3 (a public address on 443, UDP blocked), are open |
+| A3.6 over ICE-TCP: the trace log holds no token, offer address, port or mDNS name, or the publisher's real TCP ends | the same runs | Met for those runs (54 literals each) |
+
+Not claimed, because nothing tests them: the 5 s write timeout, the retry
+after a failed accept, the per-address cap on a direct connection, and
+that the inbound queue's back-pressure stays with the slow reader.
+
+- **Left after W3d.**
+  - A0.3: a run against a public address on 443 with UDP blocked, for each
+    browser target and OBS.
+  - A closed connection is not reported to its session, which sees a path
+    gone quiet and ends by consent or the media timeout (30 s) unless
+    another path carries on. Ending, or failing over, at once when the
+    session's send tuple closes would be quicker.
+  - Without PROXY protocol, a proxy in front makes every connection the
+    proxy's, under one per-address cap: use v2 behind a proxy.
+  - The limits are constants. The total does not follow
+    `SAPFLOW_MAX_PUBLISHERS`; at 5 connections a Chrome publisher, 128
+    serve about 25 at once.
+  - The `whip_session` target still uses UDP tuples. The session treats
+    tuples as opaque, so it reaches no new state through TCP, but a TCP
+    mix there would show it.
+  - CI's fuzz job has not run `whip_tcp_front` yet.
+  - The mid-stream SPS change above, in `sapflow-hls`.
 
 ### W4: qualification
 
