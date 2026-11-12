@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Local check of M1-M3: SRT and RTMP in, LL-HLS out, callbacks, refusals,
-# recording.
+# Local check of M1-M3 and WHIP (A3.9): SRT, RTMP and WHIP in, LL-HLS out,
+# callbacks, refusals, recording.
 #
 # Needs ffmpeg and srt-live-transmit (Homebrew's ffmpeg has no SRT, so
 # ffmpeg emits whole TS datagrams to srt-live-transmit's verified UDP input).
+# The WHIP publisher is FFmpeg's WHIP muxer, which needs FFmpeg 8 or later:
+# SMOKE_WHIP_FFMPEG names one if ffmpeg is older (CI's Ubuntu ffmpeg is).
 # Builds sapflow unless SAPFLOW_BIN is supplied, checks playlists, decodes the
 # segments and parts, checks the publish and unpublish callbacks.
 set -euo pipefail
@@ -62,8 +64,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 fail() { echo "FAIL: $*" >&2; echo "--- sapflow log" >&2; [ ! -f "$WORK/sapflow.log" ] || tail -20 "$WORK/sapflow.log" >&2; exit 1; }
 echo "smoke work: $WORK"
-python3 scripts/srt-loss-udp.py free --udp 18890 18891 18892 $(seq 18900 18912)
-python3 -B scripts/smoke-media.py ports --tcp 18888 18887 18886 11935 18899
+python3 scripts/srt-loss-udp.py free --udp 18890 18891 18892 $(seq 18900 18914)
+python3 -B scripts/smoke-media.py ports --tcp 18888 18887 18886 18885 18884 11935 18899
+WHIP_FFMPEG=${SMOKE_WHIP_FFMPEG:-ffmpeg}
 
 if [ -z "${SAPFLOW_BIN:-}" ]; then cargo build -q; SAPFLOW_BIN=./target/debug/sapflow; fi
 [ -x "$SAPFLOW_BIN" ] || fail "SAPFLOW_BIN is not executable"
@@ -306,6 +309,96 @@ done
 epublish "publish:live/event-optwrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" 18912 > /dev/null 2>&1 || true
 [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/event-optwrong/index.m3u8")" = 404 ] || fail "wrong passphrase accepted with optional encryption"
 echo "ok   SRT optional encryption: with and without the passphrase play; a wrong one refused"
+
+# WHIP: a fourth server with WHIP on, published by FFmpeg's WHIP muxer
+# (H.264 baseline and Opus, over ICE-lite UDP on loopback). A missing or
+# wrong token is refused with 401, and never logged; the
+# right one plays as LL-HLS with H.264 and Opus and sends the publish
+# callback. FFmpeg's DELETE at the end is a deliberate leave: the unpublish
+# callback, then the recording once the grace is over.
+# A file decodes with no decoder error. The null muxer's own complaints
+# about the timestamps it is handed ("[null @ ...] ... non monotonically
+# increasing dts", which Ubuntu's ffmpeg 6.1 prints for WHIP's video), and
+# the "Last message repeated" lines after them, are not the media's, so they
+# do not count; anything else at error level does.
+decodes() {
+  local errors
+  errors=$(ffmpeg -hide_banner -nostdin -v error -i "$1" -f null - 2>&1 \
+    | grep -Ev '^\[null @|^ *Last message repeated' || true)
+  [ -z "$errors" ] || { printf '%s\n' "$errors" | head -5 >&2; return 1; }
+}
+whip_smoke() {
+  local W=event-whip WHTTP=127.0.0.1:18885 WSIG=127.0.0.1:18884 WUDP=127.0.0.1:18913 code wpub winit wrec
+  # grep reads the whole list: an early exit would fail the pipe (pipefail).
+  "$WHIP_FFMPEG" -hide_banner -muxers 2>/dev/null | grep -E '^ *E +whip ' > /dev/null \
+    || fail "$WHIP_FFMPEG has no WHIP muxer: FFmpeg 8 or later is needed (set SMOKE_WHIP_FFMPEG)"
+  SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
+  SAPFLOW_CALLBACK_URL="http://127.0.0.1:$CB_PORT/api/public/live-events/{eventId}/stream-health" \
+  SAPFLOW_CALLBACK_SECRET=tok SAPFLOW_HTTP_ADDR=$WHTTP SAPFLOW_SRT_ADDR=127.0.0.1:18914 SAPFLOW_RTMP_ADDR=off \
+  SAPFLOW_RECORDINGS="$WORK/rec" SAPFLOW_RECONNECT_GRACE=2 \
+  SAPFLOW_WHIP_ADDR=$WSIG SAPFLOW_WHIP_UDP_ADDR=$WUDP SAPFLOW_WHIP_CANDIDATES="udp $WUDP" \
+  SAPFLOW_WHIP_PUBLIC_URL="http://$WSIG" "$SAPFLOW_BIN" > "$WORK/sapflow-whip.log" 2>&1 & pids+=($!)
+  for _ in $(seq 1 40); do grep -q 'WHIP listening' "$WORK/sapflow-whip.log" && break; sleep 0.25; done
+  grep -q 'WHIP listening' "$WORK/sapflow-whip.log" || { tail -20 "$WORK/sapflow-whip.log" >&2; fail "WHIP server did not start"; }
+
+  # No token is refused before the offer is read; a wrong one at admission,
+  # after a valid offer, so FFmpeg sends that one.
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/sdp' \
+    --data-binary 'v=0' "http://$WSIG/whip/live/event-whipbad")
+  [ "$code" = 401 ] || fail "WHIP missing token answered $code, not 401"
+  "$WHIP_FFMPEG" -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x240:rate=30 -f lavfi -i sine \
+    -t 2 -pix_fmt yuv420p -c:v libx264 -profile:v baseline -bf 0 -c:a libopus -ac 2 \
+    -f whip -whip_flags dtls_active -authorization pub:not-the-secret \
+    "http://$WSIG/whip/live/event-whipbad" > "$WORK/whip-refusal.out" 2>&1 && fail "WHIP wrong token accepted"
+  grep -q '401 Unauthorized' "$WORK/whip-refusal.out" || { tail -3 "$WORK/whip-refusal.out" >&2; fail "WHIP wrong token not refused with 401"; }
+  grep -q 'publish refused protocol="webrtc" reason=Request(Unauthorized)' "$WORK/sapflow-whip.log" \
+    || fail "WHIP refusal not logged"
+  grep -q 'not-the-secret' "$WORK/sapflow-whip.log" && fail "a WHIP token reached the log"
+  echo "ok   WHIP refusals (401 for a missing and a wrong token, the token not logged)"
+
+  "$WHIP_FFMPEG" -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
+    -f lavfi -i sine=frequency=440:sample_rate=48000 -t 12 -pix_fmt yuv420p \
+    -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -bf 0 -g 30 -b:v 2500k \
+    -c:a libopus -b:a 128k -ac 2 -f whip -whip_flags dtls_active -authorization pub:secret \
+    "http://$WSIG/whip/live/$W" > "$WORK/whip-ffmpeg.log" 2>&1 &
+  wpub=$!; pids+=("$wpub")
+  local WB="http://$WHTTP/live/$W"
+  for _ in $(seq 1 60); do
+    curl -sf "$WB/stream.m3u8" -o "$WORK/whip.m3u8" && grep -q _seg "$WORK/whip.m3u8" && break; sleep 0.25
+  done
+  grep -qs _seg "$WORK/whip.m3u8" \
+    || { tail -5 "$WORK/whip-ffmpeg.log" >&2; tail -20 "$WORK/sapflow-whip.log" >&2; fail "WHIP publish never became a stream"; }
+  curl -sf "$WB/index.m3u8" -o "$WORK/whip-index.m3u8" || fail "WHIP multivariant playlist not served"
+  grep -Eq 'CODECS="avc1\.[0-9a-f]{6},Opus"' "$WORK/whip-index.m3u8" || fail "WHIP multivariant playlist CODECS"
+  grep -q '#EXT-X-PART:DURATION=' "$WORK/whip.m3u8" || fail "WHIP media playlist has no parts"
+  winit=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/whip.m3u8" | tail -1)
+  curl -s "$WB/$winit" > "$WORK/whip.mp4"
+  for s in $(grep '_seg' "$WORK/whip.m3u8"); do curl -s "$WB/$s" >> "$WORK/whip.mp4"; done
+  decodes "$WORK/whip.mp4" || fail "WHIP segments do not decode"
+  ffprobe -v error -show_streams -of json "$WORK/whip.mp4" | python3 -c '
+import json, sys
+streams = json.load(sys.stdin)["streams"]
+video = [s for s in streams if s["codec_type"] == "video"]
+audio = [s for s in streams if s["codec_type"] == "audio"]
+assert len(video) == len(audio) == 1
+assert (video[0]["codec_name"], video[0]["width"], video[0]["height"]) == ("h264", 1280, 720)
+assert (audio[0]["codec_name"], int(audio[0]["sample_rate"]), audio[0]["channels"]) == ("opus", 48000, 2)
+' || fail "WHIP decoded track profile"
+  grep -q "\"event\":\"publish\",\"path\":\"live/$W\"" "$WORK/cb.log" || fail "no WHIP publish callback"
+  echo "ok   WHIP publish (FFmpeg): LL-HLS with H.264 and Opus decodes, publish callback"
+
+  wait_child "$wpub" || { tail -5 "$WORK/whip-ffmpeg.log" >&2; fail "the WHIP publisher failed"; }
+  for _ in $(seq 1 20); do grep -q 'WHIP session ended reason="deleted"' "$WORK/sapflow-whip.log" && break; sleep 0.25; done
+  grep -q 'WHIP session ended reason="deleted"' "$WORK/sapflow-whip.log" || fail "FFmpeg's DELETE did not end the WHIP session"
+  for _ in $(seq 1 20); do grep -q "\"unpublish\",\"path\":\"live/$W\"" "$WORK/cb.log" && break; sleep 0.25; done
+  grep -q "\"unpublish\",\"path\":\"live/$W\"" "$WORK/cb.log" || fail "no WHIP unpublish callback at the DELETE"
+  for _ in $(seq 1 30); do grep -q "recordSegmentComplete\",\"path\":\"live/$W\"" "$WORK/cb.log" && break; sleep 0.5; done
+  wrec=$(grep "recordSegmentComplete\",\"path\":\"live/$W\"" "$WORK/cb.log" | grep -o '"segmentPath":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$wrec" in "$WORK/rec/live/$W/"[0-9]*.mp4) ;; *) fail "WHIP recordSegmentComplete path: $wrec" ;; esac
+  decodes "$wrec" || fail "WHIP recording does not decode"
+  echo "ok   WHIP DELETE: session ended, unpublish callback, recording ($(basename "$wrec"))"
+}
+whip_smoke
 
 # SIGTERM (docker stop, systemd) is handled: a clean exit, not the signal's
 # default kill (status 143), which a container's first process would not get.

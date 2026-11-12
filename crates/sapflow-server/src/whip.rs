@@ -286,6 +286,10 @@ pub(crate) struct LossCounts {
     pub abnormal_ends: AtomicU64,
     /// Ingest updates in which the muxer itself reported media loss.
     pub muxer: AtomicU64,
+    /// Audio frames stamped before a codec change's keyframe that arrived
+    /// too late for the new run and were dropped; they mark the outgoing
+    /// file, not the current one (`Muxer::take_late_audio_loss`).
+    pub late_audio: AtomicU64,
     /// Timeline re-anchors with no loss of their own: not a mark, counted
     /// beside the marks.
     pub reanchors: AtomicU64,
@@ -302,7 +306,7 @@ pub(crate) struct LossCounts {
 }
 
 impl LossCounts {
-    fn fields(&self) -> [(&'static str, u64); 13] {
+    fn fields(&self) -> [(&'static str, u64); 14] {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         [
             ("lost_packets", g(&self.lost_packets)),
@@ -316,6 +320,7 @@ impl LossCounts {
             ("queue_full", g(&self.queue_full)),
             ("abnormal_ends", g(&self.abnormal_ends)),
             ("muxer", g(&self.muxer)),
+            ("late_audio", g(&self.late_audio)),
             ("reanchors", g(&self.reanchors)),
             ("panics", g(&self.panics)),
         ]
@@ -725,6 +730,12 @@ fn media(event: sapflow_rtp::Event) -> Media {
             cause: Discontinuity::Arrival { .. } | Discontinuity::SenderReport { .. },
             ..
         } => Media::Reanchor,
+        E::Aligned { alignment } => {
+            // How the start hold ended: by the sender reports, or by
+            // arrival time and why. A3.8's evidence reads this.
+            tracing::debug!(?alignment, "WHIP timeline aligned");
+            Media::Other("aligned")
+        }
         other => Media::Other(event_name(&other)),
     }
 }
@@ -2048,10 +2059,15 @@ fn take(
     let pushed = publication.push(|source, now| {
         #[cfg(test)]
         injected::ingest(setup, &item);
+        let late = |source: &Source| source.muxer().map_or(0, |m| m.late_audio_dropped());
+        let before = late(source);
         let update = match item {
             Item::Reanchor => reanchor(source, setup, now)?,
             item => feed_item(source, item, now)?,
         };
+        counts
+            .late_audio
+            .fetch_add(late(source).saturating_sub(before), Ordering::Relaxed);
         if update.media_loss {
             counts.muxer.fetch_add(1, Ordering::Relaxed);
             broke = true;

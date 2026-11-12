@@ -426,7 +426,7 @@ fn finishing_tables_alone_does_not_invent_media_and_resume_uses_new_parser() {
 }
 
 #[test]
-fn legacy_av_finish_keeps_accepted_prefix_without_emitting_unknown_last_video() {
+fn legacy_av_finish_keeps_the_accepted_prefix_as_an_interrupt_does() {
     let fixture = include_bytes!("../tests/fixtures/testsrc-3s.ts");
     let mut normal = TsIngest::new(MuxerConfig::default());
     normal.push(fixture, NOW).expect("legacy AV fixture");
@@ -443,7 +443,7 @@ fn legacy_av_finish_keeps_accepted_prefix_without_emitting_unknown_last_video() 
     assert_eq!(
         samples(&terminal),
         expected,
-        "no unbounded final video emitted"
+        "finish seals what an interrupt seals, no unbounded final video"
     );
     assert_eq!(terminal.dropped_packets(), 0);
 }

@@ -401,7 +401,7 @@ function hits(text, s) {
   check('one recording per served codec epoch', maps.size > 0 && files.length === maps.size && withParts + 1 === maps.size && (!resize || maps.size > 1),
     `${files.length} files, ${maps.size} inits served, ${changes.length} epoch changes (${changes.length - withParts} from an epoch with no part)`);
   for (const f of files) {
-    const probe = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,sample_rate,channels', '-of', 'json', f], { encoding: 'utf8' });
+    const probe = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,sample_rate,channels,start_time,duration', '-of', 'json', f], { encoding: 'utf8' });
     let streams = [];
     try { streams = JSON.parse(probe.stdout).streams || []; } catch {}
     fs.writeFileSync(path.join(out, path.basename(f) + '.probe.json'), probe.stdout);
@@ -410,10 +410,15 @@ function hits(text, s) {
     // its init can still count frames. A file that lost whole fragments
     // still decodes cleanly, so this does not see missing media; the
     // server's completeness marks are what report that.
-    const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-f', 'null', '-'], { encoding: 'utf8' });
+    // At the stream's own time base: ffmpeg's default guesses one from the
+    // frame rate, and a file whose video starts after its audio (late audio
+    // kept at a codec change) then has frames rounded onto each other,
+    // which it reports though nothing fails to decode.
+    const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-enc_time_base', 'demux', '-f', 'null', '-'], { encoding: 'utf8' });
     const decodeErrors = whole.stderr.split('\n').filter(Boolean);
+    fs.writeFileSync(path.join(out, path.basename(f) + '.decode.txt'), whole.stderr);
     check('recording: decodes whole with no error', whole.status === 0 && decodeErrors.length === 0 && video && +video.nb_read_frames > 0,
-      video ? `${video.nb_read_frames} H.264 frames at ${video.width}x${video.height}, ${decodeErrors.length} decode errors` : probe.stderr.trim());
+      video ? `${video.nb_read_frames} H.264 frames at ${video.width}x${video.height}, ${decodeErrors.length} decode errors; video from ${video.start_time} for ${video.duration} s, audio from ${audio ? audio.start_time : '-'} for ${audio ? audio.duration : '-'} s` : probe.stderr.trim());
     check('recording: Opus decodes', audio && +audio.nb_read_frames > 0, audio ? `${audio.nb_read_frames} frames, ${audio.channels} channels at ${audio.sample_rate}` : '');
     const png = path.join(out, path.basename(f) + '.frame.png');
     const ff = spawnSync('ffmpeg', ['-v', 'error', '-y', '-i', f, '-frames:v', '1', png], { encoding: 'utf8' });

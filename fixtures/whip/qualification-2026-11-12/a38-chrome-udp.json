@@ -1,0 +1,822 @@
+[
+ {
+  "run": 1,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 4.72,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -43.2,
+     -42.6,
+     -42.7,
+     -42.8,
+     -40.4,
+     -42.3
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472325.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -43.2,
+     -42.6,
+     -42.7,
+     -42.8,
+     -40.4,
+     -42.3,
+     -40.9,
+     -41.1
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -0.8,
+   -0.8,
+   -0.4,
+   -2.4,
+   -0.9,
+   -0.4,
+   1.6,
+   -0.9,
+   0.9,
+   0.9
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 228500
+   },
+   "audio": {
+    "timestamp": 227400,
+    "arrival": 235500
+   }
+  },
+  "within": false,
+  "net": -42.2
+ },
+ {
+  "run": 2,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 4.11,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -13.6,
+     -13.9,
+     -14.7,
+     -13.6,
+     -15.8,
+     -16.3
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472352.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -13.6,
+     -13.9,
+     -14.7,
+     -13.6,
+     -15.8,
+     -16.3,
+     -16.7,
+     -16.6
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   6,
+   5.2,
+   2.4,
+   1.5,
+   3.1,
+   2.7,
+   3.6,
+   3.7,
+   4.9,
+   5.3
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   -8,
+   -8,
+   -8,
+   -8,
+   -8,
+   -8,
+   -8,
+   -8,
+   -8,
+   -8
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 206400.0005722046
+   },
+   "audio": {
+    "timestamp": 204200,
+    "arrival": 246100.00038146973
+   }
+  },
+  "within": true,
+  "net": -17.6
+ },
+ {
+  "run": 3,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 4.72,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -15.3,
+     -13.6,
+     -12.6,
+     -13.9,
+     -11.2,
+     -10.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472378.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -15.3,
+     -13.6,
+     -12.6,
+     -13.9,
+     -11.2,
+     -10.5,
+     -13.9,
+     -11.4
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   0.5,
+   4.6,
+   -2.3,
+   0.4,
+   1.5,
+   0.3,
+   4,
+   4.5,
+   0.1,
+   2.3
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 216500
+   },
+   "audio": {
+    "timestamp": 216700,
+    "arrival": 224800.00019073486
+   }
+  },
+  "within": true,
+  "net": -14.1
+ },
+ {
+  "run": 4,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 4.67,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -27.4,
+     -30.6,
+     -27.3,
+     -27.4,
+     -31.3,
+     -31
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472404.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -27.4,
+     -30.6,
+     -27.3,
+     -27.4,
+     -31.3,
+     -31,
+     -35.1,
+     -32.9
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -2.2,
+   -2.3,
+   3.6,
+   0.9,
+   3.6,
+   3.7,
+   0.8,
+   1.7,
+   -2.7,
+   1.2
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   2.7,
+   -2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 240300.00019073486
+   },
+   "audio": {
+    "timestamp": 241400,
+    "arrival": 249400.0005722046
+   }
+  },
+  "within": true,
+  "net": -28.6
+ },
+ {
+  "run": 5,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 5.74,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -17.1,
+     -16.7,
+     -15.5,
+     -15.6,
+     -16.4,
+     -16.6
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472430.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -17.1,
+     -16.7,
+     -15.5,
+     -15.6,
+     -16.4,
+     -16.6,
+     -18.2,
+     -17.8
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -0.1,
+   -0.2,
+   0,
+   -0.1,
+   0.1,
+   0,
+   0.2,
+   3.4,
+   -2.9,
+   0
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 246000
+   },
+   "audio": {
+    "timestamp": 243900,
+    "arrival": 252000
+   }
+  },
+  "within": true,
+  "net": -16.4
+ },
+ {
+  "run": 6,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 5.82,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -21.3,
+     -17.5,
+     -21.1,
+     -21.2,
+     -21.8,
+     -18.2
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472457.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -21.3,
+     -17.5,
+     -21.1,
+     -21.2,
+     -21.8,
+     -18.2,
+     -17.8,
+     -18.7
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -5.5,
+   -5.6,
+   -6.3,
+   -2,
+   -5.6,
+   -6.3,
+   -9,
+   -5.8,
+   -5.1,
+   -6.7
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   2.7,
+   2.7,
+   8,
+   2.7,
+   2.7,
+   8,
+   8,
+   2.7,
+   2.7,
+   8
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 226199.99980926514
+   },
+   "audio": {
+    "timestamp": 220000,
+    "arrival": 228599.9994277954
+   }
+  },
+  "within": true,
+  "net": -15.5
+ },
+ {
+  "run": 7,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 5.7,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -11.8,
+     -7.4,
+     -11.3,
+     -7.5,
+     -8,
+     -8.2
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472483.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -11.8,
+     -7.4,
+     -11.3,
+     -7.5,
+     -8,
+     -8.2,
+     -7.6,
+     -7.8
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -4,
+   -0.5,
+   -4.3,
+   -0.8,
+   -4.1,
+   -3.4,
+   -2.6,
+   -2.1,
+   -4.6,
+   -4
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   2.7,
+   -2.7,
+   2.7,
+   -2.7,
+   2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7,
+   -2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 217000
+   },
+   "audio": {
+    "timestamp": 213700,
+    "arrival": 221800.00019073486
+   }
+  },
+  "within": true,
+  "net": -4.6
+ },
+ {
+  "run": 8,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 5.54,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -14,
+     -13.8,
+     -11.7,
+     -12.9,
+     -13.5,
+     -10.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472509.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -14,
+     -13.8,
+     -11.7,
+     -12.9,
+     -13.5,
+     -10.5,
+     -13.5,
+     -11.3
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -1.8,
+   -1.9,
+   -5.1,
+   -3.1,
+   -8.4,
+   -4.6,
+   -3.5,
+   -1.4,
+   -7.1,
+   -1.1
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   -2.7,
+   2.7,
+   2.7,
+   -2.7,
+   2.7,
+   -2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 204800.00019073486
+   },
+   "audio": {
+    "timestamp": 200800,
+    "arrival": 208800.00019073486
+   }
+  },
+  "within": true,
+  "net": -9.8
+ },
+ {
+  "run": 9,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 7.19,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -4,
+     -4.1,
+     -4.3,
+     -4.7,
+     -2.4,
+     -4.1
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472535.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -4,
+     -4.1,
+     -4.3,
+     -4.7,
+     -2.4,
+     -4.1,
+     -4.5,
+     -3.8
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   4.7,
+   4.5,
+   -0.4,
+   -0.5,
+   -0.5,
+   -0.2,
+   2.9,
+   -0.2,
+   2.5,
+   6.3
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   -8,
+   -8,
+   -2.7,
+   -8,
+   -2.7,
+   -8,
+   -8,
+   -2.7,
+   -8,
+   -8
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 219300.00019073486
+   },
+   "audio": {
+    "timestamp": 217399,
+    "arrival": 225500
+   }
+  },
+  "within": true,
+  "net": -6.6
+ },
+ {
+  "run": 10,
+  "publisher": "chrome",
+  "transport": "udp",
+  "load": 6.21,
+  "alignment": "Arrival(Timeout)",
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 6,
+    "clicks": 6,
+    "offsets": [
+     -38.5,
+     -38.3,
+     -35.3,
+     -39,
+     -37,
+     -37.9
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794472561.mp4",
+    "flashes": 8,
+    "clicks": 8,
+    "offsets": [
+     -38.5,
+     -38.3,
+     -35.3,
+     -39,
+     -37,
+     -37.9,
+     -37.7,
+     -38.4
+    ]
+   }
+  ],
+  "page_protocol": "udp",
+  "page_errors": [],
+  "source_arrival": [
+   -2.7,
+   -3.7,
+   -9.9,
+   -7.8,
+   -4,
+   -9.9,
+   -4.3,
+   -6.4,
+   -3.7,
+   -3.8
+  ],
+  "audio_context": {
+   "baseLatency": 0.005333333333333333,
+   "outputLatency": 0,
+   "sampleRate": 48000
+  },
+  "lateness": [
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   2.7,
+   2.7
+  ],
+  "first": {
+   "video": {
+    "timestamp": 0,
+    "arrival": 198800.00019073486
+   },
+   "audio": {
+    "timestamp": 194600,
+    "arrival": 202700.00076293945
+   }
+  },
+  "within": true,
+  "net": -33.9
+ }
+]

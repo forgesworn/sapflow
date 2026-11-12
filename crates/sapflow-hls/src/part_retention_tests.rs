@@ -564,10 +564,10 @@ fn kept_parts_stop_at_their_count_cap() {
     assert_eq!(m.target_duration(), 46);
     let mut most = Kept::default();
     for step in 0..5000 {
-        // The first frame is sealed by the second; the second is dropped.
-        let i = 45 * 30 + 1 + 2 * step;
+        // One keyframe a run, which the interrupt seals: a one-frame
+        // segment each.
+        let i = 45 * 30 + 1 + step;
         frame(&mut m, i, true);
-        frame(&mut m, i + 1, true);
         m.interrupt(NOW);
         if step % 250 == 249 {
             let now = kept_past_the_window(&m);
