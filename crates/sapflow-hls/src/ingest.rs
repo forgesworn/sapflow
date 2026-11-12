@@ -51,6 +51,10 @@ mod transport_gap_tests;
 #[path = "sps_change_tests.rs"]
 mod sps_change_tests;
 
+#[cfg(test)]
+#[path = "interrupt_flush_tests.rs"]
+mod interrupt_flush_tests;
+
 #[derive(Clone, Copy)]
 struct StartupLimits {
     aus: usize,
@@ -761,9 +765,9 @@ impl EsIngest {
         // What a new epoch's interrupt reported: the old epoch's last part
         // and segment, and any media it could not seal.
         let mut reconfigured = Update::default();
-        if self.origin.is_some()
+        if let Some(origin) = self.origin
             && au.idr
-            && let Some(update) = self.change_parameter_sets(now)?
+            && let Some(update) = self.change_parameter_sets(dts - origin, now)?
         {
             reconfigured.merge(update);
             restarted = true;
@@ -844,7 +848,11 @@ impl EsIngest {
     ///   better can be built.
     /// - A change seen on a frame that is not an IDR waits for the next IDR,
     ///   since the new epoch's first sample must be a keyframe.
-    fn change_parameter_sets(&mut self, now: SystemTime) -> Result<Option<Update>, IngestError> {
+    fn change_parameter_sets(
+        &mut self,
+        dts: i64,
+        now: SystemTime,
+    ) -> Result<Option<Update>, IngestError> {
         let (Some(sps), Some(pps), Some(muxer)) = (&self.sps, &self.pps, &mut self.muxer) else {
             return Ok(None);
         };
@@ -869,7 +877,8 @@ impl EsIngest {
         );
         let first = muxer.epoch_first_part_id();
         let audio = muxer.audio_config().copied();
-        let update = muxer.reconfigure_with_audio(Some(video), audio, now)?;
+        // The sender's clock carries on: the old run ends at this keyframe.
+        let update = muxer.reconfigure_with_audio_at(Some(video), audio, dts, now)?;
         // Parts the ended epoch produced, counted after the interrupt, which
         // seals an open part with video once part timing is known. Zero only
         // while timing is still being learnt: that epoch is never served.
