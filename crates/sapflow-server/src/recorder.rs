@@ -34,7 +34,8 @@ const GLOBAL_RETAINED_PART_BYTES: usize = 512 * 1024 * 1024;
 /// A path's writers: the file being written, the one just ended and held
 /// open for its late audio, and the one before it still finishing on disk.
 /// At two, codec epochs that came faster than a file was synced left the
-/// new epoch no writer, and its recording was lost.
+/// new epoch no writer more often; a disk slower than the epochs still runs
+/// out, and the refused recording marks the next file.
 const PATH_WRITERS: usize = 3;
 const MAX_WRITERS: usize = 1024;
 

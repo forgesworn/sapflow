@@ -149,9 +149,13 @@ Notes for the release after 0.2.0-rc.1.
   happened when an encoder changed its codec configuration faster than a
   file was synced to disk: the file just ended is held open for its late
   audio, and with two writers a path the one before it, still syncing, left
-  none for the new epoch. A path now has three writers, so a slow disk no
-  longer costs a recording there. A show's last epoch refused this way
-  still has no later file to carry the mark.
+  none for the new epoch. A path now has three writers, one more for the
+  file still syncing, which makes this rarer; a disk too slow to finish a
+  file before the next epoch ends still loses epochs, each now marked (with
+  writes capped at 6 a second and codec changes 120 ms apart, 8 to 12 of 20
+  were still lost). Real encoders change configuration far less often, and
+  the roll budget limits how often a file rolls. A show's last epoch
+  refused this way still has no later file to carry the mark.
 
 - `SAPFLOW_WINDOW_SECONDS` bounds each stream's playlist by time as well as
   by `SAPFLOW_SEGMENT_COUNT` (`MuxerConfig::window`, above). It defaults to
