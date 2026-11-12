@@ -82,9 +82,16 @@ the next three are required:
   SAPFLOW_WHIP_ADDR        WHIP signalling over plain HTTP, behind a TLS proxy
   SAPFLOW_WHIP_PUBLIC_URL  the public base URL of that listener, for Location
   SAPFLOW_WHIP_UDP_ADDR    the media UDP socket every session shares
-  SAPFLOW_WHIP_CANDIDATES  advertised candidates: udp <ip>:<port>, comma-separated
+  SAPFLOW_WHIP_CANDIDATES  advertised candidates, comma-separated: udp <ip>:<port>,
+                           and tcp <ip>:<port> (passive ICE-TCP) with the next
+  SAPFLOW_WHIP_TCP_ADDR    the ICE-TCP listener (RFC 4571 frames), for a layer-4
+                           front proxy on TCP 443 when UDP is blocked
+  SAPFLOW_WHIP_TCP_PROXY_PROTOCOL  v2: every ICE-TCP connection starts with a
+                           PROXY protocol v2 header from SAPFLOW_WHIP_TRUSTED_PROXY,
+                           whose source is the publisher; other peers are dropped
   SAPFLOW_WHIP_ALLOW_ORIGINS  browser origins allowed by CORS, comma-separated
-  SAPFLOW_WHIP_TRUSTED_PROXY  the proxy address whose X-Forwarded-For is believed
+  SAPFLOW_WHIP_TRUSTED_PROXY  the proxy address whose X-Forwarded-For (and, with
+                           v2 above, PROXY header) is believed
   SAPFLOW_WHIP_KEYFRAME_INTERVAL  seconds between keyframe requests (default 2;
                            0 asks only when needed, maximum 60)
   SAPFLOW_WHIP_OPUS_MAX_BITRATE   Opus maxaveragebitrate offered (default 128000;
@@ -142,6 +149,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_WHIP_OPUS_MAX_BITRATE",
     "SAPFLOW_WHIP_STALE",
     "SAPFLOW_WHIP_TCP_ADDR",
+    "SAPFLOW_WHIP_TCP_PROXY_PROTOCOL",
 ];
 
 /// WHIP ingest, when `SAPFLOW_WHIP_ADDR` is set.
@@ -153,8 +161,13 @@ pub struct WhipConfig {
     pub public_url: PublicUrl,
     /// The media socket.
     pub udp_addr: SocketAddr,
-    /// What the answer advertises (UDP only until W3d's TCP listener).
+    /// What the answer advertises: UDP, and passive TCP with `tcp_addr`.
     pub candidates: Vec<Candidate>,
+    /// The passive ICE-TCP listener, for a front proxy.
+    pub tcp_addr: Option<SocketAddr>,
+    /// Whether every connection to `tcp_addr` starts with a PROXY
+    /// protocol v2 header from `trusted_proxy`.
+    pub tcp_proxy_protocol: bool,
     /// Exact origins CORS allows.
     pub allow_origins: Vec<String>,
     /// The proxy whose `X-Forwarded-For` gives the publisher's address.
@@ -179,11 +192,6 @@ impl WhipConfig {
             }
             return Ok(None);
         };
-        if vals.contains_key("SAPFLOW_WHIP_TCP_ADDR") {
-            return Err(invalid(
-                "SAPFLOW_WHIP_TCP_ADDR: ICE over TCP is not built yet; leave it unset",
-            ));
-        }
         let socket = |key: &str, v: &str| -> Result<SocketAddr, ConfigError> {
             v.parse()
                 .map_err(|_| ConfigError::Invalid(format!("{key}: not an address: {v}")))
@@ -198,29 +206,52 @@ impl WhipConfig {
             invalid("SAPFLOW_WHIP_PUBLIC_URL: an http:// or https:// base URL with a host, no query")
         })?;
         let udp_addr = socket("SAPFLOW_WHIP_UDP_ADDR", required("SAPFLOW_WHIP_UDP_ADDR")?)?;
+        let tcp_addr = vals
+            .get("SAPFLOW_WHIP_TCP_ADDR")
+            .map(|v| socket("SAPFLOW_WHIP_TCP_ADDR", v))
+            .transpose()?;
+        if tcp_addr == Some(addr) {
+            return Err(invalid(
+                "SAPFLOW_WHIP_TCP_ADDR: the ICE-TCP listener needs its own address, not SAPFLOW_WHIP_ADDR's",
+            ));
+        }
         let mut candidates = Vec::new();
         for item in required("SAPFLOW_WHIP_CANDIDATES")?.split(',') {
             let item = item.trim();
-            let address = match item.split_once(char::is_whitespace) {
-                Some((kind, address)) if kind.eq_ignore_ascii_case("udp") => address.trim(),
-                Some((kind, _)) if kind.eq_ignore_ascii_case("tcp") => {
-                    return Err(invalid(
-                        "SAPFLOW_WHIP_CANDIDATES: tcp candidates need the ICE-TCP listener, which is not built yet",
-                    ));
+            let (transport, address) = match item.split_once(char::is_whitespace) {
+                Some((kind, address)) if kind.eq_ignore_ascii_case("udp") => {
+                    (Transport::Udp, address.trim())
+                }
+                Some((kind, address)) if kind.eq_ignore_ascii_case("tcp") => {
+                    (Transport::Tcp, address.trim())
                 }
                 _ => {
                     return Err(invalid(
-                        "SAPFLOW_WHIP_CANDIDATES: udp <ip>:<port>, comma-separated",
+                        "SAPFLOW_WHIP_CANDIDATES: udp|tcp <ip>:<port>, comma-separated",
                     ));
                 }
             };
             candidates.push(Candidate {
-                transport: Transport::Udp,
+                transport,
                 address: socket("SAPFLOW_WHIP_CANDIDATES", address)?,
             });
         }
         if candidates.is_empty() || candidates.len() > sapflow_whip::sdp::MAX_CANDIDATES {
             return Err(invalid("SAPFLOW_WHIP_CANDIDATES: 1 to 8 candidates"));
+        }
+        let tcp_candidates = candidates.iter().any(|c| c.transport == Transport::Tcp);
+        match (tcp_addr.is_some(), tcp_candidates) {
+            (false, true) => {
+                return Err(invalid(
+                    "SAPFLOW_WHIP_CANDIDATES: a tcp candidate needs SAPFLOW_WHIP_TCP_ADDR, the listener it reaches",
+                ));
+            }
+            (true, false) => {
+                return Err(invalid(
+                    "SAPFLOW_WHIP_TCP_ADDR: no tcp candidate in SAPFLOW_WHIP_CANDIDATES advertises it",
+                ));
+            }
+            _ => {}
         }
         let allow_origins = match vals.get("SAPFLOW_WHIP_ALLOW_ORIGINS") {
             None => Vec::new(),
@@ -247,6 +278,30 @@ impl WhipConfig {
                 v.parse::<IpAddr>()
                     .map_err(|_| invalid("SAPFLOW_WHIP_TRUSTED_PROXY: an IP address"))?,
             ),
+        };
+        let tcp_proxy_protocol = match vals
+            .get("SAPFLOW_WHIP_TCP_PROXY_PROTOCOL")
+            .map(String::as_str)
+        {
+            None => false,
+            Some(v) if v.eq_ignore_ascii_case("v2") => {
+                if tcp_addr.is_none() {
+                    return Err(invalid(
+                        "SAPFLOW_WHIP_TCP_PROXY_PROTOCOL needs SAPFLOW_WHIP_TCP_ADDR",
+                    ));
+                }
+                if trusted_proxy.is_none() {
+                    return Err(invalid(
+                        "SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2 needs SAPFLOW_WHIP_TRUSTED_PROXY, the only peer whose header is believed",
+                    ));
+                }
+                true
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "SAPFLOW_WHIP_TCP_PROXY_PROTOCOL: v2, or unset for none",
+                ));
+            }
         };
         let keyframe_interval = match vals.get("SAPFLOW_WHIP_KEYFRAME_INTERVAL") {
             None => Some(Duration::from_secs(2)),
@@ -279,6 +334,8 @@ impl WhipConfig {
             public_url,
             udp_addr,
             candidates,
+            tcp_addr,
+            tcp_proxy_protocol,
             allow_origins,
             trusted_proxy,
             keyframe_interval,
@@ -892,11 +949,68 @@ mod tests {
                 "{missing}"
             );
         }
+        // ICE-TCP: a tcp candidate with its listener, and PROXY v2 from the
+        // trusted proxy.
+        let tcp = with(
+            &whip,
+            &[
+                (
+                    "SAPFLOW_WHIP_CANDIDATES",
+                    Some("udp 203.0.113.5:8189, tcp 203.0.113.5:443"),
+                ),
+                ("SAPFLOW_WHIP_TCP_ADDR", Some("0.0.0.0:8444")),
+            ],
+        );
+        let c = load(&tcp, &[]).expect("TCP").whip.expect("on");
+        assert_eq!(c.tcp_addr, Some("0.0.0.0:8444".parse().expect("addr")));
+        assert!(!c.tcp_proxy_protocol);
+        assert_eq!(
+            c.candidates.iter().map(|c| c.transport).collect::<Vec<_>>(),
+            [Transport::Udp, Transport::Tcp]
+        );
+        let v2 = with(
+            &tcp,
+            &[
+                ("SAPFLOW_WHIP_TCP_PROXY_PROTOCOL", Some("v2")),
+                ("SAPFLOW_WHIP_TRUSTED_PROXY", Some("10.0.0.1")),
+            ],
+        );
+        let c = load(&v2, &[]).expect("PROXY v2").whip.expect("on");
+        assert!(c.tcp_proxy_protocol);
+        assert_eq!(c.trusted_proxy, Some("10.0.0.1".parse().expect("ip")));
+        for (base, changes) in [
+            // PROXY v2 with no trusted proxy, or no listener, or another value.
+            (&v2, vec![("SAPFLOW_WHIP_TRUSTED_PROXY", None)]),
+            (&v2, vec![("SAPFLOW_WHIP_TCP_ADDR", None)]),
+            (&v2, vec![("SAPFLOW_WHIP_TCP_PROXY_PROTOCOL", Some("v1"))]),
+            (&v2, vec![("SAPFLOW_WHIP_TCP_PROXY_PROTOCOL", Some("yes"))]),
+            // A listener no candidate advertises, or one on the signalling
+            // address.
+            (
+                &tcp,
+                vec![("SAPFLOW_WHIP_CANDIDATES", Some("udp 203.0.113.5:8189"))],
+            ),
+            (
+                &tcp,
+                vec![("SAPFLOW_WHIP_TCP_ADDR", Some("127.0.0.1:8443"))],
+            ),
+            (&tcp, vec![("SAPFLOW_WHIP_TCP_ADDR", Some("somewhere"))]),
+        ] {
+            assert!(load(&with(base, &changes), &[]).is_err(), "{changes:?}");
+        }
+        // Without SAPFLOW_WHIP_ADDR, the TCP settings are refused too.
+        for key in ["SAPFLOW_WHIP_TCP_ADDR", "SAPFLOW_WHIP_TCP_PROXY_PROTOCOL"] {
+            assert!(load(&[open, (key, "v2")], &[]).is_err(), "{key}");
+        }
         for (key, bad) in [
+            // A tcp candidate needs the listener.
             ("SAPFLOW_WHIP_CANDIDATES", "tcp 203.0.113.5:443"),
             ("SAPFLOW_WHIP_CANDIDATES", "udp somewhere"),
+            ("SAPFLOW_WHIP_CANDIDATES", "quic 203.0.113.5:443"),
             ("SAPFLOW_WHIP_CANDIDATES", ""),
+            // A listener with no tcp candidate.
             ("SAPFLOW_WHIP_TCP_ADDR", "0.0.0.0:8443"),
+            ("SAPFLOW_WHIP_TCP_PROXY_PROTOCOL", "v2"),
             ("SAPFLOW_WHIP_PUBLIC_URL", "whip.example"),
             ("SAPFLOW_WHIP_ALLOW_ORIGINS", "*"),
             ("SAPFLOW_WHIP_ALLOW_ORIGINS", "https://a.example/page"),

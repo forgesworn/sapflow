@@ -86,15 +86,28 @@ pub enum Transport {
     Tcp,
 }
 
-/// The publisher's end of a path: the transport and its address. For TCP
-/// the address names the connection (behind a front proxy, the address
-/// PROXY protocol gave, which W3d adds). `Debug` leaves the address out.
+/// The publisher's end of a path: the transport, its address and, for TCP,
+/// the connection.
+///
+/// A UDP tuple is the publisher's address and port. A TCP tuple is one
+/// connection to the ICE-TCP listener (RFC 6544: each connection is its own
+/// candidate pair): `connection` is the listener's number for it, never
+/// reused while the process runs, and `remote` is the publisher's address as
+/// the connection gives it (behind a front proxy, the source in its PROXY
+/// protocol v2 header), which a check's XOR-MAPPED-ADDRESS reports. The
+/// address alone would not name a connection: a header can repeat one, and
+/// a port is reused after a close. Tuples compare all three fields, so a
+/// TCP tuple never equals a UDP one, nor one of another connection. Build
+/// them with [`Tuple::udp`] and [`Tuple::tcp`]. `Debug` leaves the address
+/// out.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tuple {
     /// UDP or TCP.
     pub transport: Transport,
     /// The publisher's address and port.
     pub remote: SocketAddr,
+    /// The TCP connection's number; 0 for UDP.
+    pub connection: u64,
 }
 
 impl Tuple {
@@ -103,21 +116,27 @@ impl Tuple {
         Self {
             transport: Transport::Udp,
             remote,
+            connection: 0,
         }
     }
 
-    /// A TCP tuple.
-    pub const fn tcp(remote: SocketAddr) -> Self {
+    /// A TCP tuple: connection number `connection` to the listener, from
+    /// `remote`.
+    pub const fn tcp(remote: SocketAddr, connection: u64) -> Self {
         Self {
             transport: Transport::Tcp,
             remote,
+            connection,
         }
     }
 }
 
 impl fmt::Debug for Tuple {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Tuple({:?}, <address>)", self.transport)
+        match self.transport {
+            Transport::Udp => f.write_str("Tuple(Udp, <address>)"),
+            Transport::Tcp => write!(f, "Tuple(Tcp #{}, <address>)", self.connection),
+        }
     }
 }
 

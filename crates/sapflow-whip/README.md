@@ -15,9 +15,9 @@ and Opus SDP parameters), RFC 4585 and RFC 4588 (feedback, RTX) and RFC 9725
 (WHIP). No source of another WebRTC, ICE, STUN or SDP implementation was
 read. Browsers are run only as black boxes.
 
-The HTTP listener, the sockets and the wiring into publications are W3c's;
-PROXY protocol and the TCP listener are W3d's. Nothing here opens a socket,
-except the test-only example harness.
+The HTTP listener, the sockets and the wiring into publications are in the
+server (W3c), as are the ICE-TCP listener and PROXY protocol (W3d). Nothing
+here opens a socket, except the test-only example harness.
 
 ## The rules
 
@@ -106,6 +106,18 @@ except the test-only example harness.
   publisher. None of this goes beyond the per-tuple bound.
 - **Consent** is kept per tuple and read for the send tuple: it expires 30
   s after the last new successful check from it (RFC 7675).
+- **TCP.** One passive ICE-TCP connection (RFC 6544) is one tuple:
+  `Tuple::tcp(address, connection)`, where `connection` is the listener's
+  number for it, never reused, and `address` the publisher's as the
+  connection gives it (behind a front proxy, the PROXY header's source),
+  which XOR-MAPPED-ADDRESS reports. The address alone would not name a
+  connection. A UDP tuple, or another connection, from the same address is
+  another tuple. Each RFC 4571 frame goes to `handle_datagram` as a datagram
+  does, and what the session sends to a TCP tuple goes back framed on that
+  connection. Every rule above holds unchanged on TCP, the budget included,
+  counting packets, not their two-byte length prefixes. TCP cannot be
+  spoofed except through the trusted proxy, but the rules cost an honest
+  publisher nothing there either.
 - **Keys.** SRTP comes from the DTLS-SRTP exporter through
   `split_keying_material` as the DTLS server: the client's write keys
   unprotect what we receive, the server's protect our RTCP.
@@ -174,7 +186,9 @@ let mut s = Session::new(SessionConfig::default(), identity.clone(), creds, nego
 // The UDP owner: a check from a new address names the session by
 // s.local_ufrag() (stun::request_username); afterwards s.accepts(&tuple).
 s.handle_datagram(now, Tuple::udp(from), &datagram);
-while let Some(t) = s.poll_transmit() { send(t.tuple, &t.bytes) }
+// Or one RFC 4571 frame from ICE-TCP connection number n (framing::Decoder):
+s.handle_datagram(now, Tuple::tcp(publisher, n), &frame);
+while let Some(t) = s.poll_transmit() { send(t.tuple, &t.bytes) } // framed for TCP
 while let Some(e) = s.poll_event() {
     // Nominated, Connected(profile), Media(sapflow_rtp::Event), MediaDropped { count },
     // Ended(reason)
@@ -186,7 +200,7 @@ if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 | Module | What |
 |--------|------|
 | `stun` | Message parsing and building; USERNAME, MESSAGE-INTEGRITY, FINGERPRINT (own CRC-32 table), XOR-MAPPED-ADDRESS (IPv4 and IPv6), PRIORITY, USE-CANDIDATE, ICE-CONTROLLING, ICE-CONTROLLED, ERROR-CODE, UNKNOWN-ATTRIBUTES; unknown comprehension-optional attributes skipped, comprehension-required ones listed |
-| `ice` | Credentials, the lite agent, tuples (`Transport` and address; `Debug` leaves the address out) and the first-byte demultiplexer |
+| `ice` | Credentials, the lite agent, tuples (`Transport`, address and, for TCP, the connection's number; `Debug` leaves the address out) and the first-byte demultiplexer |
 | `sdp` | `Offer::parse` within `Limits`, `answer`, `Negotiated` |
 | `framing` | RFC 4571 `Decoder` and `encode`, 1500 bytes a frame |
 | `resource` | Bearer token split at the first colon, 128-bit session IDs, `/whip/session/<id>`, `Location` from an absolute public base URL, every refusal and its status (400, 401, 403, 409, 415, 422, 429, 503) |
@@ -263,6 +277,15 @@ uses), `subtle` 2.6.1 for the constant-time comparison, `zeroize` 1.9.1 and
   peaked at 0.64 times what it sent and nothing was dropped; an audio-only
   publisher, sending or muted from the start, peaks at 3.18 just after our
   first flight (the test client's 121-byte hello) and is never capped.
+- ICE-TCP, in process (`tcp_tests`): for both SRTP profiles, a whole
+  session through the router over one connection, framed both ways and cut
+  at awkward offsets (single bytes, a split length prefix, chunks longer
+  than a frame): exactly the access units and audio sent, feedback back
+  over the connection, XOR-MAPPED-ADDRESS the connection's address, nothing
+  dropped by the budget. The same address over UDP, or on another
+  connection, is another tuple and reaches nothing. The server's listener,
+  PROXY protocol and their bounds are tested in `sapflow-server`
+  (`docs/whip-ingest.md`, W3d).
 - Gate 2: headless Google Chrome 157 with fake media published to
   `examples/whip_harness.rs` on loopback and reached every milestone
   (`tests/browser_gate.js`). `tests/fixtures/chrome-157/` keeps that run's
