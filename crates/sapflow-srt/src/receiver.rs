@@ -22,7 +22,9 @@ use std::collections::VecDeque;
 
 use crate::crypto::Decryptor;
 use crate::loss::{LossList, Timing};
-use crate::packet::{Ack, AckStats, Control, ControlPacket, DataPacket, MAX_LOSS_ENTRIES};
+use crate::packet::{
+    Ack, AckStats, Control, ControlPacket, DataPacket, HEADER_LEN, MAX_LOSS_ENTRIES,
+};
 use crate::rtt::Rtt;
 use crate::seq::{Seq, TimestampExtender};
 
@@ -53,6 +55,47 @@ const REORDER_FLOOR: i64 = 1_000;
 /// and this.
 const REORDER_MARGIN: i64 = 1_000;
 
+/// IPv6 and UDP headers. IPv4 and UDP take 28, so a datagram that fits with
+/// 48 fits either; the negotiated MTU counts both headers.
+const IP_UDP_OVERHEAD: usize = 48;
+/// A negotiated MTU is clamped to this range when sizing a NAK: the
+/// largest the listener accepts, and the smallest datagram every IPv4 host
+/// must take, so a bogus handshake value cannot split a NAK into a flood.
+const NAK_MTU_RANGE: (u32, u32) = (576, 1500);
+
+/// The most bytes of loss list one NAK may carry on a path of `mtu` bytes
+/// (IP and UDP headers included): what is left of the datagram after the IP,
+/// UDP and SRT headers. 1436 at 1500.
+fn nak_list_budget(mtu: u32) -> usize {
+    let mtu = mtu.clamp(NAK_MTU_RANGE.0, NAK_MTU_RANGE.1) as usize;
+    mtu - IP_UDP_OVERHEAD - HEADER_LEN
+}
+
+/// Splits `ranges` into runs, in order, whose loss-list encodings (4 bytes
+/// for one number, 8 for a range) each take at most `budget` bytes. A budget
+/// below 8 still carries one range per run, so the split always ends.
+fn split_loss_list(ranges: &[(Seq, Seq)], budget: usize) -> impl Iterator<Item = &[(Seq, Seq)]> {
+    let mut rest = ranges;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut bytes = 0;
+        let mut n = 0;
+        for (a, b) in rest {
+            let width = if a == b { 4 } else { 8 };
+            if n > 0 && bytes + width > budget {
+                break;
+            }
+            bytes += width;
+            n += 1;
+        }
+        let (run, tail) = rest.split_at(n);
+        rest = tail;
+        Some(run)
+    })
+}
+
 /// Per-connection receiver settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
@@ -64,6 +107,10 @@ pub struct Settings {
     pub peer_idle: i64,
     /// Largest data payload accepted, in bytes; larger packets are ignored.
     pub max_payload: usize,
+    /// The negotiated MTU, IP and UDP headers included. A NAK is split so
+    /// each datagram fits it, with room for IPv6 (see
+    /// [`nak_list_budget`]); values outside 576 to 1500 are clamped.
+    pub mtu: u32,
     /// The caller set the retransmission flag (`REXMITFLG`) in its
     /// handshake, so its retransmissions can be told from originals. The
     /// reorder wait adapts only then.
@@ -669,9 +716,13 @@ impl Receiver {
             return;
         }
         let ranges = self.loss.due(now, self.timing(), MAX_LOSS_ENTRIES / 2);
-        if !ranges.is_empty() {
+        // One NAK when it fits the path, as ever; otherwise as many
+        // consecutive ones as it takes, none dropped or reordered, so the
+        // request is never a datagram the path fragments or drops.
+        let budget = nak_list_budget(self.settings.mtu);
+        for run in split_loss_list(&ranges, budget) {
             self.stats.naks_sent += 1;
-            self.queue(now, Control::Nak(ranges));
+            self.queue(now, Control::Nak(run.to_vec()));
         }
     }
 
@@ -872,6 +923,7 @@ mod tests {
             buffer: 64,
             peer_idle: 5_000 * MS,
             max_payload: 1456,
+            mtu: 1500,
             retransmit_flag: true,
             reorder_wait_max: 50 * MS,
         }
@@ -2253,6 +2305,153 @@ mod tests {
             r.on_control(12_001 * MS, &Control::Shutdown);
             assert_first_present_matches_scan(&r);
             assert_eq!(r.buffered(), 0);
+        }
+    }
+
+    /// The raw NAK datagrams queued, with their parsed form.
+    fn raw_naks(r: &mut Receiver) -> Vec<(Vec<u8>, ControlPacket)> {
+        std::iter::from_fn(|| r.take_send())
+            .filter_map(|b| match Packet::parse(&b) {
+                Ok(Packet::Control(c)) if matches!(c.body, Control::Nak(_)) => Some((b, c)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A receiver whose path reorders, with `gaps` gaps of three packets
+    /// (8 bytes apiece in a loss list) found at once and so held together,
+    /// and the NAK datagrams sent when the hold ends: the first timer tick
+    /// that sends any. Also the `naks_sent` before and after.
+    fn held_burst(r: &mut Receiver, gaps: u32) -> (Vec<(Vec<u8>, ControlPacket)>, u64, u64) {
+        let t = adapt(r) + MS;
+        for k in 1..=gaps {
+            orig(r, 2 + 4 * k, t, t);
+        }
+        let _ = raw_naks(r);
+        let before = r.stats().naks_sent;
+        for _ in 0..100_000 {
+            let at = r.next_timer().max(r.now);
+            r.on_timer(at);
+            let naks = raw_naks(r);
+            if !naks.is_empty() {
+                return (naks, before, r.stats().naks_sent);
+            }
+        }
+        panic!("the timer does not advance");
+    }
+
+    fn missing(k: u32) -> (Seq, Seq) {
+        (Seq::new(ISN + 4 * k - 1), Seq::new(ISN + 4 * k + 1))
+    }
+
+    #[test]
+    fn nak_budget_leaves_room_for_ipv6_and_clamps_the_mtu() {
+        assert_eq!(nak_list_budget(1500), 1500 - 48 - 16);
+        assert_eq!(nak_list_budget(9000), 1436);
+        assert_eq!(nak_list_budget(1200), 1200 - 48 - 16);
+        assert_eq!(nak_list_budget(0), 576 - 48 - 16);
+    }
+
+    #[test]
+    fn a_worst_case_nak_batch_is_split_to_fit_the_path() {
+        let mut r = rx2(true);
+        let (naks, before, after) = held_burst(&mut r, 256);
+        assert_eq!(naks.len(), 2, "256 ranges of 8 bytes do not fit one");
+        assert_eq!(after - before, 2, "naks_sent counts packets");
+        let mut got = Vec::new();
+        for (bytes, c) in &naks {
+            // IPv6 and UDP headers on top still fit a 1500-byte path.
+            assert!(bytes.len() + 48 <= 1500, "{} bytes", bytes.len());
+            if let Control::Nak(ranges) = &c.body {
+                got.extend(ranges.iter().copied());
+            }
+        }
+        let expected: Vec<_> = (1..=256).map(missing).collect();
+        assert_eq!(got, expected, "every range, once, in order");
+    }
+
+    #[test]
+    fn a_nak_batch_that_fits_is_one_unchanged_packet() {
+        let mut r = rx2(true);
+        let (naks, before, after) = held_burst(&mut r, 5);
+        assert_eq!(naks.len(), 1);
+        assert_eq!(after - before, 1);
+        let (bytes, c) = &naks[0];
+        let Control::Nak(ranges) = &c.body else {
+            unreachable!()
+        };
+        assert_eq!(ranges, &(1..=5).map(missing).collect::<Vec<_>>());
+        let mut whole = Vec::new();
+        ControlPacket::new(c.timestamp, 77, Control::Nak(ranges.clone())).encode(&mut whole);
+        assert_eq!(bytes, &whole);
+    }
+
+    #[test]
+    fn a_small_negotiated_mtu_splits_the_nak_further() {
+        let mut r = Receiver::new(
+            Settings {
+                latency: 2_000 * MS,
+                buffer: 32_768,
+                mtu: 600,
+                ..settings()
+            },
+            0,
+            77,
+            Seq::new(ISN),
+            0,
+        );
+        let (naks, _, _) = held_burst(&mut r, 100);
+        assert!(naks.len() > 1);
+        assert!(naks.iter().all(|(b, _)| b.len() + 48 <= 600));
+        let got: Vec<_> = naks
+            .iter()
+            .flat_map(|(_, c)| match &c.body {
+                Control::Nak(r) => r.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(got, (1..=100).map(missing).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn splitting_a_loss_list_keeps_every_range_in_order_within_the_budget() {
+        let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+        for round in 0..2_000 {
+            let n = rng.below(300) as usize;
+            let ranges: Vec<(Seq, Seq)> = (0..n)
+                .map(|_| {
+                    let a = rng.below(1 << 30) as u32;
+                    let b = if rng.below(2) == 0 {
+                        a
+                    } else {
+                        a + 1 + rng.below(1000) as u32
+                    };
+                    (Seq::new(a), Seq::new(b))
+                })
+                .collect();
+            let budget = match round % 3 {
+                0 => nak_list_budget(1500),
+                1 => nak_list_budget(1 + rng.below(2000) as u32),
+                _ => 8 + rng.below(1500) as usize,
+            };
+            let runs: Vec<_> = split_loss_list(&ranges, budget).collect();
+            assert_eq!(runs.concat(), ranges, "round {round}");
+            let encoded = |run: &[(Seq, Seq)]| {
+                let mut out = Vec::new();
+                crate::packet::encode_loss_list(run, &mut out);
+                out.len()
+            };
+            for (i, run) in runs.iter().enumerate() {
+                assert!(!run.is_empty());
+                assert!(encoded(run) <= budget, "round {round}");
+                // No more runs than needed: the next range would not fit.
+                if let Some(next) = runs.get(i + 1).and_then(|r| r.first()) {
+                    assert!(encoded(run) + encoded(&[*next]) > budget, "round {round}");
+                }
+            }
+            if encoded(&ranges) <= budget {
+                assert!(runs.len() <= 1, "a list that fits stays whole");
+            }
         }
     }
 }

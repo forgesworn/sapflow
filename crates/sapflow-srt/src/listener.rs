@@ -595,6 +595,7 @@ impl<S: BuildHasher> Listener<S> {
                 buffer,
                 peer_idle,
                 max_payload: max_payload as usize,
+                mtu: p.hs.mtu.min(MTU_MAX),
                 // Without the flag a retransmission that fills a gap looks
                 // like a late original, so the reorder wait never adapts.
                 retransmit_flag: req.flags & srt_flags::REXMITFLG != 0,
