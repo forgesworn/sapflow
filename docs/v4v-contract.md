@@ -116,6 +116,23 @@ v4v holds the gig for `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS` (default
 90). Keep the two equal. `recordSegmentComplete` arrives when the stream
 ends, so up to the grace period after the encoder's last drop.
 
+When sapflow itself is stopped (SIGTERM or ctrl-c, as at a `docker compose
+up` redeploy or a Docker restart), it takes no new encoder and ends every
+stream at once, with no grace:
+
+- A stage whose encoder is still connected gets `unpublish`, then
+  `recordSegmentComplete` with `recordingState: "incomplete"` and
+  `recordingReason: "server-stopped"`, or the reason its file already had.
+- A stage held for a reconnect, which has had its `unpublish`, gets
+  `recordSegmentComplete` as when its grace runs out, normally `finalised`.
+
+sapflow waits up to 7.5 s for its files and callbacks, then exits, inside
+Docker's default 10 s stop timeout. A file still being written or a callback
+still unsent by then (one being retried while v4v is down, say) goes
+unreported, as does everything after a SIGKILL; the file stays on disk. An
+encoder that reconnects after the restart starts a new stream and a new
+file.
+
 v4v rejects a callback whose path does not match the prepared session.
 
 ## Recording
@@ -142,9 +159,11 @@ the exact same state and reason. Reason codes include `ingest-discarded-packets`
 `rtmp-protocol-error`, `over-bitrate`, `stale-media`, `srt-listener-stopped`,
 `ingest-error`, `media-loss`, `end-of-input-loss`, `writer-behind`, `disk-low`,
 `epoch-unrecorded` (a codec epoch before this file was served but not
-recorded) and `epoch-rate` (the encoder changed its codec configuration too
+recorded), `epoch-rate` (the encoder changed its codec configuration too
 often: codec epochs after this file, or before it, were served but not
-recorded; see `SAPFLOW_RECORDING_ROLL_*`). A stream that changes
+recorded; see `SAPFLOW_RECORDING_ROLL_*`) and `server-stopped` (sapflow
+was stopped while the encoder was connected; see
+[the callback](#the-callback)). A stream that changes
 configuration often can therefore end a show with a stretch that no file
 holds; the files on either side of it say so. A file keeps only its first
 reason, so the file before such a stretch can read another code (say
