@@ -9,6 +9,8 @@
 //   node scripts/obs-ingest.js --bin <sapflow> --out <dir> --protocol srt|rtmp
 //        [--seconds 60] [--obs-keyint 1] [--bitrate 2500] [--restart-at <s>]
 //        [--base 47400] [--obs /Applications/OBS.app]
+//   node scripts/obs-ingest.js --bin <sapflow> --out <dir> --protocol srt --app-key
+//        [--app-key-wrong] [--seconds 60] [--restart-at <s>] ...
 //   node scripts/obs-ingest.js --remote --out <dir> --protocol srt|rtmp
 //        [--seconds 60] [--obs-keyint 1] [--bitrate 2500] < creds.json
 //
@@ -18,6 +20,14 @@
 // the credentials reach no command line; keep it mode 0600, outside the
 // repository, or pipe it from a keychain. No local sapflow is started, and
 // the run lasts --seconds; the server's own logs are the result.
+//
+// --app-key runs sapflow with per-stream SRT passphrases from the app
+// (SAPFLOW_SRT_APP_KEYS=1, encryption required, no global passphrase): a
+// stub publish-auth hook on loopback answers sapflow's SRT request with the
+// stream's passphrase in the `sapflow-srt-passphrase` header, and OBS's URL
+// carries only the path in its stream ID and that passphrase. With
+// --app-key-wrong, OBS is given a different passphrase and should never be
+// admitted.
 //
 // In every mode the test profile's files are overwritten before the changed
 // config goes to the Trash, and every OBS log kept (in --out, and in the
@@ -55,6 +65,11 @@ const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const bin = opt('bin'), out = opt('out'), protocol = opt('protocol');
 const remote = args.includes('--remote');
+const appKeyWrong = args.includes('--app-key-wrong');
+const appKey = args.includes('--app-key') || appKeyWrong;
+if (appKey && (remote || protocol !== 'srt')) {
+  console.error('--app-key needs a local sapflow (--bin) and --protocol srt'); process.exit(2);
+}
 if ((!bin && !remote) || !out || !['srt', 'rtmp'].includes(protocol)) {
   console.error('--bin (or --remote), --out and --protocol srt|rtmp are required'); process.exit(2);
 }
@@ -78,10 +93,16 @@ const obsApp = opt('obs', '/Applications/OBS.app');
 const OBS = path.join(obsApp, 'Contents/MacOS/OBS');
 const NAME = 'Ingest-OBS-test';
 const CONFIG = path.join(os.homedir(), 'Library/Application Support/obs-studio');
-const port = { hls: base, srt: base + 1, rtmp: base + 2, websocket: base + 9 };
+const port = { hls: base, srt: base + 1, rtmp: base + 2, hook: base + 8, websocket: base + 9 };
+// Where OBS sends SRT; another port puts a relay in between (for example to
+// record its handshakes). The app-key mode only.
+const obsSrtPort = +opt('obs-srt-port', port.srt);
 const EVENT = 'event-obs';
 const USER = 'obs', PASS = crypto.randomBytes(12).toString('hex');
 const PASSPHRASE = 'obs-' + crypto.randomBytes(12).toString('hex');
+// The stream's passphrase the stub hook hands sapflow, and what OBS is given.
+const APP_KEY = 'obs-app-' + crypto.randomBytes(12).toString('hex');
+const OBS_KEY = appKeyWrong ? 'obs-wrong-' + crypto.randomBytes(12).toString('hex') : APP_KEY;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 fs.mkdirSync(out, { recursive: true });
 
@@ -108,7 +129,7 @@ const pause = (ms) => new Promise((resolve, reject) => {
 // credentials, and in remote mode the server, its host, the key and every
 // value in either. Removed by value first, then by shape.
 function secrets() {
-  const found = [PASS, PASSPHRASE];
+  const found = [PASS, PASSPHRASE, APP_KEY, OBS_KEY];
   if (creds) {
     const key = creds.key || '';
     found.push(creds.server, key, ...key.split(/[?&=:]/));
@@ -165,6 +186,11 @@ function clip() {
 
 function service() {
   if (remote) return { server: creds.server, key: creds.key || '' };
+  if (appKey) {
+    // Only the path in the stream ID: the passphrase is the credential.
+    const q = `streamid=publish:live/${EVENT}&latency=2000000&passphrase=${OBS_KEY}&pbkeylen=32`;
+    return { server: `srt://127.0.0.1:${obsSrtPort}?${q}`, key: '' };
+  }
   if (protocol === 'srt') {
     // OBS's SRT output is FFmpeg's libsrt: latency in microseconds.
     const q = `streamid=publish:live/${EVENT}:${USER}:${PASS}&latency=2000000&passphrase=${PASSPHRASE}&pbkeylen=32`;
@@ -207,14 +233,43 @@ function sapflow() {
   const env = {
     ...process.env,
     SAPFLOW_HTTP_ADDR: `127.0.0.1:${port.hls}`, SAPFLOW_SRT_ADDR: `127.0.0.1:${port.srt}`, SAPFLOW_RTMP_ADDR: `127.0.0.1:${port.rtmp}`,
-    SAPFLOW_PUBLISH_USER: USER, SAPFLOW_PUBLISH_PASS: PASS,
-    SAPFLOW_SRT_PASSPHRASE: PASSPHRASE, SAPFLOW_SRT_PBKEYLEN: '32', SAPFLOW_SRT_ENCRYPTION: 'optional',
+    ...(appKey ? {
+      SAPFLOW_SRT_APP_KEYS: '1', SAPFLOW_SRT_ENCRYPTION: 'required',
+      SAPFLOW_PUBLISH_AUTH_URL: `http://127.0.0.1:${port.hook}/auth`,
+    } : {
+      SAPFLOW_PUBLISH_USER: USER, SAPFLOW_PUBLISH_PASS: PASS,
+      SAPFLOW_SRT_PASSPHRASE: PASSPHRASE, SAPFLOW_SRT_PBKEYLEN: '32', SAPFLOW_SRT_ENCRYPTION: 'optional',
+    }),
     SAPFLOW_RECORDINGS: path.join(out, 'recordings'), SAPFLOW_RECORD_MIN_FREE_GB: '0',
     SAPFLOW_SEGMENT_COUNT: '24', SAPFLOW_HLS_MODE: 'whole', SAPFLOW_RECONNECT_GRACE: '30', SAPFLOW_HEALTH_INTERVAL: '0',
     RUST_LOG: 'info',
   };
   const log = fs.openSync(path.join(out, `sapflow-${runs}.log`), 'w');
   return spawn(bin, [], { env, stdio: ['ignore', log, log] });
+}
+
+// The app's side of --app-key: admits SRT publishes of this run's path that
+// offer to check a passphrase, and returns the passphrase; refuses the rest.
+let hookAsked = 0, hookKeyed = 0;
+function hook() {
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 65536) req.destroy(); });
+    req.on('end', () => {
+      hookAsked += 1;
+      let j = {};
+      try { j = JSON.parse(body); } catch {}
+      if (j.protocol === 'srt' && j.srtKey === 'accepted' && j.path === `live/${EVENT}`) {
+        hookKeyed += 1;
+        res.writeHead(200, { 'sapflow-srt-passphrase': APP_KEY });
+      } else {
+        res.writeHead(401);
+      }
+      res.end();
+    });
+  });
+  server.listen(port.hook, '127.0.0.1');
+  return server;
 }
 
 function stopChild(child, ms = 4000) {
@@ -244,6 +299,8 @@ function logFacts(file) {
     connected: pick(/publisher connected/).length,
     srt_closed: pick(/SRT connection closed/),
     recordings: pick(/recording finished|recording marked incomplete/),
+    accepted: pick(/SRT publisher accepted/),
+    refused: pick(/publish refused|caller gave up/).slice(0, 10),
     warnings: pick(/\bWARN\b/).filter((l) => !/OPEN_PUBLISH|CALLBACK_URL|three quarters|receive buffer below/.test(l)).slice(0, 20),
     target: pick(/target duration fixed/),
   };
@@ -282,8 +339,10 @@ function analyse(info) {
   const source = clip();
   const backup = fs.mkdtempSync(path.join(os.tmpdir(), 'ingest-obs-backup-'));
   execFileSync('rsync', ['-a', CONFIG + '/', backup + '/']);
-  let srv = null, obs = null;
+  let srv = null, obs = null, stub = null;
+  info.app_key = appKey ? (appKeyWrong ? 'wrong' : 'right') : null;
   try {
+    if (appKey) stub = hook();
     if (!remote) {
       srv = sapflow();
       await pause(1000);
@@ -328,6 +387,10 @@ function analyse(info) {
     if (obs) info.obs_ended = !running(obs.pid);
     await sleep(4000);
     await stopChild(srv);
+    if (stub) {
+      stub.close();
+      info.hook = { asked: hookAsked, keyed: hookKeyed };
+    }
     if (interrupted) info.error = 'interrupted';
     redactFile(path.join(out, 'obs.stdout.log'));
     if (obs && running(obs.pid)) {
