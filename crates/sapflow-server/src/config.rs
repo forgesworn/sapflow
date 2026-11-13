@@ -38,8 +38,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            scoped mode): requests offer \"srtKey\":\"accepted\",
                            and a 2xx carrying sapflow-srt-passphrase admits
                            only a caller keyed with it, checked before the
-                           path is claimed. No replay guard yet: a captured
-                           handshake still passes, so not for production
+                           path is claimed. Key material that already
+                           admitted a connection (a replayed handshake) is
+                           refused too: the last 128 per stream, 4096 in
+                           all, kept in memory until a restart
   SAPFLOW_SRT_REORDER_WAIT_MAX_MS  once a caller's path reorders packets, hold
                            a new gap's first NAK up to this long, so a packet
                            that is only late is not resent (default 50, 0 to

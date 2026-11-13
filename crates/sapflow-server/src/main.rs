@@ -25,6 +25,7 @@ mod rtmp;
 mod shutdown;
 mod srt;
 mod srt_own;
+mod srt_replay;
 mod stream;
 #[cfg(test)]
 mod test_support;
