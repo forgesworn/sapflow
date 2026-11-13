@@ -115,10 +115,30 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - With app keys and no global passphrase, `SAPFLOW_SRT_ENCRYPTION=required`
   refuses every caller that sends no key material, in the handshake, before
   the app is asked. Left unset, plaintext callers still connect.
-- Not for production yet: a passing check proves the key material was made
-  with the passphrase, not that the caller made it. Someone who captured an
-  encoder's handshake can replay it to the same stream until sapflow guards
-  against replay.
+- A replayed handshake is refused too. A passing check proves only that
+  the key material was made with the passphrase, and it crosses the
+  network in clear, so a captured conclusion would pass from anywhere.
+  sapflow keeps a digest of the key material of each caller it admits
+  under app keys, in memory: the last 128 per stream and 4,096 in all,
+  oldest dropped first. Key material already kept is refused from any new
+  connection (another address, another caller socket, or the same caller
+  after its connection ended) with `SRT_REJ_BADSECRET` (1010), counted as a
+  failed attempt, before the path is claimed, whether it was checked
+  against the app's passphrase or the global `SAPFLOW_SRT_PASSPHRASE`. An
+  encoder resending its conclusion because the answer was lost is answered
+  on its own connection and never refused.
+- Encoders make fresh key material for every connection, reconnects
+  included, so they are never refused for it: checked with libsrt 1.5.1
+  (`srt-live-transmit`, a reconnect and a new run), OBS 32.0.4 (a
+  reconnect) and sapflow's own caller. Larix has not been checked.
+- What remains: a restart, or eviction past those bounds, lets an older
+  capture through again; and a replay that arrives while the encoder whose
+  handshake it copies is still waiting for the app's answer can be
+  admitted first, refusing that encoder until it reconnects with new key
+  material. Rotating the stream's passphrase limits both, since a capture
+  made under an old passphrase fails the key check. The passphrase in the
+  2xx crosses the hook link in clear, like the request: keep that link on
+  the private network.
 
 ## Ingest addresses v4v hands to encoders
 

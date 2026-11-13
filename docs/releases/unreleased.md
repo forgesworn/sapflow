@@ -285,9 +285,24 @@ Notes for the release after 0.2.0-rc.1.
   no longer replaces a live publisher first; a repeated or out-of-bounds
   header refuses as an unusable answer does. RTMP and WHIP
   are unchanged, and with the switch off so is every request. The
-  passphrase is never logged. See `docs/v4v-contract.md`. There is no
-  replay guard yet: a captured handshake replayed to the same stream still
-  passes, so do not turn this on in production before it lands.
+  passphrase is never logged. See `docs/v4v-contract.md`.
+- With `SAPFLOW_SRT_APP_KEYS`, a replayed SRT handshake is refused before
+  the path is claimed. A passing key check proves only that the key
+  material was made with the passphrase, and it travels in clear, so
+  sapflow keeps a SHA-256 digest of the part of each admitted caller's key
+  material that the check binds, in memory (128 per stream path, 4,096 in
+  all, oldest evicted first, no time limit), and refuses it from any new
+  connection with `BADSECRET`, counted by the failed-attempt throttle and
+  logged without the key material or digest. This covers keys checked
+  against the app's passphrase and the global one alike, and lookups span
+  stream paths. A conclusion the same caller resends while its connection
+  waits or is open is answered there and never refused. Real encoders make
+  fresh key material per connection (sapflow's caller, libsrt 1.5.1 and
+  OBS 32.0.4 checked, reconnects included; Larix not checked). A restart
+  or eviction lets older captures through again, and a replay that beats
+  the original caller's own admission can win; rotating the stream's
+  passphrase limits both. With the switch off nothing changes: the path is
+  claimed before any key is checked there, so the guard could not help.
 - The "SRT publisher accepted" log line gives `encryption` (`none`,
   `deployment-key`, `app-key` or `session-key`) and `key_len`, so the
   logs show which publishers still connect without a passphrase, or with
@@ -407,8 +422,14 @@ Notes for the release after 0.2.0-rc.1.
   A failed check must end in `reject`: `accept` and `accept_with_crypto`
   still admit what the listener's own settings allow. A passing check
   proves the key material was wrapped under the passphrase, not that its
-  sender made it, so a replayed conclusion passes; do not turn on
-  `app_keys` in production before the application guards against replay.
+  sender made it, so a replayed conclusion passes: the listener keeps no
+  record of key material, and an application that admits by key guards
+  against replay itself. For that, `Listener::pending_key_material` (new)
+  returns a waiting caller's `KMREQ`, `Listener::caller_socket` (new) its
+  own socket id while waiting or open, and `crypto::bound_key_material`
+  (new) the part of a `KMREQ` the passphrase check binds (the last 8 salt
+  bytes and the wrapped keys): edits anywhere else still pass the check,
+  so compare that part, not the whole message.
   `examples/listen-app-key.rs` is a complete listener. The new fuzz target
   `own_srt_app_keys` drives `check_key`, `accept_with_key`, `accept`,
   `reject` and `close`, with no global secret or with a global secret and
