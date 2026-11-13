@@ -390,7 +390,7 @@ async fn the_passphrase_never_reaches_logs_or_errors() {
         .await
         .expect("admitted");
     texts.push(format!("{admission:?}"));
-    assert!(matches!(admission, Admission::Keyed(_)));
+    assert!(matches!(admission, Admission::Pending(_)));
     texts.push(format!("{:?}", fixture.app.config));
     drop((req, admission));
     let _ = events(&mut fixture);
@@ -460,12 +460,12 @@ async fn a_caller_gone_before_the_app_answered_claims_nothing_and_is_not_counted
     let mut listener = Listener::new(listener_config(&fixture.app.config), Instant::now());
     // More than the throttle's ten: none of them counts.
     for _ in 0..12 {
-        let Ok(Admission::Keyed(keyed)) =
+        let Ok(Admission::Pending(keyed)) =
             crate::srt::admit(&fixture.app, STREAM_ID, peer.ip(), 0).await
         else {
             panic!("expected a keyed admission")
         };
-        assert!(accept_keyed(&fixture.app, &mut listener, ConnId(7), peer, keyed).is_none());
+        assert!(accept_pending(&fixture.app, &mut listener, ConnId(7), peer, keyed).is_none());
     }
     assert!(fixture.app.streams.get("event-a").is_none());
     assert_eq!(stub.count(), 12);
@@ -478,4 +478,106 @@ async fn a_caller_gone_before_the_app_answered_claims_nothing_and_is_not_counted
             .allowed(peer.ip(), Instant::now())
     );
     assert_eq!(listener.stats().rejected, 0, "no one to answer");
+}
+
+/// Without the header, a caller the listener would refuse is refused before
+/// the claim too: an SRT claim takes over the path, so claiming first would
+/// knock a live publisher off for a caller that then fails to connect.
+#[tokio::test(flavor = "current_thread")]
+async fn without_the_header_a_caller_refused_at_accept_never_replaces_a_live_stage() {
+    const GLOBAL: &str = "deployment-wide-secret";
+    const JUNK: &str = "anything-the-attacker-likes";
+    let captured = crate::log_capture::Capture::start();
+    let from: std::net::IpAddr = "127.0.0.1".parse().expect("ip");
+    /// The live publisher's protocol, required with no global key, and the
+    /// attackers with the code each is refused with.
+    type Case = (&'static str, bool, Vec<(CryptoConfig, RejectCode)>);
+    let cases: [Case; 3] = [
+        (
+            "rtmp",
+            true,
+            vec![(key(JUNK, KeySize::Aes128), RejectCode::UNSECURE)],
+        ),
+        (
+            "rtmp",
+            false,
+            vec![
+                (key(JUNK, KeySize::Aes128), RejectCode::BADSECRET),
+                (key(GLOBAL, KeySize::Aes256), RejectCode::BADSECRET),
+            ],
+        ),
+        (
+            "srt",
+            false,
+            vec![
+                (key(JUNK, KeySize::Aes128), RejectCode::BADSECRET),
+                (key(GLOBAL, KeySize::Aes256), RejectCode::BADSECRET),
+            ],
+        ),
+    ];
+    for (live_kind, required, attackers) in cases {
+        let stub = stub::start(Answer::Status(200)).await;
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        if required {
+            app.config.srt_require_encryption = true;
+        } else {
+            app.config.srt_crypto = Some(key(GLOBAL, KeySize::Aes128));
+            app.config.srt_allow_plaintext = true;
+        }
+        let (addr, server) = origin(&fixture.app);
+        let mut rtmp = None;
+        let mut live = None;
+        if live_kind == "rtmp" {
+            let req = sapflow_core::PublishRequest::parse_rtmp(
+                "live",
+                "event-a?user=encoder&pass=pw_live_visible",
+            )
+            .expect("rtmp");
+            rtmp = Some(
+                Publication::begin_authorised(&fixture.app, &req, SourceKind::Flv, from)
+                    .await
+                    .expect("RTMP live"),
+            );
+        } else {
+            let mut encoder = Encoder::call(addr, Some(key(GLOBAL, KeySize::Aes128))).await;
+            assert!(encoder.connected, "{:?}", encoder.closed);
+            encoder.send_media().await;
+            wait_for(&mut fixture, &mut encoder, "publish").await;
+            live = Some(encoder);
+        }
+        let _ = events(&mut fixture);
+        let before = stage(&fixture.app);
+        assert!(before.owner.1, "{live_kind}: attached");
+        assert!(before.recording.is_some());
+        for (crypto, code) in attackers {
+            let asked = stub.count();
+            let attacker = Encoder::call(addr, Some(crypto)).await;
+            assert_eq!(attacker.rejected(), Some(code.0), "{live_kind} {required}");
+            assert_eq!(stub.count(), asked + 1, "the app was asked first");
+            if let Some(live) = &mut live {
+                live.pump(Duration::from_millis(50)).await;
+            }
+        }
+        assert_eq!(stage(&fixture.app), before, "{live_kind} {required}");
+        let after = events(&mut fixture);
+        for name in ["unpublish", "recordSegmentComplete", "publish"] {
+            assert!(!after.iter().any(|e| e == name), "{after:?}");
+        }
+        if let Some(live) = &mut live {
+            assert!(live.connected && live.closed.is_none(), "{:?}", live.closed);
+            live.stop().await;
+        }
+        drop(rtmp);
+        server.abort();
+        let _ = server.await;
+    }
+    let logs = captured.text();
+    assert!(!logs.contains("publisher replaced"), "{logs}");
+    assert!(
+        logs.contains("neither the app nor the server has a passphrase"),
+        "{logs}"
+    );
+    assert!(logs.contains("key length differs"), "{logs}");
+    assert!(!logs.contains(GLOBAL) && !logs.contains(JUNK));
 }

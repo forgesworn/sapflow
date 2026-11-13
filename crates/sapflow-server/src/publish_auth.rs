@@ -625,7 +625,7 @@ mod tests {
             .await
             .expect("admitted");
         // Keyed: nothing is claimed until the listener checks the key.
-        let crate::srt::Admission::Keyed(keyed) = admission else {
+        let crate::srt::Admission::Pending(keyed) = admission else {
             panic!("expected a keyed admission")
         };
         assert!(fixture.app.streams.get("event-a").is_none());

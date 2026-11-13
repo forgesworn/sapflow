@@ -678,6 +678,14 @@ impl<S: BuildHasher> Listener<S> {
         }
     }
 
+    /// Whether a caller waiting for an answer sent key material, so an
+    /// application can tell how [`accept`](Self::accept) would treat it
+    /// before acting on its behalf. `None` when no caller with this id is
+    /// waiting. Reads the handshake only: no key derivation.
+    pub fn sent_key_material(&self, id: ConnId) -> Option<bool> {
+        self.pending(id).map(|p| p.km().is_some())
+    }
+
     fn pending(&self, id: ConnId) -> Option<&Pending> {
         match &self.conns.get(&id.0)?.state {
             State::Pending(p) => Some(&**p),
@@ -1614,6 +1622,21 @@ mod tests {
                 assert!(!l.accept_with_key(id, t0, &app(app_size)), "answered once");
                 assert!(sent_handshakes(&mut l).is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn sent_key_material_says_whether_a_waiting_caller_sent_any() {
+        let t0 = Instant::now();
+        let km = key_material(APP, KeySize::Aes256);
+        for (socket, sent) in [(1, Some(km.as_slice())), (2, None)] {
+            let mut l = with_config(t0, app_keys());
+            let id = waiting(&mut l, t0, socket, sent);
+            assert_eq!(l.sent_key_material(id), Some(sent.is_some()));
+            assert!(sent_handshakes(&mut l).is_empty(), "nothing answered");
+            assert_eq!(l.sent_key_material(ConnId(id.0 ^ 1)), None, "unknown id");
+            assert!(l.reject(id, RejectCode::UNSECURE));
+            assert_eq!(l.sent_key_material(id), None, "answered");
         }
     }
 

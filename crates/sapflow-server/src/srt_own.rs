@@ -16,7 +16,7 @@ use crate::App;
 use crate::publish::{Publication, PublicationLoss};
 use crate::publish_sessions::ScopedLease;
 use crate::recorder::IncompleteReason;
-use crate::srt::{Admission, IDLE, Keyed, Refused, admit, feed_payload};
+use crate::srt::{Admission, IDLE, Pending, Refused, admit, feed_payload};
 use crate::stream::SourceKind;
 
 const QUEUE: usize = 16_384;
@@ -343,11 +343,12 @@ fn complete_admission(
             listener.reject(id, reject_code(error));
             return;
         }
-        Ok(Admission::Keyed(keyed)) => {
-            let Some((publication, size)) = accept_keyed(app, listener, id, peer, keyed) else {
+        Ok(Admission::Pending(pending)) => {
+            let Some((publication, encryption)) = accept_pending(app, listener, id, peer, pending)
+            else {
                 return;
             };
-            (publication, None, QUEUE, Encryption::AppKey(size))
+            (publication, None, QUEUE, encryption)
         }
         Ok(Admission::Claimed(publication)) => {
             let scope = publication.scoped_lease();
@@ -415,34 +416,48 @@ fn refused_key(app: &Arc<App>, peer: SocketAddr) {
     );
 }
 
-/// An admission with the app's passphrase for this stream: checks the
-/// caller's key material, then claims the path, then accepts, with no await
-/// in between. A wrong or missing key is refused before the claim, so a live
-/// or held stage, its recording and its callbacks are untouched.
-fn accept_keyed(
+/// An admission under `SAPFLOW_SRT_APP_KEYS`: makes sure the caller will be
+/// accepted, then claims the path, then accepts, with no await in between.
+/// SRT claims take over a live path, so a caller refused for its key, or for
+/// sending none, is refused before the claim, and a live or held stage, its
+/// recording and its callbacks are untouched. With the app's passphrase the
+/// caller must have used it; without one the listener's own settings decide,
+/// as [`Listener::accept`] would.
+fn accept_pending(
     app: &Arc<App>,
     listener: &mut Listener,
     id: ConnId,
     peer: SocketAddr,
-    keyed: Keyed,
-) -> Option<(Publication, KeySize)> {
-    let Keyed { req, admitted, key } = keyed;
-    let size = match listener.check_key(id, &key) {
-        Ok(size) => size,
+    pending: Pending,
+) -> Option<(Publication, Encryption)> {
+    let Pending { req, admitted, key } = pending;
+    let checked = match &key {
+        Some(key) => match listener.check_key(id, key) {
+            Ok(size) => Ok(Encryption::AppKey(size)),
+            Err(error) => {
+                if error != KeyCheckError::NotPending {
+                    // The error names the failure only, never the key.
+                    app.log_refusal("srt", &error);
+                }
+                Err(error.reject_code())
+            }
+        },
+        None => deployment_check(app, listener, id),
+    };
+    let encryption = match checked {
+        Ok(encryption) => encryption,
         // Not answered within the accept timeout while the app was asked:
         // the caller is gone, and nothing was claimed for it.
-        Err(KeyCheckError::NotPending) => {
+        Err(None) => {
             app.log_refusal("srt", &"caller gave up before the app answered");
             return None;
         }
-        Err(error) => {
-            listener.reject(id, error.reject_code().unwrap_or(RejectCode::BADSECRET));
+        Err(Some(code)) => {
+            listener.reject(id, code);
             app.auth_throttle
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .failed(peer.ip(), Instant::now());
-            // The error names the failure only, never the key.
-            app.log_refusal("srt", &error);
             return None;
         }
     };
@@ -454,14 +469,66 @@ fn accept_keyed(
             return None;
         }
     };
-    if !listener.accept_with_key(id, Instant::now(), &key) {
+    let accepted = match &key {
+        Some(key) => listener.accept_with_key(id, Instant::now(), key),
+        None => listener.accept(id, Instant::now()),
+    };
+    if !accepted {
         // As after any failed accept: dropping the unaccepted publication
         // releases its claim.
         drop(publication);
         refused_key(app, peer);
         return None;
     }
-    Some((publication, size))
+    Some((publication, encryption))
+}
+
+/// Whether [`Listener::accept`] will admit a caller the app admitted without
+/// a passphrase, decided before anything is claimed for it: key material
+/// must unwrap with the global passphrase at its key length, and a caller
+/// with none needs plaintext allowed. `Err(None)` when the caller is gone,
+/// else the code to refuse it with (logged here).
+fn deployment_check(
+    app: &Arc<App>,
+    listener: &Listener,
+    id: ConnId,
+) -> Result<Encryption, Option<RejectCode>> {
+    let config = &app.config;
+    let refuse = |code: RejectCode, reason: &str| {
+        app.log_refusal("srt", &reason);
+        Err(Some(code))
+    };
+    match (listener.sent_key_material(id), &config.srt_crypto) {
+        (None, _) => Err(None),
+        (Some(false), crypto) => {
+            let plaintext = !(config.control.is_some() || config.srt_require_encryption)
+                && (crypto.is_none() || config.srt_allow_plaintext);
+            if plaintext {
+                Ok(Encryption::None)
+            } else {
+                refuse(
+                    RejectCode::UNSECURE,
+                    "no key material, and encryption is required",
+                )
+            }
+        }
+        (Some(true), None) => refuse(
+            RejectCode::UNSECURE,
+            "key material, but neither the app nor the server has a passphrase",
+        ),
+        (Some(true), Some(global)) => match listener.check_key(id, global) {
+            Ok(size) if size == global.key_size => Ok(Encryption::DeploymentKey(size)),
+            Ok(_) => refuse(
+                RejectCode::BADSECRET,
+                "key length differs from the server passphrase's",
+            ),
+            Err(KeyCheckError::NotPending) => Err(None),
+            Err(error) => {
+                app.log_refusal("srt", &error);
+                Err(error.reject_code())
+            }
+        },
+    }
 }
 
 /// How an accepted publisher's media is encrypted, for the accept log.
