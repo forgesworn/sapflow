@@ -189,8 +189,10 @@ Notes for the release after 0.2.0-rc.1.
   encoders connect, one at a time and at least a second apart, on a sender
   of their own so a slow import (v4v copies the whole file first) never
   holds up a live `publish`, with attempts of up to ten minutes. A failure
-  is retried in up to three later rounds (30 s, 60 s, 120 s), then waits
-  for the next start; a 4xx keeps the report for the next start. A live
+  is retried in later rounds, 30 s apart and doubling to 10 minutes: while
+  v4v cannot be reached at all, until it is up or the recording expires;
+  once it answered and failed, three times in a run, then at the next
+  start. A 4xx keeps the report for the next start. A live
   callback that fails while sapflow runs is sent at the next start. sapflow creates the directory (0700) itself, so no setup is
   needed; if it cannot be used, sapflow logs an error and records as before.
   A scoped recording reserves its completion's `eventSequence` when its file
@@ -204,7 +206,10 @@ Notes for the release after 0.2.0-rc.1.
 
 - Callbacks treated a 408 or 429 as a refusal and gave up at once. They are
   now retried, after as long as `Retry-After` or the JSON body's
-  `retryAfterMs` (as v4v's rate limiter sends) asks, up to a minute.
+  `retryAfterMs` (as v4v's rate limiter sends) asks: up to 10 s for a live
+  callback, a minute for a recovered one. Only a callback's 408, 429 or 503
+  body is read for that, at most 1 KiB within 1.5 s; publish authorisation
+  still never reads a body.
 
 - A recording refused its first part, for want of a writer or byte budget,
   stopped before it had a file, so its codec epoch was served and then lost

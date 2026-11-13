@@ -321,11 +321,14 @@ stages), on a sender of their own, so a slow answer never holds up a live
 stage's `publish`: two attempts each, of up to ten minutes, since v4v copies
 and hashes the whole file before it answers (a four-hour show at 4,000
 kbit/s is about 8 GB, some seven minutes at 20 MB/s). One is forgotten only
-when v4v answers it 2xx. A failure (v4v not yet up after a power cut that
-restarted both, or answering 408, 429 or 5xx) is tried again while sapflow
-runs, 30 s later, then 60 s and 120 s; after three retry rounds it waits for
-the next start, so a receiver that keeps failing is not asked without end.
-After three failures in a row the rest of a round waits too. A 4xx other
+when v4v answers it 2xx. A failure is tried again while sapflow runs, 30 s
+later, then at doubling waits up to every 10 minutes. If v4v cannot be
+reached at all (not yet up after a power cut that restarted both), that
+goes on until it is up or the recording expires. If it was reached and
+failed (answered 408, 429 or 5xx, or timed out once connected), the report
+is retried three times in that run and then waits for the next start, so
+a receiver that keeps failing, copying the file each time, is not asked
+without end. After three failures in a row the rest of a round waits too. A 4xx other
 than 408 and 429 (a wrong token after a redeploy, say) is not retried in
 that run, but kept for the next start, so it is sent at each start until
 v4v takes it or it expires. A start sends at most 4,096, oldest first.
@@ -333,8 +336,12 @@ A stop does not wait for a recovered callback in flight: it stays owed.
 
 Every callback, live or recovered, treats 408 and 429 as "try again", not
 as a refusal, and waits as long as a `Retry-After` header (seconds) or a
-`retryAfterMs` in the JSON body asks, up to a minute, before its next
-attempt.
+`retryAfterMs` in the JSON body asks before its next attempt: up to 10 s
+for a live callback, so one event holds the live queue at most about 50 s,
+and up to a minute for a recovered one. To find `retryAfterMs`, the body of
+a 408, 429 or 503 to a callback is read, up to its `content-length`, at most
+1 KiB and for at most 1.5 s; no other body is read, and never one answering
+a publish authorisation request.
 
 v4v follow-up: since every attempt that times out makes v4v copy the file
 again, its importer should answer before it copies (and copy in the
@@ -350,7 +357,8 @@ v4v's legacy importer treats the same file with the same bytes a second
 time as the same part (`kept`, `same-part`); recovery never changes a
 file's bytes. A scoped receiver can dedupe on `recordingId` and
 `eventSequence`, which a resend repeats. A file reported `server-interrupted`
-was never reported live, so it has no earlier report to differ from.
+was normally never reported live, so it normally has no earlier report to
+differ from.
 
 v4v rejects a callback whose path does not match the prepared session.
 
