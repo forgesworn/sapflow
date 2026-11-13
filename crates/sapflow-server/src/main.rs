@@ -168,8 +168,14 @@ async fn run(config: Config) -> std::io::Result<()> {
                 std::io::Error::other(format!("SAPFLOW_SRT_REPLAY_STORE {}: {e}", path.display()))
             })?;
             if store.created() {
+                let mode = if config.control.is_some() {
+                    "scoped publish sessions"
+                } else {
+                    "SRT app keys"
+                };
                 tracing::warn!(
-                    "SRT replay store created empty: right on a first start; if SRT app keys were in use before, SAPFLOW_SRT_REPLAY_STORE is not on a persistent volume and every restart forgets admitted key material"
+                    mode,
+                    "SRT replay store created empty: right on a first start; if this mode was in use before, the replay store is not on a persistent volume and every restart forgets admitted key material"
                 );
             } else {
                 tracing::info!(admitted = records.len(), "SRT replay store read");

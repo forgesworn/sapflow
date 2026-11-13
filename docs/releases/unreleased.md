@@ -393,8 +393,10 @@ Notes for the release after 0.2.0-rc.1.
   directory, which already has to be private and persistent, so nothing
   new needs configuring; `SAPFLOW_SRT_REPLAY_STORE` names another file,
   and may not name the session store. The first start after upgrading
-  writes it empty and logs a warning, as any first start does. Live
-  scoped stages were never open to takeover (409), and still are not.
+  writes it empty and logs a warning, as any first start does, so captures
+  of scoped connections admitted before the upgrade can still be replayed
+  after it, within their grant, while the stage is held. Live scoped
+  stages were never open to takeover (409), and still are not.
 - `SAPFLOW_SRT_ENCRYPTION=required` set explicitly without
   `SAPFLOW_SRT_PASSPHRASE` now stops startup unless app keys are on, where
   it refuses callers that send no key material. It used to start and

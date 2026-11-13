@@ -430,6 +430,10 @@ pub fn persist(
 /// that already admitted a connection is refused; otherwise it is
 /// remembered, and with a store written before the hook returns, so the
 /// claim waits for it. The file work runs in a blocking task.
+/// The longest a scoped admission waits for its replay store write, while
+/// holding the session manager's operation lock.
+const SCOPED_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn scoped_check(
     app: &Arc<crate::App>,
     path: String,
@@ -441,6 +445,13 @@ pub fn scoped_check(
         Box::pin(async move {
             let (store, generation) = {
                 let mut guard = app.srt_replay.lock().unwrap_or_else(|e| e.into_inner());
+                // Usually the Connect check has refused this already, but not
+                // always: if the owner's first attempt waits for the
+                // operation lock past the listener's accept timeout, its
+                // resend from the same address and socket is a new
+                // connection the owner rule lets through. The first attempt
+                // then remembers, reserves and fails at accept, and this
+                // one is refused here (BADSECRET): failing closed.
                 if guard.admitted(&seen) {
                     return Err(Refused::Replay);
                 }
@@ -451,17 +462,23 @@ pub fn scoped_check(
                 }
             };
             let writer = app.clone();
-            match tokio::task::spawn_blocking(move || {
+            // Bounded, so a hung disk refuses this caller and frees the
+            // operation lock rather than stalling every control-plane call
+            // and scoped admission behind it. The write may still finish.
+            let write = tokio::task::spawn_blocking(move || {
                 persist(&writer.srt_replay, &store, generation)
-            })
-            .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => {
+            });
+            match tokio::time::timeout(SCOPED_WRITE_WAIT, write).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(error))) => {
                     tracing::error!(%error, "SRT replay store not written; caller refused");
                     Err(Refused::Unrecorded)
                 }
-                Err(_) => Err(Refused::Unrecorded),
+                Ok(Err(_)) => Err(Refused::Unrecorded),
+                Err(_) => {
+                    tracing::error!("SRT replay store write took too long; caller refused");
+                    Err(Refused::Unrecorded)
+                }
             }
         })
     })

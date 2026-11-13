@@ -2240,3 +2240,39 @@ async fn a_scoped_caller_is_refused_when_the_replay_store_cannot_be_written() {
     stage.genuine_reconnect_resumes(held, epoch).await;
     stage.server.abort();
 }
+
+/// A replay store write that hangs (a stuck disk) refuses the caller once
+/// the wait is up, reserves nothing, and frees the operation lock, so the
+/// control plane and other admissions are not stalled behind it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hung_replay_store_write_refuses_and_frees_the_operation_lock() {
+    use crate::srt_own::app_key_tests::{Encoder, key};
+    use sapflow_srt::RejectCode;
+    let stage = HeldScoped::start().await;
+    let (held, epoch) = (stage.held(), stage.epoch().await);
+    let store = stage
+        .app
+        .srt_replay
+        .lock()
+        .expect("guard")
+        .store()
+        .expect("replay store");
+    store.lock().expect("store").stall = Duration::from_secs(6);
+    let started = std::time::Instant::now();
+    let right = Some(key(TRANSPORT_SECRET, sapflow_srt::crypto::KeySize::Aes256));
+    let refused = Encoder::call_as(stage.addr, &stage.stream_id, right).await;
+    assert_eq!(refused.rejected(), Some(RejectCode::http(503).0));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    // The operation lock is free while the write is still stuck.
+    let status = tokio::time::timeout(Duration::from_secs(1), stage.manager.status(SID))
+        .await
+        .expect("the operation lock was held")
+        .expect("receipt");
+    assert_eq!(status.connection_epoch, epoch);
+    assert_eq!(stage.held(), held);
+    stage.server.abort();
+}
