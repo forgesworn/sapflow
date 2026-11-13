@@ -340,14 +340,31 @@ Notes for the release after 0.2.0-rc.1.
   recorded media included; evicting an owner needs a long flood of ended
   connections; callers the listener refuses before the application hears
   of them (`BACKLOG`, the handshake rate limit) own
-  nothing. With the switch off nothing changes: the path is claimed before
-  any key is checked there, so the guard could not help.
+  nothing. With the switch off the guard does not apply (below).
 - The "SRT publisher accepted" log line gives `encryption` (`none`,
   `deployment-key`, `app-key` or `session-key`) and `key_len`, so the
   logs show which publishers still connect without a passphrase, or with
   the global one. With `SAPFLOW_SRT_ENCRYPTION=optional` and a global
   passphrase, telling an encrypting caller apart costs one more key
   derivation per connection. The "SRT listening" line gives `app_keys`.
+- With app keys off, an SRT caller is now checked against the global
+  `SAPFLOW_SRT_PASSPHRASE` before its path is claimed, as with them on.
+  The path used to be claimed as soon as the publish user and password or
+  the app admitted the caller, and an SRT claim takes over: a caller with
+  the stream id's credentials, which travel in clear, and the wrong
+  passphrase or key length replaced a live RTMP, WHIP or SRT publisher,
+  then failed to connect. It is now refused (`BADSECRET`, counted by the
+  throttle) and the live or held stage, its recording and callbacks are
+  untouched. Admitted callers see nothing new: the app's request, the
+  answers and the takeover by a caller with the right key are as before.
+  A caller refused for its key no longer logs "publisher connected" or
+  resumes a held stage, is refused for the key ahead of a claim refusal
+  (such as the memory limit), and is logged with its reason
+  (`BadSecret`, or the key length). One that gives up before the app
+  answers is no longer counted by the throttle, and claims nothing. The
+  check costs one more key derivation per encrypting caller with a global
+  passphrase, before the accept's own. Scoped sessions are unchanged. The
+  replay guard still applies only with app keys.
 - `SAPFLOW_SRT_ENCRYPTION=required` set explicitly without
   `SAPFLOW_SRT_PASSPHRASE` now stops startup unless app keys are on, where
   it refuses callers that send no key material. It used to start and
