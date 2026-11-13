@@ -167,7 +167,13 @@ async fn run(config: Config) -> std::io::Result<()> {
             let (store, records) = srt_replay_store::ReplayStore::open(path).map_err(|e| {
                 std::io::Error::other(format!("SAPFLOW_SRT_REPLAY_STORE {}: {e}", path.display()))
             })?;
-            tracing::info!(admitted = records.len(), "SRT replay store read");
+            if store.created() {
+                tracing::warn!(
+                    "SRT replay store created empty: right on a first start; if SRT app keys were in use before, SAPFLOW_SRT_REPLAY_STORE is not on a persistent volume and every restart forgets admitted key material"
+                );
+            } else {
+                tracing::info!(admitted = records.len(), "SRT replay store read");
+            }
             srt_replay::ReplayGuard::with_store(store, records)
         }
         None => srt_replay::ReplayGuard::default(),

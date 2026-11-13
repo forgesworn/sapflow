@@ -189,6 +189,7 @@ pub struct ReplayStore {
     directory: File,
     name: OsString,
     _lock: File,
+    created: bool,
     #[cfg(test)]
     pub(crate) fail_before_rename: bool,
 }
@@ -230,6 +231,7 @@ impl ReplayStore {
             directory,
             name,
             _lock: lock,
+            created: false,
             #[cfg(test)]
             fail_before_rename: false,
         };
@@ -237,10 +239,17 @@ impl ReplayStore {
             Some(records) => Ok((store, records)),
             None if new_lock => {
                 store.write(&encode(std::iter::empty())?)?;
+                store.created = true;
                 Ok((store, Vec::new()))
             }
             None => Err(ReplayStoreError::Missing),
         }
+    }
+
+    /// Whether [`open`](Self::open) found neither file nor lock and wrote an
+    /// empty store: a first start, or a path that does not persist.
+    pub fn created(&self) -> bool {
+        self.created
     }
 
     fn read(&self) -> Result<Option<Vec<Record>>, ReplayStoreError> {
@@ -388,7 +397,7 @@ pub(crate) mod tests {
     fn a_first_start_writes_an_empty_store_and_a_restart_reads_it() {
         let scratch = Scratch::new();
         let (mut store, loaded) = ReplayStore::open(&scratch.path()).expect("first start");
-        assert!(loaded.is_empty());
+        assert!(loaded.is_empty() && store.created());
         assert!(scratch.path().exists(), "written at once");
         store.write(&bytes(&records(4))).expect("write");
         assert!(matches!(
@@ -396,8 +405,9 @@ pub(crate) mod tests {
             Err(ReplayStoreError::Locked)
         ));
         drop(store);
-        let (_store, loaded) = ReplayStore::open(&scratch.path()).expect("restart");
+        let (store, loaded) = ReplayStore::open(&scratch.path()).expect("restart");
         assert_eq!(loaded, records(4));
+        assert!(!store.created());
     }
 
     #[test]

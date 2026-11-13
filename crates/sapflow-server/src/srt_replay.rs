@@ -42,6 +42,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use sapflow_srt::ConnId;
 use sha2::{Digest, Sha256};
@@ -134,7 +135,7 @@ pub struct ReplayGuard {
     admitted: VecDeque<Entry>,
     /// The admitted digests, for lookups.
     admitted_index: HashSet<[u8; 32]>,
-    store: Option<ReplayStore>,
+    store: Option<Arc<Mutex<ReplayStore>>>,
 }
 
 impl ReplayGuard {
@@ -145,7 +146,7 @@ impl ReplayGuard {
         for (path, digest) in records {
             guard.insert(&path, digest, None, &|_| None);
         }
-        guard.store = Some(store);
+        guard.store = Some(Arc::new(Mutex::new(store)));
         guard
     }
 
@@ -194,29 +195,48 @@ impl ReplayGuard {
         self.admitted_index.contains(&seen.digest)
     }
 
-    /// Remembers the key material of a caller about to be admitted on
-    /// `path`, evicting the path's oldest ended entry past [`PER_PATH`] and
-    /// the oldest ended entry of all past [`TOTAL`], then writes the
-    /// admitted tier to the store, if there is one. On an error the entry is
-    /// kept in memory, but a restart would forget it: do not admit the
-    /// caller.
-    pub fn record(
+    /// Remembers, in memory, the key material of a caller about to be
+    /// admitted on `path`, evicting the path's oldest ended entry past
+    /// [`PER_PATH`] and the oldest ended entry of all past [`TOTAL`]. From
+    /// now on it is refused to everyone. With a store, do not claim or
+    /// accept the caller until [`persist`] has written it.
+    pub fn remember(
         &mut self,
         path: &str,
         seen: Seen,
         caller_socket: impl Fn(ConnId) -> Option<u32>,
-    ) -> Result<(), ReplayStoreError> {
+    ) {
         self.insert(
             path,
             seen.digest,
             Some((seen.conn, seen.caller_socket)),
             &caller_socket,
         );
-        let Some(store) = &mut self.store else {
+    }
+
+    /// The store the admitted tier is kept in, if any.
+    pub fn store(&self) -> Option<Arc<Mutex<ReplayStore>>> {
+        self.store.clone()
+    }
+
+    /// [`remember`](Self::remember), then the store written at once.
+    #[cfg(test)]
+    pub fn record(
+        &mut self,
+        path: &str,
+        seen: Seen,
+        caller_socket: impl Fn(ConnId) -> Option<u32>,
+    ) -> Result<(), ReplayStoreError> {
+        self.remember(path, seen, caller_socket);
+        let Some(store) = self.store() else {
             return Ok(());
         };
-        let bytes = encode(self.admitted.iter().map(|e| (&*e.path, &e.digest)))?;
-        store.write(&bytes)
+        let bytes = self.encoded()?;
+        store.lock().expect("store").write(&bytes)
+    }
+
+    fn encoded(&self) -> Result<Vec<u8>, ReplayStoreError> {
+        encode(self.admitted.iter().map(|e| (&*e.path, &e.digest)))
     }
 
     fn insert(
@@ -260,6 +280,19 @@ impl ReplayGuard {
     fn sizes(&self) -> (usize, usize) {
         (self.owners.len(), self.admitted.len())
     }
+}
+
+/// Writes the admitted tier as it is now to `store`: blocking file work, for
+/// a blocking task. Writes are one at a time, and each takes the tier when
+/// it starts, so once one that started after a [`ReplayGuard::remember`]
+/// succeeds, that entry is on disk. Holds the guard only to encode it.
+pub fn persist(
+    guard: &Mutex<ReplayGuard>,
+    store: &Mutex<ReplayStore>,
+) -> Result<(), ReplayStoreError> {
+    let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = guard.lock().unwrap_or_else(|e| e.into_inner()).encoded()?;
+    store.write(&bytes)
 }
 
 #[cfg(test)]
