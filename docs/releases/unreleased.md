@@ -432,6 +432,22 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-srt
 
+- The receiver splits a NAK that would not fit one datagram. A batch of
+  loss ranges (up to 256 a tick; 8 bytes each unless a single number) could
+  reach 2,064 bytes with the SRT header, over a 1,500-byte path, so under
+  heavy scattered loss, or after a held burst of reordered gaps was
+  reported together, the very NAK asking for retransmissions could be
+  fragmented or dropped. Each NAK now carries at most the negotiated MTU
+  (clamped to 576 to 1500) less 48 bytes of IPv6 and UDP headers (IPv4
+  needs only 28) and the 16-byte SRT header: 1,436 bytes of loss list, 179
+  ranges, at 1,500. A longer batch goes out as consecutive NAKs in the same
+  tick, every range once and in order. A batch that fits is the same single
+  packet, byte for byte. `Stats::naks_sent` still counts NAK packets sent,
+  so one batch can now add more than 1.
+- `receiver::Settings` gains `mtu`, the negotiated MTU with IP and UDP
+  headers (the listener sets it from the caller's handshake, at most 1500).
+  `Settings` is not `#[non_exhaustive]`, so a struct literal needs the new
+  field.
 - `receiver::Stats` gains `reordered`: packets reported missing that then
   arrived as originals, not retransmissions (counted correctly only when
   the caller sets the retransmission flag, as libsrt does). `Stats` is not
