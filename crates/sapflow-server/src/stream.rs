@@ -228,7 +228,9 @@ pub struct Session {
     clean_close: Option<u64>,
     /// The `unpublish` owed to the app by the generation that sent `publish`,
     /// with that publication's callbacks. Whoever ends the publication first
-    /// takes it, its `Publication` or a stop, so it is sent once.
+    /// takes it, its `Publication` or a stop, so it is sent once. After a
+    /// takeover it stays the replaced generation's until the new one
+    /// publishes.
     unpublish: Option<(u64, Callbacks)>,
 }
 
@@ -1344,8 +1346,11 @@ impl Registry {
     /// publisher can claim a path in between.
     ///
     /// - A live publisher's recording is marked [`IncompleteReason::ServerStopped`]
-    ///   (unless it already has a reason) and its owed `unpublish` is sent.
+    ///   (unless it already has a reason).
     /// - A held stream ends as if its grace had passed.
+    /// - Any `unpublish` still owed is sent, whichever generation owes it: a
+    ///   connection that took the stream over and has not yet published
+    ///   leaves its predecessor's `publish` standing, and the stage is ending.
     ///
     /// Each stream's `unpublish` is queued before its recording is released,
     /// so it goes ahead of `recordSegmentComplete`. A connection still running
@@ -1370,7 +1375,7 @@ impl Registry {
                 } else {
                     stopped.held += 1;
                 }
-                if let Some(callbacks) = session.take_unpublish(generation) {
+                if let Some((_, callbacks)) = session.unpublish.take() {
                     callbacks.send(&stream.path, sapflow_core::StreamEvent::Unpublish);
                 }
             }

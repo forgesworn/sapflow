@@ -234,6 +234,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_right_after_a_takeover_still_sends_the_owed_unpublish() {
+        let (fixture, seen) = fixture(Duration::from_secs(60), None);
+        let mut old = begin(&fixture, "event-a").expect("first connection");
+        Fixture::feed(&mut old);
+        // The encoder reconnects, as on a network change, and is stopped
+        // before its new connection has sent `publish`.
+        let new = begin(&fixture, "event-a").expect("takeover");
+        drop(old);
+        let outcome = stop(&fixture.app, &[], DEADLINE).await;
+        assert_eq!(outcome.ended, Stopped { live: 1, held: 0 });
+        drop(new);
+        tokio::time::timeout(Duration::from_secs(1), fixture.app.callbacks.drained())
+            .await
+            .expect("drained");
+        let events = events(&seen, "event-a");
+        assert_eq!(
+            names(&events),
+            ["publish", "unpublish", "recordSegmentComplete"]
+        );
+        assert_eq!(events[2]["recordingReason"], "server-stopped");
+    }
+
+    #[tokio::test]
     async fn the_deadline_bounds_a_stop_whose_writer_never_finishes() {
         let (fixture, seen) = fixture(
             Duration::ZERO,
