@@ -405,3 +405,77 @@ async fn the_passphrase_never_reaches_logs_or_errors() {
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn at_cutover_a_global_optional_key_and_app_keys_are_told_apart() {
+    // As the switch goes on in production: a global passphrase with
+    // `optional`, and app keys. Legacy gigs (no header) admit the global
+    // key or plaintext; a gig with a passphrase admits only its own key.
+    const GLOBAL: &str = "deployment-wide-secret";
+    let captured = crate::log_capture::Capture::start();
+    for (answer, stream) in [
+        (Answer::Status(200), "legacy"),
+        (Answer::Passphrase(&[KEY]), "keyed"),
+    ] {
+        let stub = stub::start(answer).await;
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.srt_crypto = Some(key(GLOBAL, KeySize::Aes128));
+        app.config.srt_allow_plaintext = true;
+        let (addr, server) = origin(&fixture.app);
+        let global = Encoder::call(addr, Some(key(GLOBAL, KeySize::Aes128))).await;
+        let plain = Encoder::call(addr, None).await;
+        let own = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+        if stream == "legacy" {
+            assert!(global.connected && plain.connected, "{stream}");
+            // The app key is no key here: only the global one unwraps.
+            assert_eq!(own.rejected(), Some(RejectCode::BADSECRET.0));
+        } else {
+            assert_eq!(global.rejected(), Some(RejectCode::BADSECRET.0));
+            assert_eq!(plain.rejected(), Some(RejectCode::UNSECURE.0));
+            assert!(own.connected, "{:?}", own.closed);
+        }
+        for mut encoder in [global, plain, own] {
+            encoder.stop().await;
+        }
+        server.abort();
+        let _ = server.await;
+    }
+    let logs = captured.text();
+    for line in [
+        "encryption=\"deployment-key\" key_len=16",
+        "encryption=\"none\"",
+        "encryption=\"app-key\" key_len=32",
+    ] {
+        assert!(logs.contains(line), "{line}: {logs}");
+    }
+    assert!(!logs.contains(GLOBAL) && !logs.contains(KEY));
+}
+
+#[tokio::test]
+async fn a_caller_gone_before_the_app_answered_claims_nothing_and_is_not_counted() {
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let fixture = fixture(&stub, Duration::ZERO);
+    let peer: SocketAddr = "127.0.0.1:5000".parse().expect("peer");
+    let mut listener = Listener::new(listener_config(&fixture.app.config), Instant::now());
+    // More than the throttle's ten: none of them counts.
+    for _ in 0..12 {
+        let Ok(Admission::Keyed(keyed)) =
+            crate::srt::admit(&fixture.app, STREAM_ID, peer.ip(), 0).await
+        else {
+            panic!("expected a keyed admission")
+        };
+        assert!(accept_keyed(&fixture.app, &mut listener, ConnId(7), peer, keyed).is_none());
+    }
+    assert!(fixture.app.streams.get("event-a").is_none());
+    assert_eq!(stub.count(), 12);
+    assert!(
+        fixture
+            .app
+            .auth_throttle
+            .lock()
+            .expect("throttle")
+            .allowed(peer.ip(), Instant::now())
+    );
+    assert_eq!(listener.stats().rejected, 0, "no one to answer");
+}

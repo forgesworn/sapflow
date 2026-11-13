@@ -9,13 +9,15 @@
 //! body is never read. A redirect is a refusal like any other status.
 //!
 //! The URL carries the app's token and the body carries the publisher's
-//! password: neither is logged, and nothing the app answers is kept.
+//! password: neither is logged, and nothing the app answers is kept beyond
+//! the admission it decides.
 //!
 //! With `SAPFLOW_SRT_APP_KEYS=1`, an SRT request also carries
 //! `"srtKey":"accepted"` ([`SRT_KEY_FIELD`]): sapflow can check a passphrase
 //! the app holds for this stream. The app may then answer 2xx with that
 //! passphrase in one `sapflow-srt-passphrase` header
-//! ([`SRT_PASSPHRASE_HEADER`]), 10 to 79 bytes; the caller is admitted only if
+//! ([`SRT_PASSPHRASE_HEADER`]), 10 to 79 bytes once the spaces and tabs
+//! around it are dropped; the caller is admitted only if
 //! its SRT key material was made with it. The value goes straight into
 //! zeroising storage and is never logged. A header that is repeated or out of
 //! bounds refuses the publisher as an app that did not answer usably would.

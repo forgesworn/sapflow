@@ -757,6 +757,11 @@ mod tests {
                 == ResponseHeader::One(b"pw_srt_0123456789")
         );
         assert!(response_header(head, "x-other") == ResponseHeader::Absent);
+        // Spaces and tabs around a value are not part of it.
+        assert!(
+            response_header(b"HTTP/1.1 200 OK\r\nx-key: \t value \t \r\n\r\n", "x-key")
+                == ResponseHeader::One(b"value")
+        );
         let twice = b"HTTP/1.1 200 OK\r\nx-key: a\r\nX-Key: a\r\n\r\n";
         assert!(response_header(twice, "x-key") == ResponseHeader::Unusable);
         assert!(response_header(b"HTTP/1.1 200 OK\r\n", "x-key") == ResponseHeader::Unusable);
