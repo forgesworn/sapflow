@@ -79,9 +79,9 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - A 2xx may carry the stream's passphrase in one `sapflow-srt-passphrase`
   header: 10 to 79 bytes, no NUL (libsrt's limits), exactly as the encoder
   is given it (libsrt does not percent-decode a passphrase). Spaces and
-  tabs around the value are not part of it. sapflow then
-  admits the caller only if its SRT key material was made with that
-  passphrase, at key length 16 or 32, whichever the caller chose.
+  tabs around the value are not part of it. sapflow then admits the caller
+  only if its SRT key material was made with that passphrase, at key
+  length 16 or 32, whichever the caller chose.
 - The key is checked before the path is claimed. A caller with no key
   material is refused with `SRT_REJ_UNSECURE` (1011), one with another
   passphrase with `SRT_REJ_BADSECRET` (1010); either counts as a failed
@@ -90,12 +90,26 @@ handshake carries in clear in the stream id, no longer admits on its own.
   replaced, no `unpublish` or `recordSegmentComplete` is sent. The app
   answered 2xx, so it hears nothing of such a refusal; only the encoder
   does.
-- A 2xx without the header admits as before. A header sent twice, or
-  outside the bounds, refuses as an unusable answer does (`PREDEFINED:503`,
-  not counted). The header is read only from a 2xx to an SRT request.
+- A 2xx without the header admits as without app keys, by sapflow's own
+  SRT settings: key material must match `SAPFLOW_SRT_PASSPHRASE` at its
+  key length, and a caller with none is admitted in plaintext unless
+  encryption is required. With app keys this too is decided before the
+  path is claimed, so a caller refused here also leaves a live stage as it
+  was. Under `SAPFLOW_SRT_ENCRYPTION=optional`, or with no global
+  passphrase and encryption not required, a missing header therefore
+  admits a plaintext caller: by design, for gigs without a passphrase.
+- So, for a stream that has a passphrase, the app must never answer an SRT
+  request that carries `"srtKey":"accepted"` and an empty password with a
+  2xx and no header, and nothing between sapflow and the app (a proxy, a
+  framework that drops unknown headers) may strip the header: either turns
+  the gig's passphrase back into no check at all.
+- A header sent twice, or outside the bounds, refuses as an unusable
+  answer does (`PREDEFINED:503`, not counted). The header is read only from
+  a 2xx to an SRT request.
 - The passphrase is never logged and is dropped once the caller is
-  answered; an accepted connection keeps only the keys derived from it. The "SRT publisher accepted" log line says how each publisher
-  encrypts: `encryption="none"`, `"deployment-key"` (the global
+  answered; an accepted connection keeps only the keys derived from it.
+- The "SRT publisher accepted" log line says how each publisher encrypts:
+  `encryption="none"`, `"deployment-key"` (the global
   `SAPFLOW_SRT_PASSPHRASE`), `"app-key"` or `"session-key"` (scoped), with
   `key_len`.
 - With app keys and no global passphrase, `SAPFLOW_SRT_ENCRYPTION=required`
