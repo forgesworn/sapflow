@@ -283,6 +283,12 @@ async fn run(
                         listener.reject(id, RejectCode::http(402));
                         continue;
                     }
+                    // Scoped sessions check it before reserving anything.
+                    let key_material = app
+                        .publish_sessions
+                        .is_some()
+                        .then(|| listener.pending_key_material(id).map(<[u8]>::to_vec))
+                        .flatten();
                     let app = app.clone();
                     admissions.spawn(async move {
                         let result = admit(
@@ -290,6 +296,7 @@ async fn run(
                             &String::from_utf8_lossy(&stream_id),
                             peer.ip(),
                             active,
+                            key_material,
                         )
                         .await;
                         (id, peer, result)
@@ -812,7 +819,10 @@ pub(crate) fn listener_config_for_test(config: &crate::config::Config) -> Config
 }
 
 fn reject_code(reason: Refused) -> RejectCode {
-    RejectCode::http(reason.status())
+    match reason {
+        Refused::Key(error) => error.reject_code().unwrap_or(RejectCode::BADSECRET),
+        reason => RejectCode::http(reason.status()),
+    }
 }
 
 async fn cancelled(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
@@ -1141,4 +1151,4 @@ mod io_tests;
 
 #[cfg(test)]
 #[path = "srt_app_keys_tests.rs"]
-mod app_key_tests;
+pub(crate) mod app_key_tests;

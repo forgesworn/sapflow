@@ -15,7 +15,7 @@ use sapflow_core::{PublishError, PublishRequest};
 use sapflow_srt::crypto::CryptoConfig;
 
 use crate::App;
-use crate::publish::{Admitted, Publication, Refusal};
+use crate::publish::{Admitted, Publication, Refusal, ScopedRefusal};
 use crate::stream::{Source, SourceKind};
 
 /// Drop a publisher that sends nothing for this long (the SRT
@@ -42,6 +42,11 @@ pub enum Refused {
     Policy(Refusal),
     /// `SAPFLOW_MAX_PUBLISHERS` already publishing over SRT.
     PublisherLimit,
+    /// A scoped session's caller whose key the strict accept would refuse,
+    /// refused before anything was reserved for it: answered with the key's
+    /// own code ([`sapflow_srt::KeyCheckError::reject_code`]), as the accept
+    /// answered it.
+    Key(sapflow_srt::KeyCheckError),
 }
 
 impl Refused {
@@ -65,6 +70,8 @@ impl Refused {
                 | Refusal::MemoryLimit,
             )
             | Self::PublisherLimit => 402,
+            // Not sent as a status: see `Refused::Key`.
+            Self::Key(_) => 401,
         }
     }
 }
@@ -111,11 +118,14 @@ impl std::fmt::Debug for Admission {
 /// Decides on a caller from its stream id, with `active` SRT publishers
 /// already live: begins its publication, hands back an admission whose key
 /// is still to be checked, or says why not (and logs it, rate-limited).
+/// `key_material` is the caller's, copied from the listener (`None` if it
+/// sent none); scoped sessions check it before reserving anything.
 pub async fn admit(
     app: &Arc<App>,
     stream_id: &str,
     from: IpAddr,
     active: usize,
+    key_material: Option<Vec<u8>>,
 ) -> Result<Admission, Refused> {
     let admitted = match PublishRequest::parse_srt_stream_id(stream_id) {
         Err(e) => Err(Refused::Policy(Refusal::Request(e))),
@@ -126,15 +136,20 @@ pub async fn admit(
         Ok(req) if app.publish_sessions.is_none() => admit_unclaimed(app, req, from)
             .await
             .map_err(Refused::Policy),
-        Ok(req) => Publication::begin_srt(app, &req, from)
+        Ok(req) => Publication::begin_scoped_srt(app, &req, from, key_material)
             .await
             .map(Admission::Claimed)
-            .map_err(Refused::Policy),
+            .map_err(|refusal| match refusal {
+                ScopedRefusal::Policy(refusal) => Refused::Policy(refusal),
+                ScopedRefusal::Key(error) => Refused::Key(error),
+            }),
     };
     if let Err(r) = &admitted {
         match r {
             Refused::PublisherLimit => app.log_refusal("srt", &"publisher limit"),
             Refused::Policy(p) => app.log_refusal("srt", p),
+            // The error names the failure only, never the key.
+            Refused::Key(error) => app.log_refusal("srt", error),
         }
     }
     admitted

@@ -11,6 +11,7 @@ use sapflow_core::publish_session::{
     self as policy, Authority, Command, ConnectionLease, Disposition, EpochMs, SessionKey,
     SessionStatus,
 };
+use sapflow_srt::KeyCheckError;
 use sapflow_srt::crypto::{CryptoConfig, KeySize};
 use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, watch};
@@ -20,6 +21,25 @@ use crate::publish_observer::{CallbackScope, SessionObservations};
 use crate::publish_session_store::PublishSessionStore;
 use crate::publish_session_wire::{Limits, PutSession, RevokeSession, Secret};
 use crate::stream::{LiveStream, Registry};
+
+/// Why [`PublishSessions::admit_with_key`] refused a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    Session(Error),
+    /// Its key material does not unwrap with the session's passphrase at its
+    /// key length, or it sent none. Nothing was reserved for it.
+    Key(KeyCheckError),
+}
+impl From<Error> for Refused {
+    fn from(error: Error) -> Self {
+        Self::Session(error)
+    }
+}
+impl From<KeyCheckError> for Refused {
+    fn from(error: KeyCheckError) -> Self {
+        Self::Key(error)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -591,39 +611,101 @@ impl PublishSessions {
     }
 
     pub async fn admit(&self, request: &PublishRequest) -> Result<ScopedLease, Error> {
+        self.admit_checked(request, None)
+            .await
+            .map_err(|error| match error {
+                Refused::Session(error) => error,
+                // Unreachable: nothing was asked to check.
+                Refused::Key(_) => Error::Denied,
+            })
+    }
+
+    /// [`admit`](Self::admit) for an SRT caller, whose key material (copied
+    /// from the listener, `None` if it sent none) must unwrap with the
+    /// session's passphrase at the session's key length, as the strict accept
+    /// will require. Checked once the credentials match and before anything
+    /// else: a caller refused for its key reserves no claim, burns no
+    /// connection epoch, writes nothing to the store and resumes nothing.
+    pub async fn admit_with_key(
+        &self,
+        request: &PublishRequest,
+        key_material: Option<Vec<u8>>,
+    ) -> Result<ScopedLease, Refused> {
+        self.admit_checked(request, Some(key_material)).await
+    }
+
+    async fn admit_checked(
+        &self,
+        request: &PublishRequest,
+        key_material: Option<Option<Vec<u8>>>,
+    ) -> Result<ScopedLease, Refused> {
         let slot = self.slot()?;
         let manager = self.clone();
         let request = request.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            manager.admit_inner(&request).await
+            manager.admit_inner(&request, key_material).await
         })
         .await
         .map_err(|_| Error::Unavailable)?
     }
-    async fn admit_inner(&self, request: &PublishRequest) -> Result<ScopedLease, Error> {
+
+    /// The grant whose credentials `request` carries, still within its
+    /// deadline.
+    fn matching<'a>(
+        state: &'a State,
+        request: &PublishRequest,
+    ) -> Option<(&'a Grant, &'a Credentials)> {
+        state
+            .grants
+            .get(request.path.event_id())
+            .filter(|grant| Instant::now() < grant.deadline)
+            .and_then(|grant| {
+                grant
+                    .credentials
+                    .as_ref()
+                    .map(|credentials| (grant, credentials))
+            })
+            .filter(|(grant, credentials)| {
+                request.user.as_deref() == Some(grant.key.session_id.as_str())
+                    && request
+                        .pass
+                        .as_deref()
+                        .is_some_and(|p| credentials.password.matches(p))
+            })
+    }
+
+    async fn admit_inner(
+        &self,
+        request: &PublishRequest,
+        key_material: Option<Option<Vec<u8>>>,
+    ) -> Result<ScopedLease, Refused> {
         let _operation = self.0.operation.lock().await;
+        if let Some(key_material) = key_material {
+            // Credentials first, so a wrong password is refused below exactly
+            // as before; then the key, before any draft, reservation or save.
+            let crypto = {
+                let state = self.gate();
+                Self::matching(&state, request).map(|(_, credentials)| credentials.crypto.clone())
+            };
+            if let Some(crypto) = crypto {
+                let km = key_material.ok_or(KeyCheckError::NoKeyMaterial)?;
+                match sapflow_srt::check_key_material(&km, &crypto)? {
+                    size if size == crypto.key_size => {}
+                    // The strict accept takes the session's key length only.
+                    _ => return Err(Refused::Key(KeyCheckError::BadSecret)),
+                }
+            }
+        }
+        Ok(self.admit_reserving(request).await?)
+    }
+
+    async fn admit_reserving(&self, request: &PublishRequest) -> Result<ScopedLease, Error> {
         let (mut draft, reservation, must_save) = {
             let mut state = self.gate();
             let mut draft = self.draft(&state)?;
             Self::fence_draft(&mut state, &draft);
-            let result = state
-                .grants
-                .get(request.path.event_id())
-                .filter(|grant| Instant::now() < grant.deadline)
-                .and_then(|grant| {
-                    grant
-                        .credentials
-                        .as_ref()
-                        .map(|credentials| (grant, credentials))
-                })
-                .filter(|(grant, credentials)| {
-                    request.user.as_deref() == Some(grant.key.session_id.as_str())
-                        && request
-                            .pass
-                            .as_deref()
-                            .is_some_and(|p| credentials.password.matches(p))
-                })
+            let result = Self::matching(&state, request)
                 .ok_or(Error::Denied)
                 .and_then(|(grant, _)| draft.reserve_claim(&grant.key).map_err(Error::from));
             let must_save =

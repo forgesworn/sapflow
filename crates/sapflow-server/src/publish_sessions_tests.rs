@@ -1798,3 +1798,155 @@ async fn active_attempt_echo_is_runtime_only_and_a_fresh_revision_cannot_restore
     assert_eq!(refreshed.state, "prepared");
     assert!(refreshed.connection_attempt_id.is_none() && refreshed.fresh_media.is_none());
 }
+
+/// The real SRT loop in scoped mode, with our encrypting caller. A caller
+/// with the session's credentials but a key the strict accept would refuse
+/// is refused before anything is reserved: no connection epoch is burnt,
+/// nothing is written to the session store, and a stage held for a
+/// reconnect is not resumed and keeps its original deadline. Then the right
+/// key resumes it, and a live stage is never taken over.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wrong_key_reserves_nothing_and_leaves_a_held_stage_held() {
+    use crate::srt_own::app_key_tests::{Encoder, key, origin};
+    use sapflow_srt::RejectCode;
+    use sapflow_srt::crypto::KeySize::{Aes128, Aes256};
+    let captured = crate::log_capture::Capture::start();
+    let scratch = Scratch::new();
+    let manager = scratch.open(true).await;
+    prepare(&manager).await;
+    let (mut app, mut callbacks) = fresh_media_app(&manager);
+    let config = &mut Arc::get_mut(&mut app).expect("unshared app fixture").config;
+    // As in scoped mode: the listener requires encryption.
+    config.control = Some(scratch.config());
+    config.recordings = Some(scratch.0.join("recordings"));
+    config.record_min_free = 0;
+    let (addr, server) = origin(&app);
+    let stream_id = format!("publish:live/{EVENT}:{SID}:{PASSWORD}");
+    let right = || Some(key(TRANSPORT_SECRET, Aes256));
+    let events = |callbacks: &mut tokio::sync::mpsc::Receiver<_>| fresh_events(callbacks);
+
+    let mut live = Encoder::call_as(addr, &stream_id, right()).await;
+    assert!(live.connected, "{:?}", live.closed);
+    live.send_media().await;
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        seen.extend(events(&mut callbacks));
+        if seen.iter().any(|e| e == "publish") {
+            break;
+        }
+        live.pump(Duration::from_millis(20)).await;
+    }
+    assert!(seen.iter().any(|e| e == "publish"), "{seen:?}");
+    live.stop().await;
+    for _ in 0..200 {
+        seen.extend(events(&mut callbacks));
+        if seen.iter().any(|e| e == "unpublish") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(seen.iter().any(|e| e == "unpublish"), "{seen:?}");
+
+    let store = scratch.0.join("sessions.json");
+    let held = || {
+        let stream = app.streams.get(EVENT).expect("held stage mapped");
+        let session = stream.session();
+        (
+            session.owner(),
+            session.outage_deadline(),
+            session.recorder.is_some(),
+        )
+    };
+    let on_disk = || {
+        (
+            fs::read(&store).expect("store"),
+            fs::metadata(&store)
+                .and_then(|m| m.modified())
+                .expect("mtime"),
+        )
+    };
+    let before = held();
+    assert!(
+        !before.0.1 && before.1.is_some() && before.2,
+        "held, with its recording"
+    );
+    let epoch = manager.status(SID).await.expect("receipt").connection_epoch;
+    let disk = on_disk();
+    let connected = captured.text().matches("publisher connected").count();
+
+    // (a) the wrong passphrase, (b) no key material, (c) the session's
+    // passphrase at another key length.
+    for (crypto, codes) in [
+        (
+            Some(key("not the session secret!!", Aes256)),
+            vec![RejectCode::BADSECRET.0],
+        ),
+        (None, vec![RejectCode::UNSECURE.0]),
+        (
+            Some(key(TRANSPORT_SECRET, Aes128)),
+            vec![RejectCode::BADSECRET.0],
+        ),
+    ] {
+        let none = crypto.is_none();
+        let attacker = Encoder::call_as(addr, &stream_id, crypto).await;
+        assert!(!attacker.connected);
+        assert!(
+            attacker
+                .rejected()
+                .is_some_and(|code| codes.contains(&code))
+                || (none
+                    && attacker.closed == Some(sapflow_srt::CallerCloseReason::UnsupportedPeer)),
+            "{:?}",
+            attacker.closed
+        );
+        assert_eq!(held(), before);
+        assert_eq!(
+            manager.status(SID).await.expect("receipt").connection_epoch,
+            epoch
+        );
+        assert!(on_disk() == disk, "the session store was written");
+    }
+    let after = events(&mut callbacks);
+    assert!(after.is_empty(), "{after:?}");
+    let logs = captured.text();
+    assert_eq!(
+        logs.matches("publisher connected").count(),
+        connected,
+        "{logs}"
+    );
+    assert!(!logs.contains("resumed=true"), "{logs}");
+    assert!(logs.contains("reason=BadSecret"), "{logs}");
+
+    // The right key resumes the held stage, as before.
+    let mut back = Encoder::call_as(addr, &stream_id, right()).await;
+    assert!(back.connected, "{:?}", back.closed);
+    let resumed = held();
+    assert_eq!(resumed.0, (before.0.0 + 1, true));
+    assert_eq!(
+        manager.status(SID).await.expect("receipt").connection_epoch,
+        epoch + 1
+    );
+    assert!(captured.text().contains("resumed=true"));
+    // A live scoped stage is never taken over: the right key is refused as
+    // already live (409), a wrong one for its key.
+    for (crypto, code) in [
+        (right(), RejectCode::http(409).0),
+        (
+            Some(key("not the session secret!!", Aes256)),
+            RejectCode::BADSECRET.0,
+        ),
+    ] {
+        let other = Encoder::call_as(addr, &stream_id, crypto).await;
+        assert_eq!(other.rejected(), Some(code), "{:?}", other.closed);
+        assert_eq!(held().0, resumed.0);
+        back.pump(Duration::from_millis(20)).await;
+    }
+    assert!(back.connected && back.closed.is_none(), "{:?}", back.closed);
+    assert_eq!(
+        manager.status(SID).await.expect("receipt").connection_epoch,
+        epoch + 1
+    );
+    back.stop().await;
+    server.abort();
+    let _ = server.await;
+}

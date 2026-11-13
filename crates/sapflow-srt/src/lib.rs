@@ -57,5 +57,7 @@ pub mod seq;
 pub use caller::{Caller, CallerCloseReason, CallerConfig, CallerEvent, CallerStats};
 pub use sender::{SendConfig, SendError, SendStats};
 
-pub use listener::{Config, ConnId, Event, KeyCheckError, Listener, ListenerStats, RejectCode};
+pub use listener::{
+    Config, ConnId, Event, KeyCheckError, Listener, ListenerStats, RejectCode, check_key_material,
+};
 pub use receiver::{CloseReason, Stats};
