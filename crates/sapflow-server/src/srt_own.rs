@@ -249,6 +249,20 @@ async fn run(
                     peer,
                     stream_id,
                 } => {
+                    // Before the throttle, the app or any limit: the first
+                    // caller to send key material owns it, so a copy is
+                    // refused here however the original's attempt ends.
+                    // Not charged to the throttle: nothing costly was done,
+                    // and a replayer behind the encoder's address could
+                    // otherwise lock the encoder out.
+                    if app.config.srt_app_keys
+                        && let Some(seen) = seen(listener, id, peer)
+                        && replay.connect(seen, |c| listener.caller_socket(c))
+                    {
+                        listener.reject(id, RejectCode::BADSECRET);
+                        app.log_refusal("srt", &"key material belongs to another caller");
+                        continue;
+                    }
                     let active = publishers.len() + admissions.len();
                     if active >= app.config.max_publishers {
                         listener.reject(id, RejectCode::http(402));
@@ -468,26 +482,16 @@ fn accept_pending(
             return None;
         }
     };
-    // Only a caller that sent key material has any to replay. One whose key
-    // passed but cannot be told apart is refused, never admitted unguarded
-    // (unreachable: the check has already parsed its key material).
-    let seen = listener
-        .pending_key_material(id)
-        .and_then(sapflow_srt::crypto::bound_key_material)
-        .zip(listener.caller_socket(id))
-        .map(|(bound, socket)| Seen::new(bound, peer, socket, id));
+    // The caller owns its key material since it connected (checked then).
+    // Once more before the claim, in case a connection with it was admitted
+    // meanwhile. A caller whose key passed but cannot be told apart is
+    // refused, never admitted unguarded (unreachable: the check has already
+    // parsed its key material).
+    let seen = seen(listener, id, peer);
     let keyed = !matches!(encryption, Encryption::None);
-    if (keyed && seen.is_none())
-        || seen
-            .as_ref()
-            .is_some_and(|seen| replay.is_replay(seen, |c| listener.caller_socket(c)))
-    {
+    if (keyed && seen.is_none()) || seen.as_ref().is_some_and(|seen| replay.admitted(seen)) {
         // As a wrong passphrase: the replayer learns nothing new.
         listener.reject(id, RejectCode::BADSECRET);
-        app.auth_throttle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .failed(peer.ip(), Instant::now());
         app.log_refusal("srt", &"key material already admitted another connection");
         return None;
     }
@@ -511,9 +515,19 @@ fn accept_pending(
         return None;
     }
     if let Some(seen) = seen {
-        replay.record(&req.path.as_path(), seen);
+        replay.record(&req.path.as_path(), seen, |c| listener.caller_socket(c));
     }
     Some((publication, encryption))
+}
+
+/// A waiting caller's key material as the replay guard compares it; `None`
+/// when it sent none (or is no longer waiting).
+fn seen(listener: &Listener, id: ConnId, peer: SocketAddr) -> Option<Seen> {
+    listener
+        .pending_key_material(id)
+        .and_then(sapflow_srt::crypto::bound_key_material)
+        .zip(listener.caller_socket(id))
+        .map(|(bound, socket)| Seen::new(bound, peer, socket, id))
 }
 
 /// Whether [`Listener::accept`] will admit a caller the app admitted without

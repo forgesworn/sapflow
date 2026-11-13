@@ -80,6 +80,15 @@ impl Encoder {
     /// [`call`](Self::call), losing the first `drops` conclusion responses:
     /// the caller resends its conclusion.
     async fn call_dropping(origin: SocketAddr, crypto: Option<CryptoConfig>, drops: u32) -> Self {
+        let mut encoder = Self::start(origin, crypto, drops).await;
+        encoder
+            .run_until(|e| e.connected || e.closed.is_some())
+            .await;
+        encoder
+    }
+
+    /// An encoder for `origin` that has sent nothing yet.
+    async fn start(origin: SocketAddr, crypto: Option<CryptoConfig>, drops: u32) -> Self {
         let socket = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
         let caller = Caller::new(
             CallerConfig {
@@ -91,19 +100,22 @@ impl Encoder {
             Instant::now(),
         )
         .expect("caller");
-        let mut encoder = Self {
+        Self {
             caller,
             socket,
             connected: false,
             closed: None,
             conclusion: None,
             drop_responses: drops,
-        };
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while !encoder.connected && encoder.closed.is_none() && Instant::now() < deadline {
-            encoder.pump(Duration::from_millis(20)).await;
         }
-        encoder
+    }
+
+    /// Runs the caller's I/O until `done`, for 8 s at most.
+    async fn run_until(&mut self, done: impl Fn(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !done(self) && Instant::now() < deadline {
+            self.pump(Duration::from_millis(20)).await;
+        }
     }
 
     /// Runs the caller's I/O for `period`.
@@ -754,7 +766,11 @@ async fn a_replayed_conclusion_never_takes_a_live_stage() {
                 Answered::Rejected(RejectCode::BADSECRET.0),
                 "{mode}: {what}"
             );
-            assert_eq!(stub.count(), asked + 1, "{mode}: the app was asked first");
+            assert_eq!(
+                stub.count(),
+                asked,
+                "{mode}: refused before the app is asked"
+            );
             live.pump(Duration::from_millis(50)).await;
         }
 
@@ -766,7 +782,7 @@ async fn a_replayed_conclusion_never_takes_a_live_stage() {
         }
         let logs = captured.text();
         assert!(
-            logs.contains("already admitted another connection"),
+            logs.contains("key material belongs to another caller"),
             "{logs}"
         );
         assert!(!logs.contains("publisher replaced"), "{logs}");
@@ -882,8 +898,22 @@ async fn a_lost_response_resend_is_answered_not_refused() {
     let _ = server.await;
 }
 
+/// Whether `ip` has no failed attempts on the fixture's throttle (ten a
+/// minute): with none, nine more still leave it allowed. Uses up nine, so
+/// call it last.
+fn uncharged(app: &Arc<App>, ip: &str) -> bool {
+    let ip = ip.parse().expect("ip");
+    let mut throttle = app.auth_throttle.lock().expect("throttle");
+    for _ in 0..9 {
+        throttle.failed(ip, Instant::now());
+    }
+    throttle.allowed(ip, Instant::now())
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn replays_from_one_address_are_throttled() {
+async fn replays_are_refused_without_asking_the_app_or_charging_the_throttle() {
+    // A replayer behind the encoder's own address (one NAT at a venue) must
+    // not be able to lock the encoder out by replaying.
     let stub = stub::start(Answer::Passphrase(&[KEY])).await;
     let mut fixture = fixture(&stub, Duration::ZERO);
     let (addr, server) = origin(&fixture.app);
@@ -891,7 +921,7 @@ async fn replays_from_one_address_are_throttled() {
     assert!(live.connected, "{:?}", live.closed);
     let conclusion = live.conclusion.clone().expect("captured");
     let replayer = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
-    for attempt in 0..10u32 {
+    for attempt in 0..20u32 {
         let answered = replay(&replayer, addr, &conclusion, Some(0x100 + attempt), true).await;
         assert_eq!(
             answered,
@@ -900,12 +930,143 @@ async fn replays_from_one_address_are_throttled() {
         );
         live.pump(Duration::from_millis(10)).await;
     }
-    assert_eq!(stub.count(), 11);
-    let answered = replay(&replayer, addr, &conclusion, Some(0x200), true).await;
-    assert_eq!(answered, Answered::Rejected(RejectCode::http(402).0));
-    assert_eq!(stub.count(), 11, "throttled before the app is asked");
+    assert_eq!(stub.count(), 1, "only the live encoder's admission");
+    assert!(uncharged(&fixture.app, "127.0.0.1"));
     let _ = events(&mut fixture);
     live.stop().await;
     server.abort();
     let _ = server.await;
+}
+
+/// The captured conclusion with its key material edited where the key
+/// check does not look: the first half of the salt, and the key flags
+/// (even key to odd).
+fn edited(conclusion: &[u8]) -> Vec<u8> {
+    let Ok(Packet::Control(ControlPacket {
+        timestamp,
+        dest,
+        body: Control::Handshake(mut h),
+    })) = Packet::parse(conclusion)
+    else {
+        panic!("a conclusion");
+    };
+    for e in &mut h.extensions {
+        if let Extension::KmReq(km) = e {
+            km[16] ^= 0x01;
+            km[23] ^= 0x80;
+            assert!(matches!(km[3], 1 | 2), "one key");
+            km[3] = 3 - km[3];
+        }
+    }
+    let mut out = Vec::new();
+    ControlPacket::new(timestamp, dest, Control::Handshake(h)).encode(&mut out);
+    out
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_edited_copy_of_the_key_material_is_still_a_replay() {
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = fixture(&stub, Duration::ZERO);
+    let (addr, server) = origin(&fixture.app);
+    let mut live = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert!(live.connected, "{:?}", live.closed);
+    live.send_media().await;
+    wait_for(&mut fixture, &mut live, "publish").await;
+    let before = stage(&fixture.app);
+    let copy = edited(&live.conclusion.clone().expect("captured"));
+    let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    let answered = replay(&elsewhere, addr, &copy, Some(0x4242), true).await;
+    assert_eq!(answered, Answered::Rejected(RejectCode::BADSECRET.0));
+    assert_eq!(stub.count(), 1, "refused before the app is asked");
+    assert_eq!(stage(&fixture.app), before);
+    live.pump(Duration::from_millis(50)).await;
+    assert!(live.connected && live.closed.is_none());
+    live.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_while_the_original_waits_for_the_app_is_refused_and_the_original_admitted() {
+    // The app takes its time, so the original's admission is still in
+    // flight while copies of its conclusion arrive from elsewhere.
+    let stub = stub::start(Answer::SlowPassphrase(600, &[KEY])).await;
+    let mut fixture = fixture(&stub, Duration::ZERO);
+    let (addr, server) = origin(&fixture.app);
+    let mut original = Encoder::start(addr, Some(key(KEY, KeySize::Aes256)), 0).await;
+    original.run_until(|e| e.conclusion.is_some()).await;
+    let conclusion = original.conclusion.clone().expect("captured");
+    let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    for socket in [None, Some(0x0bad_cafe), Some(0x0bad_cafd)] {
+        let answered = replay(&elsewhere, addr, &conclusion, socket, true).await;
+        assert_eq!(
+            answered,
+            Answered::Rejected(RejectCode::BADSECRET.0),
+            "{socket:?}"
+        );
+    }
+    assert!(!original.connected, "still waiting for the app");
+    original
+        .run_until(|e| e.connected || e.closed.is_some())
+        .await;
+    assert!(original.connected, "{:?}", original.closed);
+    assert_eq!(stub.count(), 1, "only the original asked the app");
+    original.send_media().await;
+    wait_for(&mut fixture, &mut original, "publish").await;
+    assert!(uncharged(&fixture.app, "127.0.0.1"));
+    original.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn key_material_from_a_refused_attempt_stays_its_owners() {
+    // The encoder's attempt is refused before its key is checked: throttled
+    // (someone behind its address used up the allowance) or by the app
+    // (the stage is not armed yet). Its key material was never admitted,
+    // but a copy of it from elsewhere is still refused, before the app.
+    for answer in [Answer::Passphrase(&[KEY]), Answer::Status(401)] {
+        let stub = stub::start(answer).await;
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        let throttled = matches!(answer, Answer::Passphrase(_));
+        if throttled {
+            let mut throttle = fixture.app.auth_throttle.lock().expect("throttle");
+            for _ in 0..10 {
+                throttle.failed("127.0.0.1".parse().expect("ip"), Instant::now());
+            }
+        }
+        let (addr, server) = origin(&fixture.app);
+        let refused = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+        let code = if throttled { 402 } else { 401 };
+        assert_eq!(refused.rejected(), Some(RejectCode::http(code).0));
+        let asked = stub.count();
+        assert_eq!(asked, usize::from(!throttled));
+        let conclusion = refused.conclusion.clone().expect("captured");
+        // The window passes, or the stage is armed: the throttle is clear.
+        *fixture.app.auth_throttle.lock().expect("throttle") =
+            sapflow_core::limits::AuthThrottle::new(10, Duration::from_secs(60));
+        let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+        let answered = replay(&elsewhere, addr, &conclusion, None, true).await;
+        assert_eq!(
+            answered,
+            Answered::Rejected(RejectCode::BADSECRET.0),
+            "{code}"
+        );
+        assert_eq!(
+            stub.count(),
+            asked,
+            "{code}: refused before the app is asked"
+        );
+        assert!(fixture.app.streams.get("event-a").is_none(), "{code}");
+        if throttled {
+            // The encoder's next attempt, with fresh key material, publishes.
+            let mut back = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+            assert!(back.connected, "{:?}", back.closed);
+            back.send_media().await;
+            wait_for(&mut fixture, &mut back, "publish").await;
+            back.stop().await;
+        }
+        server.abort();
+        let _ = server.await;
+    }
 }
