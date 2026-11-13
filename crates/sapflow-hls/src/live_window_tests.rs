@@ -478,3 +478,33 @@ fn the_projection_estimates_the_full_window_from_its_first_segments() {
         );
     }
 }
+
+/// OBS over RTMP floors its millisecond timestamps, so at 30 fps its
+/// keyframe a second in is stamped 999 ms. It still ends the first segment,
+/// so the target is 2 s, as for the same stream over SRT, not 3.
+#[test]
+fn a_keyframe_a_millisecond_short_of_the_minimum_ends_the_segment() {
+    let mut m = Muxer::new(MuxerConfig::default(), crate::muxer::tests::video(), None);
+    for i in 0..30 * 6i64 {
+        // OBS's video clock: 33,333,333 ns a frame, floored to milliseconds.
+        let ms = i * 33_333_333 / 1_000_000;
+        m.push_video(
+            ms * 90,
+            ms * 90,
+            i % 30 == 0,
+            Bytes::from_static(&[1; 64]),
+            NOW,
+        )
+        .expect("video");
+    }
+    assert_eq!(m.target_duration(), 2);
+    let first = m
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            crate::muxer::Entry::Segment(s) => Some(s.duration),
+            crate::muxer::Entry::Gap { .. } => None,
+        })
+        .expect("a segment");
+    assert!(first < std::time::Duration::from_millis(1100), "{first:?}");
+}

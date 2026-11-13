@@ -110,6 +110,12 @@ Notes for the release after 0.2.0-rc.1.
   the edge steps back at such a run end; `RetentionCheck` now fails on a
   tag listed again.
 
+- A keyframe within 10 ms of `MuxerConfig::segment_min` now ends a video
+  segment. OBS over RTMP floors its millisecond timestamps, so at 30 fps
+  its keyframe a second in is stamped 999 ms; the first segment ran on to
+  the next keyframe, 1.999 s, and fixed a target duration of 3 for the
+  whole stream where SRT from the same OBS got 2. Players that hold back
+  three target durations were 3 s further behind on RTMP.
 - `MuxerConfig::window` (new, default none) bounds the window by time as
   well as by `segment_count`. Segment length follows the encoder's keyframe
   interval, so 24 segments of a publisher sending a keyframe every 8 s held
