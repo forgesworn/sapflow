@@ -40,7 +40,7 @@
 //! There is no time limit. Owners leave by their bound or a restart;
 //! admitted entries by their bounds, or if the operator discards the store.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -110,8 +110,9 @@ impl std::fmt::Debug for Seen {
 }
 
 struct Entry {
-    path: Box<str>,
     digest: [u8; 32],
+    /// Order of admission, across paths.
+    seq: u64,
     /// The connection and its caller socket id; `None` for an entry read
     /// from the store, whose connection ended before the restart.
     conn: Option<(ConnId, u32)>,
@@ -131,11 +132,16 @@ pub struct ReplayGuard {
     owners: HashMap<[u8; 32], Seen>,
     /// The owners' digests, oldest first.
     owned_order: VecDeque<[u8; 32]>,
-    /// Oldest first.
-    admitted: VecDeque<Entry>,
-    /// The admitted digests, for lookups.
-    admitted_index: HashSet<[u8; 32]>,
+    /// Per stage path, oldest first.
+    admitted: HashMap<Box<str>, VecDeque<Entry>>,
+    /// The admitted digests and their paths, for lookups.
+    admitted_index: HashMap<[u8; 32], Box<str>>,
+    admitted_len: usize,
+    next_seq: u64,
     store: Option<Arc<Mutex<ReplayStore>>>,
+    /// Counts changes to the admitted tier, so a queued write that a later
+    /// one already covered is skipped.
+    generation: u64,
 }
 
 impl ReplayGuard {
@@ -192,7 +198,7 @@ impl ReplayGuard {
     /// Whether `seen` repeats key material that already admitted a
     /// connection, from anyone.
     pub fn admitted(&self, seen: &Seen) -> bool {
-        self.admitted_index.contains(&seen.digest)
+        self.admitted_index.contains_key(&seen.digest)
     }
 
     /// Remembers, in memory, the key material of a caller about to be
@@ -212,6 +218,13 @@ impl ReplayGuard {
             Some((seen.conn, seen.caller_socket)),
             &caller_socket,
         );
+        self.generation += 1;
+    }
+
+    /// The admitted tier's change count: pass it to [`persist`] for the
+    /// caller just remembered.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The store the admitted tier is kept in, if any.
@@ -236,7 +249,13 @@ impl ReplayGuard {
     }
 
     fn encoded(&self) -> Result<Vec<u8>, ReplayStoreError> {
-        encode(self.admitted.iter().map(|e| (&*e.path, &e.digest)))
+        let mut all: Vec<(u64, &str, &[u8; 32])> = self
+            .admitted
+            .iter()
+            .flat_map(|(path, q)| q.iter().map(move |e| (e.seq, &**path, &e.digest)))
+            .collect();
+        all.sort_unstable_by_key(|(seq, _, _)| *seq);
+        encode(all.into_iter().map(|(_, path, digest)| (path, digest)))
     }
 
     fn insert(
@@ -246,53 +265,110 @@ impl ReplayGuard {
         conn: Option<(ConnId, u32)>,
         caller_socket: &impl Fn(ConnId) -> Option<u32>,
     ) {
-        if self.admitted_index.contains(&digest) {
-            self.admitted.retain(|e| e.digest != digest);
-        }
-        if self.admitted.iter().filter(|e| &*e.path == path).count() >= PER_PATH
-            && let Some(oldest) = self
+        if let Some(old) = self.admitted_index.get(&digest).cloned()
+            && let Some(at) = self
                 .admitted
-                .iter()
-                .position(|e| &*e.path == path && e.ended(caller_socket))
+                .get(&old)
+                .and_then(|q| q.iter().position(|e| e.digest == digest))
         {
-            self.evict(oldest);
+            self.evict(&old, at);
         }
-        if self.admitted.len() >= TOTAL
-            && let Some(oldest) = self.admitted.iter().position(|e| e.ended(caller_socket))
+        if self.admitted.get(path).map_or(0, VecDeque::len) >= PER_PATH
+            && let Some(at) = self.oldest_ended(path, caller_socket)
         {
-            self.evict(oldest);
+            self.evict(path, at);
         }
-        self.admitted_index.insert(digest);
-        self.admitted.push_back(Entry {
-            path: path.into(),
-            digest,
-            conn,
-        });
+        if self.admitted_len >= TOTAL
+            && let Some((crowded, at)) = self.crowded_oldest_ended(caller_socket)
+        {
+            self.evict(&crowded, at);
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.admitted_index.insert(digest, path.into());
+        self.admitted
+            .entry(path.into())
+            .or_default()
+            .push_back(Entry { digest, seq, conn });
+        self.admitted_len += 1;
     }
 
-    fn evict(&mut self, at: usize) {
-        if let Some(entry) = self.admitted.remove(at) {
+    /// The position of `path`'s oldest ended entry.
+    fn oldest_ended(
+        &self,
+        path: &str,
+        caller_socket: &impl Fn(ConnId) -> Option<u32>,
+    ) -> Option<usize> {
+        self.admitted
+            .get(path)?
+            .iter()
+            .position(|e| e.ended(caller_socket))
+    }
+
+    /// Past [`TOTAL`]: the oldest ended entry of the path holding the most
+    /// entries (ties: the path whose candidate is oldest), so a tenant
+    /// churning admissions on many streams of its own evicts only its own
+    /// entries, never another stage's. A path whose entries are all live is
+    /// passed over.
+    fn crowded_oldest_ended(
+        &self,
+        caller_socket: &impl Fn(ConnId) -> Option<u32>,
+    ) -> Option<(Box<str>, usize)> {
+        let mut best: Option<(usize, u64, &Box<str>, usize)> = None;
+        for (path, q) in &self.admitted {
+            let Some(at) = q.iter().position(|e| e.ended(caller_socket)) else {
+                continue;
+            };
+            let seq = q.get(at).map_or(u64::MAX, |e| e.seq);
+            if best.is_none_or(|(len, oldest, _, _)| {
+                (q.len(), std::cmp::Reverse(seq)) > (len, std::cmp::Reverse(oldest))
+            }) {
+                best = Some((q.len(), seq, path, at));
+            }
+        }
+        best.map(|(_, _, path, at)| (path.clone(), at))
+    }
+
+    fn evict(&mut self, path: &str, at: usize) {
+        let Some(q) = self.admitted.get_mut(path) else {
+            return;
+        };
+        if let Some(entry) = q.remove(at) {
             self.admitted_index.remove(&entry.digest);
+            self.admitted_len -= 1;
+        }
+        if q.is_empty() {
+            self.admitted.remove(path);
         }
     }
 
     #[cfg(test)]
     fn sizes(&self) -> (usize, usize) {
-        (self.owners.len(), self.admitted.len())
+        (self.owners.len(), self.admitted_len)
     }
 }
 
-/// Writes the admitted tier as it is now to `store`: blocking file work, for
-/// a blocking task. Writes are one at a time, and each takes the tier when
-/// it starts, so once one that started after a [`ReplayGuard::remember`]
-/// succeeds, that entry is on disk. Holds the guard only to encode it.
+/// Makes sure the admitted tier as of `generation` ([`ReplayGuard::generation`]
+/// after a [`ReplayGuard::remember`]) is in `store`: blocking file work, for
+/// a blocking task. Writes are one at a time and each takes the tier as it
+/// is when it starts, so a write already covered by a later successful one
+/// is skipped. Holds the guard only to encode it.
 pub fn persist(
     guard: &Mutex<ReplayGuard>,
     store: &Mutex<ReplayStore>,
+    generation: u64,
 ) -> Result<(), ReplayStoreError> {
     let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-    let bytes = guard.lock().unwrap_or_else(|e| e.into_inner()).encoded()?;
-    store.write(&bytes)
+    if store.written() >= generation {
+        return Ok(());
+    }
+    let (bytes, now) = {
+        let guard = guard.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.encoded()?, guard.generation)
+    };
+    store.write(&bytes)?;
+    store.set_written(now);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -417,7 +493,7 @@ mod tests {
             assert!(guard.sizes().1 <= TOTAL);
         }
         assert_eq!(guard.sizes().1, TOTAL);
-        let per_path = |p: &str| guard.admitted.iter().filter(|e| &*e.path == p).count();
+        let per_path = |p: &str| guard.admitted.get(p).map_or(0, VecDeque::len);
         assert!((0..97).all(|p| per_path(&format!("live/event-{p}")) <= PER_PATH));
         // Oldest first: the last TOTAL admissions are the ones remembered.
         let kept = flood - u32::try_from(TOTAL).expect("small");
@@ -521,6 +597,59 @@ mod tests {
                 .is_err()
         );
         assert!(guard.admitted(&seen(1, 6000, 9, 1)));
+    }
+
+    #[test]
+    fn a_tenant_churning_many_streams_never_evicts_another_stage() {
+        let mut guard = ReplayGuard::default();
+        for i in 0..3 {
+            guard
+                .record("live/event-victim", seen(i, 5000, i, i), GONE)
+                .expect("recorded");
+        }
+        // 40 streams of its own, each admitted again and again: far more
+        // than the global bound, every connection ended at once.
+        let churn = u32::try_from(TOTAL * 4).expect("small");
+        for i in 0..churn {
+            let path = format!("live/event-tenant-{}", i % 40);
+            guard
+                .record(&path, seen(1000 + i, 6000, i, i), GONE)
+                .expect("recorded");
+            assert!(guard.sizes().1 <= TOTAL);
+        }
+        for i in 0..3 {
+            assert!(guard.admitted(&seen(i, 7000, 0, 0)), "victim entry {i}");
+        }
+        // The tenant's own oldest went first.
+        assert!(!guard.admitted(&seen(1000, 7000, 0, 0)));
+    }
+
+    #[test]
+    fn a_write_covered_by_a_later_one_is_skipped() {
+        use crate::srt_replay_store::tests::Scratch;
+        let scratch = Scratch::new();
+        let (store, records) = ReplayStore::open(&scratch.path()).expect("first start");
+        let guard = Mutex::new(ReplayGuard::with_store(store, records));
+        let store = guard.lock().expect("guard").store().expect("store");
+        let mut targets = Vec::new();
+        for i in 0..3 {
+            let mut g = guard.lock().expect("guard");
+            g.remember("live/event-a", seen(i, 5000, i, i), GONE);
+            targets.push(g.generation());
+        }
+        // The last write covers all three; the other two then cost nothing,
+        // so a store that would now fail is never touched.
+        persist(&guard, &store, targets[2]).expect("written");
+        store.lock().expect("store").fail_before_rename = true;
+        persist(&guard, &store, targets[0]).expect("covered");
+        persist(&guard, &store, targets[1]).expect("covered");
+        // Anything newer is written, and fails here.
+        guard
+            .lock()
+            .expect("guard")
+            .remember("live/event-a", seen(9, 5000, 9, 9), GONE);
+        let newer = guard.lock().expect("guard").generation();
+        assert!(persist(&guard, &store, newer).is_err());
     }
 
     #[test]

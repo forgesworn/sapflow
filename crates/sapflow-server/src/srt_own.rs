@@ -388,16 +388,22 @@ fn complete_admission(
                 else {
                     return;
                 };
-                (caller, replay.store())
+                (
+                    caller,
+                    replay.store().map(|store| (store, replay.generation())),
+                )
             };
-            if let Some(store) = store {
+            if let Some((store, generation)) = store {
                 // Its key material is already refused to everyone else; the
                 // file work runs off this loop, and the path is claimed only
                 // once it is written (complete_persisted).
                 waiting.checked.insert(id, (peer, caller));
                 let app = app.clone();
                 waiting.writes.spawn_blocking(move || {
-                    (id, crate::srt_replay::persist(&app.srt_replay, &store))
+                    (
+                        id,
+                        crate::srt_replay::persist(&app.srt_replay, &store, generation),
+                    )
                 });
                 return;
             }

@@ -13,8 +13,11 @@
 //! leaves the old file as it was.
 //!
 //! A malformed or unreadable file refuses to start, and so does a missing
-//! file once the lock exists (it was there and has gone): never an empty
-//! start the operator did not choose. SHA-256 over the contents catches
+//! file once the lock says a store was written (it was there and has gone):
+//! never an empty start the operator did not choose. The lock is marked only
+//! once the first store has landed, so a start interrupted before that
+//! starts again cleanly. A store from a newer sapflow is refused with its
+//! own message. Temporary files a crash left behind are removed at start. SHA-256 over the contents catches
 //! accidental damage, not a rollback by the owning user.
 
 use std::ffi::OsString;
@@ -48,6 +51,8 @@ pub enum ReplayStoreError {
     /// The lock is there but the file is not: it was removed.
     Missing,
     Corrupt,
+    /// Written by a newer sapflow, in a format this one does not read.
+    Newer,
     TooLarge,
     Io {
         operation: &'static str,
@@ -76,6 +81,9 @@ impl fmt::Display for ReplayStoreError {
                 "the SRT replay store is missing but its .lock is there, so it was removed; {RECOVER}"
             ),
             Self::Corrupt => write!(f, "the SRT replay store is malformed; {RECOVER}"),
+            Self::Newer => f.write_str(
+                "the SRT replay store was written by a newer sapflow; upgrade sapflow, and do not move the store aside",
+            ),
             Self::TooLarge => write!(f, "the SRT replay store is too large; {RECOVER}"),
             Self::Io { operation, source } => {
                 write!(f, "SRT replay store {operation}: {source}")
@@ -146,6 +154,12 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Record>, ReplayStoreError> {
         return Err(ReplayStoreError::TooLarge);
     }
     let corrupt = || ReplayStoreError::Corrupt;
+    // A newer format may lay out the rest differently: told apart first.
+    if let Some(&version) = bytes.strip_prefix(MAGIC).and_then(<[u8]>::first)
+        && version > VERSION
+    {
+        return Err(ReplayStoreError::Newer);
+    }
     let body_len = bytes.len().checked_sub(32).ok_or_else(corrupt)?;
     let (body, checksum) = bytes.split_at(body_len);
     if Sha256::digest(body).as_slice() != checksum {
@@ -188,11 +202,16 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Record>, ReplayStoreError> {
 pub struct ReplayStore {
     directory: File,
     name: OsString,
-    _lock: File,
+    lock: File,
     created: bool,
+    /// The guard's generation the file holds ([`crate::srt_replay::persist`]).
+    written: u64,
     #[cfg(test)]
     pub(crate) fail_before_rename: bool,
 }
+
+/// What the lock holds once a store has been written beside it.
+const LOCK_MARK: &[u8] = b"written\n";
 
 impl ReplayStore {
     /// Opens the store at `path` and reads its records, oldest first. The
@@ -203,7 +222,7 @@ impl ReplayStore {
         let mut lock_name = name.clone();
         lock_name.push(".lock");
         let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        let (lock, new_lock) = match fs::openat(
+        let (lock, _) = match fs::openat(
             &directory,
             &lock_name,
             flags | OFlags::CREATE | OFlags::EXCL,
@@ -230,20 +249,81 @@ impl ReplayStore {
         let mut store = Self {
             directory,
             name,
-            _lock: lock,
+            lock,
             created: false,
+            written: 0,
             #[cfg(test)]
             fail_before_rename: false,
         };
-        match store.read()? {
-            Some(records) => Ok((store, records)),
-            None if new_lock => {
+        store.remove_stale_temporaries()?;
+        let records = match store.read()? {
+            Some(records) => records,
+            // A store was written here and has gone.
+            None if store.marked()? => return Err(ReplayStoreError::Missing),
+            // A first start, or one that stopped before its first store
+            // landed: nothing was ever admitted under this lock.
+            None => {
                 store.write(&encode(std::iter::empty())?)?;
                 store.created = true;
-                Ok((store, Vec::new()))
+                Vec::new()
             }
-            None => Err(ReplayStoreError::Missing),
+        };
+        store.mark()?;
+        Ok((store, records))
+    }
+
+    /// Whether the lock says a store was written beside it.
+    fn marked(&self) -> Result<bool, ReplayStoreError> {
+        let len = self
+            .lock
+            .metadata()
+            .map_err(|e| io_error("lock metadata", e))?
+            .len();
+        Ok(len != 0)
+    }
+
+    /// Marks the lock once a store is on disk beside it.
+    fn mark(&mut self) -> Result<(), ReplayStoreError> {
+        if self.marked()? {
+            return Ok(());
         }
+        self.lock
+            .write_all(LOCK_MARK)
+            .map_err(|e| io_error("mark lock", e))?;
+        self.lock.sync_all().map_err(|e| io_error("sync lock", e))
+    }
+
+    /// Removes temporary files of this store's own pattern (a crash between
+    /// creating one and renaming it leaves it behind), through the
+    /// directory handle, while holding the lock.
+    fn remove_stale_temporaries(&self) -> Result<(), ReplayStoreError> {
+        let mut prefix = OsString::from(".");
+        prefix.push(&self.name);
+        prefix.push(".tmp-");
+        let prefix = prefix.as_encoded_bytes().to_vec();
+        let mut dir = fs::Dir::read_from(&self.directory).map_err(|e| io_error("list", e))?;
+        while let Some(entry) = dir.read() {
+            let entry = entry.map_err(|e| io_error("list", e))?;
+            let name = entry.file_name().to_bytes();
+            let ours = name.strip_prefix(prefix.as_slice()).is_some_and(|nonce| {
+                nonce.len() == 16 && nonce.iter().all(|b| b.is_ascii_hexdigit())
+            });
+            if ours && entry.file_type() == fs::FileType::RegularFile {
+                fs::unlinkat(&self.directory, entry.file_name(), AtFlags::empty())
+                    .map_err(|e| io_error("remove stale temporary", e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The guard's generation this file holds.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Records that the file now holds the guard's `generation`.
+    pub fn set_written(&mut self, generation: u64) {
+        self.written = generation;
     }
 
     /// Whether [`open`](Self::open) found neither file nor lock and wrote an
@@ -458,6 +538,73 @@ pub(crate) mod tests {
             ReplayStore::open(&shared.path()),
             Err(ReplayStoreError::InsecureFile)
         ));
+    }
+
+    #[test]
+    fn a_start_stopped_before_its_first_store_landed_starts_again() {
+        let scratch = Scratch::new();
+        // As a crash leaves it: the lock created, nothing written.
+        let mut lock = scratch.path().into_os_string();
+        lock.push(".lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock)
+            .expect("lock");
+        let (store, loaded) = ReplayStore::open(&scratch.path()).expect("starts");
+        assert!(loaded.is_empty() && store.created());
+        drop(store);
+        // Now the lock is marked: losing the file is refused.
+        std::fs::remove_file(scratch.path()).expect("remove");
+        assert!(matches!(
+            ReplayStore::open(&scratch.path()),
+            Err(ReplayStoreError::Missing)
+        ));
+    }
+
+    #[test]
+    fn a_store_from_a_newer_sapflow_has_its_own_message() {
+        let mut newer = MAGIC.to_vec();
+        newer.push(VERSION + 1);
+        newer.extend_from_slice(b"whatever a later format holds");
+        let error = decode(&newer).expect_err("refused");
+        assert!(matches!(error, ReplayStoreError::Newer));
+        let text = error.to_string();
+        assert!(
+            text.contains("newer sapflow") && text.contains("do not move"),
+            "{text}"
+        );
+        assert!(!text.contains("malformed"));
+    }
+
+    #[test]
+    fn stale_temporaries_of_its_own_pattern_are_removed_at_start() {
+        let scratch = Scratch::new();
+        drop(ReplayStore::open(&scratch.path()).expect("first start"));
+        let file = |name: &str| scratch.0.join(name);
+        for name in [
+            ".srt-replay.tmp-0011223344556677",
+            ".srt-replay.tmp-zz",
+            ".srt-replay.tmp-00112233445566778899",
+            ".other.tmp-0011223344556677",
+            "srt-replay.tmp-0011223344556677",
+        ] {
+            std::fs::write(file(name), b"x").expect("fixture");
+        }
+        drop(ReplayStore::open(&scratch.path()).expect("restart"));
+        assert!(
+            !file(".srt-replay.tmp-0011223344556677").exists(),
+            "ours removed"
+        );
+        for kept in [
+            ".srt-replay.tmp-zz",
+            ".srt-replay.tmp-00112233445566778899",
+            ".other.tmp-0011223344556677",
+            "srt-replay.tmp-0011223344556677",
+        ] {
+            assert!(file(kept).exists(), "{kept} kept");
+        }
     }
 
     #[test]
