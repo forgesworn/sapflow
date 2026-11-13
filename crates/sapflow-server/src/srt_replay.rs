@@ -4,12 +4,12 @@
 //! `KMREQ`: salt and wrapped keys, sent in clear) was wrapped under the
 //! passphrase, not who sent it. Anyone who captured an encoder's conclusion
 //! handshake can replay it from another address and pass the check, and an
-//! SRT claim takes over a live path. A copy refused at first sight was never
-//! used for media, so its sender cannot decrypt or forge any, but it would
-//! knock the real encoder off; a copy of an admitted connection's handshake
-//! also restores that connection's keys, so its recorded media would decrypt
-//! onto the stage again (and AES-CTR, unauthenticated, lets predictable bytes
-//! be flipped). Real encoders make fresh key material for every connection
+//! SRT claim takes over a live path. A copy of an attempt that never carried
+//! media gives its sender nothing to decrypt or send, but it would knock the
+//! real encoder off; a copy of an admitted connection's handshake also
+//! restores that connection's keys, so whoever recorded the connection could
+//! send its media again and it would decrypt onto the stage (and AES-CTR,
+//! unauthenticated, lets predictable bytes be flipped). Real encoders make fresh key material for every connection
 //! (our `Caller`, libsrt and OBS, checked), so key material seen before from
 //! another caller is a replay.
 //!

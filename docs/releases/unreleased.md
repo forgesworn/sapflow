@@ -294,20 +294,40 @@ Notes for the release after 0.2.0-rc.1.
   refused at once with `BADSECRET`, without asking the app or counting
   against the throttle, however the owner's attempt ends, and once a
   caller is admitted its key material is refused to everyone. sapflow keeps
-  a SHA-256 digest of the part of the key material the check binds, in
-  memory: 16,384 owners and 128 admitted per stream path (4,096 in all),
-  oldest ended first, never one whose connection is waiting or open, no
-  time limit. It covers the app's passphrase and the global one, and
-  spans stream paths. Real encoders make fresh key material per
-  connection (sapflow's caller, libsrt 1.5.1 and OBS 32.0.4 checked,
-  reconnects included); one that reused it would be refused, so check
-  Larix and hardware encoders before turning app keys on. Residuals: a
-  copy that reaches sapflow before the original needs an attacker on the
-  path; a restart forgets every owner; eviction needs a long flood of
-  ended connections; callers the listener refuses before the application
-  hears of them (`BACKLOG`, the handshake rate limit) own nothing. With the
-  switch off nothing changes: the path is claimed before any key is
-  checked there, so the guard could not help.
+  a SHA-256 digest of the part of the key material the check binds:
+  16,384 owners in memory, and 128 admitted per stream path (4,096 in all)
+  in memory and on disk, oldest ended first, never one whose connection is
+  waiting or open, no time limit. It covers the app's passphrase and the
+  global one, and spans stream paths. Real encoders make fresh key
+  material per connection (sapflow's caller, libsrt 1.5.1 and OBS 32.0.4
+  checked, reconnects included); one that reused it would be refused, so
+  check Larix and hardware encoders before turning app keys on.
+- `SAPFLOW_SRT_REPLAY_STORE` (new) is required with
+  `SAPFLOW_SRT_APP_KEYS=1`; sapflow refuses to start without it. Replaying
+  an admitted connection's handshake restores its keys, so its recorded
+  media would decrypt onto the stage again; the store keeps admitted key
+  material digests across restarts, and every deploy is one. It is an
+  absolute file in an existing private (0700) directory owned by sapflow's
+  user, on a persistent writable volume of its own (not the recordings
+  directory, which v4v reads; recording expiry would leave it alone, but
+  the directory must not be shared). It holds stage paths and digests of
+  bytes sent in clear, nothing secret. Each admission writes it (a synced
+  temporary file renamed over the old one, at most about 680 KB) before
+  the stage is claimed; a caller whose digest cannot be written is refused
+  with `503` and nothing is claimed. An unreadable or malformed store, or
+  one removed while its `.lock` remains, stops sapflow at start with a
+  message; moving both aside starts it empty, after which earlier captures
+  can be replayed until the app rotates those streams' passphrases.
+- Replay residuals: a copy that reaches sapflow before the original needs
+  an attacker who can delay or drop the encoder's packets, a passive
+  listener with a faster route, or one who times a copy while the shared
+  handshake allowance (100 a second) is used up, and it only displaces the
+  encoder, with no media; a restart forgets owners, so an attempt refused
+  before it can be replayed after it, again with no media; eviction needs
+  a long flood of ended connections; callers the listener refuses before
+  the application hears of them (`BACKLOG`, the handshake rate limit) own
+  nothing. With the switch off nothing changes: the path is claimed before
+  any key is checked there, so the guard could not help.
 - The "SRT publisher accepted" log line gives `encryption` (`none`,
   `deployment-key`, `app-key` or `session-key`) and `key_len`, so the
   logs show which publishers still connect without a passphrase, or with
