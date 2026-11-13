@@ -6,7 +6,8 @@ use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
 
-use sapflow_srt::{CloseReason, Config, ConnId, Event, Listener, RejectCode};
+use sapflow_srt::crypto::KeySize;
+use sapflow_srt::{CloseReason, Config, ConnId, Event, KeyCheckError, Listener, RejectCode};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -15,7 +16,8 @@ use crate::App;
 use crate::publish::{Publication, PublicationLoss};
 use crate::publish_sessions::ScopedLease;
 use crate::recorder::IncompleteReason;
-use crate::srt::{IDLE, Refused, admit, feed_payload};
+use crate::srt::{Admission, IDLE, Pending, Refused, admit, feed_payload};
+use crate::stream::SourceKind;
 
 const QUEUE: usize = 16_384;
 struct Payload {
@@ -167,6 +169,17 @@ fn service_due_timers(
 pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let want = wanted_recv_buffer(app.config.max_publishers);
     let (socket, pending, recv_buffer) = bind_udp(addr, want)?;
+    run(app, socket, pending, recv_buffer, want).await
+}
+
+async fn run(
+    app: Arc<App>,
+    socket: UdpSocket,
+    pending: StdUdpSocket,
+    recv_buffer: usize,
+    want: usize,
+) -> std::io::Result<()> {
+    let addr = socket.local_addr()?;
     if recv_buffer < want {
         tracing::warn!(
             requested = want,
@@ -174,16 +187,14 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
             "SRT receive buffer below the requested size; raise the OS limit (Linux net.core.rmem_max, macOS kern.ipc.maxsockbuf) if many publishers share this server"
         );
     }
-    let encryption = if app.publish_sessions.is_some()
-        || (app.config.srt_crypto.is_some() && !app.config.srt_allow_plaintext)
-    {
+    let encryption = if app.publish_sessions.is_some() || app.config.srt_require_encryption {
         "required"
-    } else if app.config.srt_crypto.is_some() {
+    } else if app.config.srt_crypto.is_some() || app.config.srt_app_keys {
         "optional"
     } else {
         "off"
     };
-    tracing::info!(%addr,implementation="own",recv_buffer,scoped=app.publish_sessions.is_some(),encryption,"SRT listening");
+    tracing::info!(%addr,implementation="own",recv_buffer,scoped=app.publish_sessions.is_some(),encryption,app_keys=app.config.srt_app_keys,"SRT listening");
     let mut engine = Engine {
         listener: Listener::new(listener_config(&app.config), Instant::now()),
         publishers: HashMap::new(),
@@ -325,75 +336,262 @@ fn complete_admission(
     ended: &mpsc::Sender<ConnId>,
     id: ConnId,
     peer: SocketAddr,
-    result: Result<Publication, Refused>,
+    result: Result<Admission, Refused>,
 ) {
-    let publication = match result {
-        Ok(publication) => publication,
+    let (publication, scope, capacity, encryption) = match result {
         Err(error) => {
             listener.reject(id, reject_code(error));
             return;
         }
-    };
-    let scope = publication.scoped_lease();
-    let (accepted, capacity) = if let Some(scope) = &scope {
-        let crypto = scope.crypto();
-        let capacity = scope
-            .limits()
-            .map(|(limits, _)| (limits.max_queue_bytes / 1500) as usize);
-        match capacity.and_then(|capacity| {
-            scope.with_open(|| {
-                let accepted = listener.accept_with_crypto(id, Instant::now(), crypto);
-                if accepted {
-                    scope.accepted();
+        Ok(Admission::Pending(pending)) => {
+            let Some((publication, encryption)) = accept_pending(app, listener, id, peer, pending)
+            else {
+                return;
+            };
+            (publication, None, QUEUE, encryption)
+        }
+        Ok(Admission::Claimed(publication)) => {
+            let scope = publication.scoped_lease();
+            let encryption = match &scope {
+                Some(scope) => Encryption::SessionKey(scope.crypto().map(|c| c.key_size)),
+                None => deployment_encryption(&app.config, listener, id),
+            };
+            let (accepted, capacity) = if let Some(scope) = &scope {
+                let crypto = scope.crypto();
+                let capacity = scope
+                    .limits()
+                    .map(|(limits, _)| (limits.max_queue_bytes / 1500) as usize);
+                match capacity.and_then(|capacity| {
+                    scope.with_open(|| {
+                        let accepted = listener.accept_with_crypto(id, Instant::now(), crypto);
+                        if accepted {
+                            scope.accepted();
+                        }
+                        (accepted, capacity)
+                    })
+                }) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        listener.reject(id, RejectCode::http(403));
+                        scope.protocol_stopped();
+                        return;
+                    }
                 }
-                (accepted, capacity)
-            })
-        }) {
-            Ok(result) => result,
-            Err(_) => {
-                listener.reject(id, RejectCode::http(403));
-                scope.protocol_stopped();
+            } else {
+                (listener.accept(id, Instant::now()), QUEUE)
+            };
+            if !accepted {
+                if let Some(scope) = &scope {
+                    scope.protocol_stopped();
+                }
+                refused_key(app, peer);
                 return;
             }
+            (publication, scope, capacity, encryption)
         }
-    } else {
-        (listener.accept(id, Instant::now()), QUEUE)
     };
-    if !accepted {
-        if let Some(scope) = &scope {
-            scope.protocol_stopped();
-        }
-        app.auth_throttle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .failed(peer.ip(), Instant::now());
-        app.log_refusal(
-            "srt",
-            &"passphrase, key length or admission handshake refused",
-        );
-        return;
-    }
     let (tx, rx) = mpsc::channel(capacity.clamp(1, QUEUE));
     let loss = publication.loss_notice();
     publishers.insert(id, Publisher { tx, scope, loss });
+    let (encryption, key_len) = encryption.label();
     tracing::info!(
         latency_ms = listener.latency(id).map(|d| d.as_millis() as u64),
+        encryption,
+        key_len,
         "SRT publisher accepted"
     );
     tokio::spawn(publish(id, publication, rx, ended.clone()));
 }
 
+/// A caller refused at accept: a failed attempt against its address's
+/// throttle, and a rate-limited log line.
+fn refused_key(app: &Arc<App>, peer: SocketAddr) {
+    app.auth_throttle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .failed(peer.ip(), Instant::now());
+    app.log_refusal(
+        "srt",
+        &"passphrase, key length or admission handshake refused",
+    );
+}
+
+/// An admission under `SAPFLOW_SRT_APP_KEYS`: makes sure the caller will be
+/// accepted, then claims the path, then accepts, with no await in between.
+/// SRT claims take over a live path, so a caller refused for its key, or for
+/// sending none, is refused before the claim, and a live or held stage, its
+/// recording and its callbacks are untouched. With the app's passphrase the
+/// caller must have used it; without one the listener's own settings decide,
+/// as [`Listener::accept`] would.
+fn accept_pending(
+    app: &Arc<App>,
+    listener: &mut Listener,
+    id: ConnId,
+    peer: SocketAddr,
+    pending: Pending,
+) -> Option<(Publication, Encryption)> {
+    let Pending { req, admitted, key } = pending;
+    let checked = match &key {
+        Some(key) => match listener.check_key(id, key) {
+            Ok(size) => Ok(Encryption::AppKey(size)),
+            Err(error) => {
+                if error != KeyCheckError::NotPending {
+                    // The error names the failure only, never the key.
+                    app.log_refusal("srt", &error);
+                }
+                Err(error.reject_code())
+            }
+        },
+        None => deployment_check(app, listener, id),
+    };
+    let encryption = match checked {
+        Ok(encryption) => encryption,
+        // Not answered within the accept timeout while the app was asked:
+        // the caller is gone, and nothing was claimed for it.
+        Err(None) => {
+            app.log_refusal("srt", &"caller gave up before the app answered");
+            return None;
+        }
+        Err(Some(code)) => {
+            listener.reject(id, code);
+            app.auth_throttle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .failed(peer.ip(), Instant::now());
+            return None;
+        }
+    };
+    let publication = match Publication::claim_admitted(app, &req, SourceKind::Ts, admitted) {
+        Ok(publication) => publication,
+        Err(refusal) => {
+            listener.reject(id, reject_code(Refused::Policy(refusal)));
+            app.log_refusal("srt", &refusal);
+            return None;
+        }
+    };
+    let accepted = match &key {
+        Some(key) => listener.accept_with_key(id, Instant::now(), key),
+        None => listener.accept(id, Instant::now()),
+    };
+    if !accepted {
+        // As after any failed accept: dropping the unaccepted publication
+        // releases its claim.
+        drop(publication);
+        refused_key(app, peer);
+        return None;
+    }
+    Some((publication, encryption))
+}
+
+/// Whether [`Listener::accept`] will admit a caller the app admitted without
+/// a passphrase, decided before anything is claimed for it: key material
+/// must unwrap with the global passphrase at its key length, and a caller
+/// with none needs plaintext allowed. `Err(None)` when the caller is gone,
+/// else the code to refuse it with (logged here).
+fn deployment_check(
+    app: &Arc<App>,
+    listener: &Listener,
+    id: ConnId,
+) -> Result<Encryption, Option<RejectCode>> {
+    let config = &app.config;
+    let refuse = |code: RejectCode, reason: &str| {
+        app.log_refusal("srt", &reason);
+        Err(Some(code))
+    };
+    match (listener.sent_key_material(id), &config.srt_crypto) {
+        (None, _) => Err(None),
+        (Some(false), crypto) => {
+            let plaintext = !(config.control.is_some() || config.srt_require_encryption)
+                && (crypto.is_none() || config.srt_allow_plaintext);
+            if plaintext {
+                Ok(Encryption::None)
+            } else {
+                refuse(
+                    RejectCode::UNSECURE,
+                    "no key material, and encryption is required",
+                )
+            }
+        }
+        (Some(true), None) => refuse(
+            RejectCode::UNSECURE,
+            "key material, but neither the app nor the server has a passphrase",
+        ),
+        (Some(true), Some(global)) => match listener.check_key(id, global) {
+            Ok(size) if size == global.key_size => Ok(Encryption::DeploymentKey(size)),
+            Ok(_) => refuse(
+                RejectCode::BADSECRET,
+                "key length differs from the server passphrase's",
+            ),
+            Err(KeyCheckError::NotPending) => Err(None),
+            Err(error) => {
+                app.log_refusal("srt", &error);
+                Err(error.reject_code())
+            }
+        },
+    }
+}
+
+/// How an accepted publisher's media is encrypted, for the accept log.
+enum Encryption {
+    None,
+    /// The global `SAPFLOW_SRT_PASSPHRASE`.
+    DeploymentKey(KeySize),
+    /// The passphrase the app returned for this stream.
+    AppKey(KeySize),
+    /// A scoped publish session's own key.
+    SessionKey(Option<KeySize>),
+}
+
+impl Encryption {
+    fn label(&self) -> (&'static str, Option<u8>) {
+        let len = |size: &KeySize| match size {
+            KeySize::Aes128 => 16,
+            KeySize::Aes256 => 32,
+        };
+        match self {
+            Self::None => ("none", None),
+            Self::DeploymentKey(size) => ("deployment-key", Some(len(size))),
+            Self::AppKey(size) => ("app-key", Some(len(size))),
+            Self::SessionKey(size) => ("session-key", size.as_ref().map(len)),
+        }
+    }
+}
+
+/// What [`Listener::accept`] will admit this caller with: the global key,
+/// whose length a caller must match, or nothing. Only `optional` needs to
+/// look, and a caller with no key material is told apart before any key
+/// derivation.
+fn deployment_encryption(
+    config: &crate::config::Config,
+    listener: &Listener,
+    id: ConnId,
+) -> Encryption {
+    match &config.srt_crypto {
+        None => Encryption::None,
+        Some(global) if !config.srt_allow_plaintext => Encryption::DeploymentKey(global.key_size),
+        Some(global) => match listener.check_key(id, global) {
+            Err(KeyCheckError::NoKeyMaterial) => Encryption::None,
+            _ => Encryption::DeploymentKey(global.key_size),
+        },
+    }
+}
+
 fn listener_config(config: &crate::config::Config) -> Config {
     Config {
         max_connections: config.max_publishers.saturating_mul(2).max(4),
-        require_encryption: config.control.is_some()
-            || (config.srt_crypto.is_some() && !config.srt_allow_plaintext),
+        require_encryption: config.control.is_some() || config.srt_require_encryption,
         crypto: config.srt_crypto.clone(),
         allow_plaintext: config.srt_allow_plaintext,
         reorder_wait_max: config.srt_reorder_wait_max,
+        app_keys: config.srt_app_keys,
         ..Config::default()
     }
 }
+#[cfg(test)]
+pub(crate) fn listener_config_for_test(config: &crate::config::Config) -> Config {
+    listener_config(config)
+}
+
 fn reject_code(reason: Refused) -> RejectCode {
     RejectCode::http(reason.status())
 }
@@ -721,3 +919,7 @@ mod recv_buffer_tests {
 #[cfg(test)]
 #[path = "srt_own_io_tests.rs"]
 mod io_tests;
+
+#[cfg(test)]
+#[path = "srt_app_keys_tests.rs"]
+mod app_key_tests;

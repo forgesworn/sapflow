@@ -270,6 +270,36 @@ Notes for the release after 0.2.0-rc.1.
   are refused: send plain PROXY v2, without SSL, authority or unique-ID
   TLVs.
 
+- A passphrase per SRT stream, held by the app: `SAPFLOW_SRT_APP_KEYS=1`
+  (or `--srt-app-keys 1`, `--srt-app-keys=1`; off by default). It needs `SAPFLOW_PUBLISH_AUTH_URL`
+  and is refused with scoped sessions. SRT publish authorisation requests
+  then carry `"srtKey":"accepted"`, and a 2xx may return the stream's
+  passphrase in one `sapflow-srt-passphrase` header (10 to 79 bytes). The
+  caller's key material is checked against it, at key length 16 or 32,
+  before the path is claimed, so a caller with no key or the wrong one is
+  refused (`UNSECURE` or `BADSECRET`, counted by the failed-attempt
+  throttle) and a live or held stage, its recording and its callbacks are
+  untouched. A 2xx without the header admits by the server's own SRT
+  settings, as before, but with app keys that too is decided before the
+  claim, so a caller whose key or lack of one would be refused at accept
+  no longer replaces a live publisher first; a repeated or out-of-bounds
+  header refuses as an unusable answer does. RTMP and WHIP
+  are unchanged, and with the switch off so is every request. The
+  passphrase is never logged. See `docs/v4v-contract.md`. There is no
+  replay guard yet: a captured handshake replayed to the same stream still
+  passes, so do not turn this on in production before it lands.
+- The "SRT publisher accepted" log line gives `encryption` (`none`,
+  `deployment-key`, `app-key` or `session-key`) and `key_len`, so the
+  logs show which publishers still connect without a passphrase, or with
+  the global one. With `SAPFLOW_SRT_ENCRYPTION=optional` and a global
+  passphrase, telling an encrypting caller apart costs one more key
+  derivation per connection. The "SRT listening" line gives `app_keys`.
+- `SAPFLOW_SRT_ENCRYPTION=required` set explicitly without
+  `SAPFLOW_SRT_PASSPHRASE` now stops startup unless app keys are on, where
+  it refuses callers that send no key material. It used to start and
+  admit plaintext callers, as if unset. Unset still means plaintext without
+  a passphrase.
+
 ## sapflow-dtls
 
 - A connected server now refuses every renegotiation with one warning-level
@@ -383,3 +413,6 @@ Notes for the release after 0.2.0-rc.1.
   `own_srt_app_keys` drives `check_key`, `accept_with_key`, `accept`,
   `reject` and `close`, with no global secret or with a global secret and
   `allow_plaintext`; it does not call `accept_with_crypto` directly.
+- `Listener::sent_key_material` (new) says whether a waiting caller sent
+  key material, reading the handshake only, so an application can refuse
+  before acting on its behalf what `accept` would refuse.

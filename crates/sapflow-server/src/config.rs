@@ -30,7 +30,16 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_SRT_CIPHER       compatibility alias: aes128 or aes256; when both key
                            settings are present they must agree
   SAPFLOW_SRT_ENCRYPTION   required (default) or optional: with a passphrase,
-                           optional also admits callers that send none
+                           optional also admits callers that send none. Set
+                           to required with no passphrase only with
+                           SAPFLOW_SRT_APP_KEYS=1: callers must then encrypt
+  SAPFLOW_SRT_APP_KEYS     set to 1 to let the app give each SRT stream its own
+                           passphrase (needs SAPFLOW_PUBLISH_AUTH_URL; not with
+                           scoped mode): requests offer \"srtKey\":\"accepted\",
+                           and a 2xx carrying sapflow-srt-passphrase admits
+                           only a caller keyed with it, checked before the
+                           path is claimed. No replay guard yet: a captured
+                           handshake still passes, so not for production
   SAPFLOW_SRT_REORDER_WAIT_MAX_MS  once a caller's path reorders packets, hold
                            a new gap's first NAK up to this long, so a packet
                            that is only late is not resent (default 50, 0 to
@@ -185,6 +194,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_PBKEYLEN",
     "SAPFLOW_SRT_ENCRYPTION",
     "SAPFLOW_SRT_REORDER_WAIT_MAX_MS",
+    "SAPFLOW_SRT_APP_KEYS",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
     "SAPFLOW_WHIP_ADDR",
@@ -419,6 +429,12 @@ pub struct Config {
     pub srt_crypto: Option<CryptoConfig>,
     /// With `srt_crypto`, also admit SRT callers that do not encrypt.
     pub srt_allow_plaintext: bool,
+    /// Refuse SRT callers that send no key material: a global passphrase
+    /// without `optional`, or an explicit `required` with app keys.
+    pub srt_require_encryption: bool,
+    /// The app may give each SRT stream its own passphrase in its publish
+    /// authorisation answer (`SAPFLOW_SRT_APP_KEYS`).
+    pub srt_app_keys: bool,
     /// The longest an SRT connection holds a new gap's first NAK while its
     /// path reorders packets; zero reports every gap at once.
     pub srt_reorder_wait_max: Duration,
@@ -549,9 +565,17 @@ impl Config {
         };
         let open = vals.get("SAPFLOW_OPEN_PUBLISH").is_some_and(|v| v == "1");
         let publish_auth_url = vals.get("SAPFLOW_PUBLISH_AUTH_URL");
+        let srt_app_keys = match vals.get("SAPFLOW_SRT_APP_KEYS").map(String::as_str) {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => {
+                return Err(ConfigError::Invalid("SAPFLOW_SRT_APP_KEYS: 1 or 0".into()));
+            }
+        };
         if control.is_some()
             && (open
                 || publish_auth_url.is_some()
+                || srt_app_keys
                 || vals.contains_key("SAPFLOW_PUBLISH_USER")
                 || vals.contains_key("SAPFLOW_PUBLISH_PASS")
                 || srt_crypto.is_some()
@@ -581,6 +605,11 @@ impl Config {
                 ConfigError::Invalid("SAPFLOW_PUBLISH_AUTH_URL: not a usable http:// URL".into())
             })?),
         };
+        if srt_app_keys && publish_auth.is_none() {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_PUBLISH_AUTH_URL: the app returns each stream's passphrase".into(),
+            ));
+        }
         if publish_auth.is_some()
             && (open
                 || vals.contains_key("SAPFLOW_PUBLISH_USER")
@@ -833,9 +862,21 @@ impl Config {
                 config
             });
 
-        let srt_allow_plaintext = match vals.get("SAPFLOW_SRT_ENCRYPTION").map(String::as_str) {
-            None | Some("required") => false,
+        let encryption = vals.get("SAPFLOW_SRT_ENCRYPTION").map(String::as_str);
+        let srt_allow_plaintext = match encryption {
+            None => false,
+            // Explicitly required with no key to require: refused rather
+            // than left meaning plaintext, unless the app holds the keys.
+            Some("required") if srt_crypto.is_none() && !srt_app_keys => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_ENCRYPTION=required needs SAPFLOW_SRT_PASSPHRASE or SAPFLOW_SRT_APP_KEYS=1".into(),
+                ));
+            }
+            Some("required") => false,
             Some("optional") if srt_crypto.is_some() => true,
+            // App keys without a global passphrase admit plaintext callers
+            // already; optional says so.
+            Some("optional") if srt_app_keys => false,
             Some("optional") => {
                 return Err(ConfigError::Invalid(
                     "SAPFLOW_SRT_ENCRYPTION=optional requires SAPFLOW_SRT_PASSPHRASE".into(),
@@ -847,6 +888,9 @@ impl Config {
                 ));
             }
         };
+
+        let srt_require_encryption = (srt_crypto.is_some() && !srt_allow_plaintext)
+            || (srt_app_keys && encryption == Some("required"));
 
         let srt_reorder_wait_max = match vals.get("SAPFLOW_SRT_REORDER_WAIT_MAX_MS") {
             None => Duration::from_millis(50),
@@ -912,6 +956,8 @@ impl Config {
             health_interval,
             srt_crypto,
             srt_allow_plaintext,
+            srt_require_encryption,
+            srt_app_keys,
             srt_reorder_wait_max,
             record_min_free,
             recording_roll,
@@ -2009,6 +2055,107 @@ mod tests {
             assert!(!error.contains("app-secret-token"), "{error}");
         }
         assert!(HELP.contains("SAPFLOW_PUBLISH_AUTH_URL"));
+    }
+
+    #[test]
+    fn srt_app_keys_need_the_app_and_refuse_scoped_mode() {
+        let url = ("SAPFLOW_PUBLISH_AUTH_URL", "http://app/auth?token=t");
+        let on = ("SAPFLOW_SRT_APP_KEYS", "1");
+        let off = load(&[url], &[]).expect("default");
+        assert!(!off.srt_app_keys && !off.srt_require_encryption);
+        assert!(
+            !load(&[url, ("SAPFLOW_SRT_APP_KEYS", "0")], &[])
+                .expect("off")
+                .srt_app_keys
+        );
+        let c = load(&[url, on], &[]).expect("app keys");
+        // On, with nothing else: plaintext callers are still admitted.
+        assert!(c.srt_app_keys && c.srt_crypto.is_none() && !c.srt_require_encryption);
+        assert!(
+            load(&[url], &["--srt-app-keys=1"])
+                .expect("flag")
+                .srt_app_keys
+        );
+        let Err(ConfigError::Invalid(error)) = load(&[url, ("SAPFLOW_SRT_APP_KEYS", "yes")], &[])
+        else {
+            panic!("bad value accepted")
+        };
+        assert_eq!(error, "SAPFLOW_SRT_APP_KEYS: 1 or 0");
+        for env in [
+            vec![on, ("SAPFLOW_OPEN_PUBLISH", "1")],
+            vec![
+                on,
+                ("SAPFLOW_PUBLISH_USER", "u"),
+                ("SAPFLOW_PUBLISH_PASS", "p"),
+            ],
+        ] {
+            let Err(ConfigError::Invalid(error)) = load(&env, &[]) else {
+                panic!("app keys without the app accepted: {env:?}")
+            };
+            assert!(
+                error.contains("requires SAPFLOW_PUBLISH_AUTH_URL"),
+                "{error}"
+            );
+        }
+        let scoped = [
+            ("SAPFLOW_CONTROL_ADDR", "127.0.0.1:9000"),
+            (
+                "SAPFLOW_CONTROL_TOKEN",
+                "independent-control-token-32-bytes-minimum",
+            ),
+            ("SAPFLOW_SESSION_STORE", "/private/session-authority.json"),
+            on,
+        ];
+        assert!(matches!(
+            load(&scoped, &[]),
+            Err(ConfigError::Invalid(m)) if m.contains("scoped control mode")
+        ));
+        assert!(HELP.contains("SAPFLOW_SRT_APP_KEYS"));
+    }
+
+    #[test]
+    fn required_encryption_without_a_passphrase_needs_app_keys() {
+        let url = ("SAPFLOW_PUBLISH_AUTH_URL", "http://app/auth?token=t");
+        let on = ("SAPFLOW_SRT_APP_KEYS", "1");
+        let required = ("SAPFLOW_SRT_ENCRYPTION", "required");
+        let c = load(&[url, on, required], &[]).expect("app keys, required");
+        assert!(c.srt_require_encryption && c.srt_crypto.is_none() && !c.srt_allow_plaintext);
+        let listener = crate::srt_own::listener_config_for_test(&c);
+        assert!(listener.require_encryption && listener.app_keys && listener.crypto.is_none());
+        // Without app keys an explicit `required` with nothing to require is
+        // refused, rather than left meaning plaintext.
+        for env in [
+            vec![url, required],
+            vec![("SAPFLOW_OPEN_PUBLISH", "1"), required],
+        ] {
+            let Err(ConfigError::Invalid(error)) = load(&env, &[]) else {
+                panic!("required without a key accepted: {env:?}")
+            };
+            assert_eq!(
+                error,
+                "SAPFLOW_SRT_ENCRYPTION=required needs SAPFLOW_SRT_PASSPHRASE or SAPFLOW_SRT_APP_KEYS=1"
+            );
+        }
+        assert!(load(&[url], &["--srt-encryption=required"]).is_err());
+        // Unset still means plaintext without a passphrase, app keys or not.
+        let listener =
+            crate::srt_own::listener_config_for_test(&load(&[url, on], &[]).expect("on"));
+        assert!(!listener.require_encryption && listener.app_keys);
+        let listener = crate::srt_own::listener_config_for_test(&load(&[url], &[]).expect("off"));
+        assert!(!listener.require_encryption && !listener.app_keys);
+        // Optional, with app keys and no passphrase, says the same.
+        let c = load(&[url, on, ("SAPFLOW_SRT_ENCRYPTION", "optional")], &[]).expect("optional");
+        assert!(!c.srt_require_encryption && !c.srt_allow_plaintext);
+        // A global passphrase alongside app keys keeps its meaning.
+        let pass = ("SAPFLOW_SRT_PASSPHRASE", "deployment secret");
+        let c = load(
+            &[url, on, pass, ("SAPFLOW_SRT_ENCRYPTION", "optional")],
+            &[],
+        )
+        .expect("both");
+        assert!(c.srt_allow_plaintext && !c.srt_require_encryption && c.srt_app_keys);
+        let c = load(&[url, on, pass], &[]).expect("both, required");
+        assert!(c.srt_require_encryption);
     }
 
     #[test]

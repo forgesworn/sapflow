@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sapflow_core::{PublishError, PublishRequest};
+use sapflow_srt::crypto::CryptoConfig;
 
 use crate::App;
-use crate::publish::{Publication, Refusal};
+use crate::publish::{Admitted, Publication, Refusal};
 use crate::stream::Source;
 
 /// Drop a publisher that sends nothing for this long (the SRT
@@ -68,20 +69,61 @@ impl Refused {
     }
 }
 
+/// What the asynchronous part of an SRT admission decided.
+pub enum Admission {
+    /// Admitted and its path claimed, as always without app keys.
+    Claimed(Publication),
+    /// With `SAPFLOW_SRT_APP_KEYS`: the app admitted the caller, with or
+    /// without a passphrase for this stream. Nothing is claimed yet: the
+    /// listener first makes sure it will accept the caller.
+    Pending(Pending),
+}
+
+/// An admission waiting for its key check.
+pub struct Pending {
+    pub req: PublishRequest,
+    pub admitted: Admitted,
+    /// The stream's passphrase from the app; `None` when it sent none, and
+    /// the listener's own settings decide.
+    pub key: Option<CryptoConfig>,
+}
+
+/// Names the path only: the request carries the publish password and the
+/// key is the stream's passphrase.
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claimed(publication) => f
+                .debug_tuple("Claimed")
+                .field(&publication.stream.path.as_path())
+                .finish(),
+            Self::Pending(pending) => f
+                .debug_struct("Pending")
+                .field("path", &pending.req.path.as_path())
+                .field("app_key", &pending.key.is_some())
+                .finish(),
+        }
+    }
+}
+
 /// Decides on a caller from its stream id, with `active` SRT publishers
-/// already live: begins its publication, or says why not (and logs it,
-/// rate-limited).
+/// already live: begins its publication, hands back an admission whose key
+/// is still to be checked, or says why not (and logs it, rate-limited).
 pub async fn admit(
     app: &Arc<App>,
     stream_id: &str,
     from: IpAddr,
     active: usize,
-) -> Result<Publication, Refused> {
+) -> Result<Admission, Refused> {
     let admitted = match PublishRequest::parse_srt_stream_id(stream_id) {
         Err(e) => Err(Refused::Policy(Refusal::Request(e))),
         Ok(_) if active >= app.config.max_publishers => Err(Refused::PublisherLimit),
+        Ok(req) if app.config.srt_app_keys => admit_offering_key(app, req, from)
+            .await
+            .map_err(Refused::Policy),
         Ok(req) => Publication::begin_srt(app, &req, from)
             .await
+            .map(Admission::Claimed)
             .map_err(Refused::Policy),
     };
     if let Err(r) = &admitted {
@@ -91,6 +133,19 @@ pub async fn admit(
         }
     }
     admitted
+}
+
+/// Asks the app, offering to check its passphrase for the stream. Claims
+/// nothing, with or without one in the answer: an SRT claim takes over a live
+/// path, so it waits until the caller is known to be accepted.
+async fn admit_offering_key(
+    app: &Arc<App>,
+    req: PublishRequest,
+    from: IpAddr,
+) -> Result<Admission, Refusal> {
+    let mut admitted = Publication::admit_srt_key(app, &req, from).await?;
+    let key = admitted.take_srt_key();
+    Ok(Admission::Pending(Pending { req, admitted, key }))
 }
 
 /// Feeds one payload (MPEG-TS) to the publication. An error means the

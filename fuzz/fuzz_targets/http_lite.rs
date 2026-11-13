@@ -8,7 +8,9 @@ use libfuzzer_sys::fuzz_target;
 #[path = "../../crates/sapflow-server/src/http_lite.rs"]
 mod http_lite;
 
-use http_lite::{Endpoint, Framing, MAX_HEAD, MAX_TARGET, ParsedRequest, ParsedResponse};
+use http_lite::{
+    Endpoint, Framing, MAX_HEAD, MAX_TARGET, ParsedRequest, ParsedResponse, ResponseHeader,
+};
 
 fuzz_target!(|data: &[u8]| {
     match http_lite::parse_request(data) {
@@ -50,7 +52,21 @@ fuzz_target!(|data: &[u8]| {
     if let ParsedResponse::Complete { status, used } = http_lite::parse_response(data) {
         assert!((100..600).contains(&status));
         assert!(used > 0 && used <= data.len() && used <= MAX_HEAD);
+        // The publish authorisation's one header: a single line's value from
+        // inside the head, never a line end, and the same with later bytes.
+        let head = &data[..used];
+        let header = http_lite::response_header(head, "sapflow-srt-passphrase");
+        if let ResponseHeader::One(value) = header {
+            assert!(!value.contains(&b'\r') && !value.contains(&b'\n'));
+            let start = value.as_ptr() as usize - head.as_ptr() as usize;
+            assert!(start + value.len() <= used);
+        }
+        if data.len() <= MAX_HEAD {
+            assert!(http_lite::response_header(data, "sapflow-srt-passphrase") == header);
+        }
     }
+    // Any bytes at all: no panic.
+    let _ = http_lite::response_header(data, "content-length");
 
     // Whatever URL is accepted becomes one request head that the server side
     // reads back as the same POST, so no URL can add a header or a request.

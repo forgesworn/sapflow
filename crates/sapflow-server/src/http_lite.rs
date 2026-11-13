@@ -302,6 +302,38 @@ pub fn parse_response(buf: &[u8]) -> ParsedResponse {
     }
 }
 
+/// One named header of a response head. No `Debug`: the value may be a
+/// secret, so it is never printed.
+#[derive(PartialEq, Eq)]
+pub enum ResponseHeader<'a> {
+    Absent,
+    /// Exactly one line with that name; its value as httparse gives it.
+    One(&'a [u8]),
+    /// More than one line with that name, or a head that does not parse.
+    Unusable,
+}
+
+/// Finds the header `name` (case-insensitive) in `head`, the bytes a
+/// [`ParsedResponse::Complete`] said it used. A repeated header is never
+/// joined or picked from: it is [`ResponseHeader::Unusable`].
+pub fn response_header<'a>(head: &'a [u8], name: &str) -> ResponseHeader<'a> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+    let mut res = httparse::Response::new(&mut headers);
+    if head.len() > MAX_HEAD || !matches!(res.parse(head), Ok(httparse::Status::Complete(_))) {
+        return ResponseHeader::Unusable;
+    }
+    let mut found = ResponseHeader::Absent;
+    for header in res.headers.iter() {
+        if header.name.eq_ignore_ascii_case(name) {
+            if found != ResponseHeader::Absent {
+                return ResponseHeader::Unusable;
+            }
+            found = ResponseHeader::One(header.value);
+        }
+    }
+    found
+}
+
 /// Preserve the previous client's response-head checks before acknowledging a
 /// callback. No-body statuses ignore framing; otherwise Transfer-Encoding takes
 /// precedence on HTTP/1.1 only. Without it, all Content-Length values (including
@@ -715,6 +747,25 @@ mod tests {
         }
         many.push_str("\r\n");
         assert_eq!(parse_response(many.as_bytes()), ParsedResponse::Malformed);
+    }
+
+    #[test]
+    fn one_response_header_is_found_and_a_repeat_is_unusable() {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nSapflow-Srt-Passphrase: pw_srt_0123456789\r\n\r\n";
+        assert!(
+            response_header(head, "sapflow-srt-passphrase")
+                == ResponseHeader::One(b"pw_srt_0123456789")
+        );
+        assert!(response_header(head, "x-other") == ResponseHeader::Absent);
+        // Spaces and tabs around a value are not part of it.
+        assert!(
+            response_header(b"HTTP/1.1 200 OK\r\nx-key: \t value \t \r\n\r\n", "x-key")
+                == ResponseHeader::One(b"value")
+        );
+        let twice = b"HTTP/1.1 200 OK\r\nx-key: a\r\nX-Key: a\r\n\r\n";
+        assert!(response_header(twice, "x-key") == ResponseHeader::Unusable);
+        assert!(response_header(b"HTTP/1.1 200 OK\r\n", "x-key") == ResponseHeader::Unusable);
+        assert!(response_header(b"not http\r\n\r\n", "x-key") == ResponseHeader::Unusable);
     }
 
     #[test]
