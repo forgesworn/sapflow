@@ -360,7 +360,8 @@ Notes for the release after 0.2.0-rc.1.
   A caller refused for its key no longer logs "publisher connected" or
   resumes a held stage, is refused for the key ahead of a claim refusal
   (such as the memory limit), and is logged with its reason
-  (`BadSecret`, or the key length). One that gives up before the app
+  (`publish refused protocol="srt" reason=BadSecret`, or the key length)
+  rather than "passphrase, key length or admission handshake refused". One that gives up before the app
   answers is no longer counted by the throttle, and claims nothing. The
   check costs one more key derivation per encrypting caller with a global
   passphrase, before the accept's own. Scoped sessions are unchanged. The

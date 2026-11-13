@@ -286,7 +286,7 @@ epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase
 for e in event-plain event-wrong; do
   [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/$e/index.m3u8")" = 404 ] || fail "$e was accepted"
 done
-grep -Eq 'wrong passphrase or key length|passphrase, key length or admission handshake refused' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
+grep -Eq 'wrong passphrase or key length|passphrase, key length or admission handshake refused|publish refused protocol="srt" reason=BadSecret' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
 grep -q 'not-the-passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
 echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
 
