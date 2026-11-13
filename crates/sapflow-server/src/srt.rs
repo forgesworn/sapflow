@@ -16,7 +16,7 @@ use sapflow_srt::crypto::CryptoConfig;
 
 use crate::App;
 use crate::publish::{Admitted, Publication, Refusal};
-use crate::stream::Source;
+use crate::stream::{Source, SourceKind};
 
 /// Drop a publisher that sends nothing for this long (the SRT
 /// connection's own 5 s timeout normally fires first).
@@ -71,10 +71,12 @@ impl Refused {
 
 /// What the asynchronous part of an SRT admission decided.
 pub enum Admission {
-    /// Admitted and its path claimed, as always without app keys.
+    /// Admitted and its path claimed: scoped publish sessions, which never
+    /// take over a live path.
     Claimed(Publication),
-    /// With `SAPFLOW_SRT_APP_KEYS`: the app admitted the caller, with or
-    /// without a passphrase for this stream. Nothing is claimed yet: the
+    /// Admitted, by the app (with or without a passphrase for this stream
+    /// under `SAPFLOW_SRT_APP_KEYS`) or by the publish user and password.
+    /// Nothing is claimed yet: an SRT claim takes over a live path, so the
     /// listener first makes sure it will accept the caller.
     Pending(Pending),
 }
@@ -121,6 +123,9 @@ pub async fn admit(
         Ok(req) if app.config.srt_app_keys => admit_offering_key(app, req, from)
             .await
             .map_err(Refused::Policy),
+        Ok(req) if app.publish_sessions.is_none() => admit_unclaimed(app, req, from)
+            .await
+            .map_err(Refused::Policy),
         Ok(req) => Publication::begin_srt(app, &req, from)
             .await
             .map(Admission::Claimed)
@@ -146,6 +151,23 @@ async fn admit_offering_key(
     let mut admitted = Publication::admit_srt_key(app, &req, from).await?;
     let key = admitted.take_srt_key();
     Ok(Admission::Pending(Pending { req, admitted, key }))
+}
+
+/// Without app keys or scoped sessions: the app's answer, or the publish user
+/// and password, as [`Publication::begin_authorised`] asks them, with the
+/// claim left to the listener once it knows the caller's key will be
+/// accepted. The request the app gets is unchanged.
+async fn admit_unclaimed(
+    app: &Arc<App>,
+    req: PublishRequest,
+    from: IpAddr,
+) -> Result<Admission, Refusal> {
+    let admitted = Publication::admit(app, &req, SourceKind::Ts, from).await?;
+    Ok(Admission::Pending(Pending {
+        req,
+        admitted,
+        key: None,
+    }))
 }
 
 /// Feeds one payload (MPEG-TS) to the publication. An error means the
