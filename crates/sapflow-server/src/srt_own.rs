@@ -295,8 +295,9 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                             // usually show as duplicates. Duplicates were
                             // already held; belated came after delivery or
                             // give-up, from reordering or a repeated NAK
-                            // under loss. max_reorder_wait_us: the longest a
-                            // first NAK was held (0 if never).
+                            // under loss. max_reorder_wait_us: the highest the
+                            // reorder wait reached (0 if never); a first NAK
+                            // is held no longer, and less near its deadline.
                             reordered = stats.reordered,
                             duplicates = stats.duplicates,
                             belated = stats.belated,

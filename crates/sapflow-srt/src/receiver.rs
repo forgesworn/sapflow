@@ -5,11 +5,12 @@
 //! A gap is reported in a NAK as soon as it is seen, as libsrt does, until
 //! the path is seen to reorder: a missing packet that then arrives as an
 //! original rather than a retransmission. From then on the first NAK of each
-//! new gap is held for a little longer than the latest such packet came
-//! (at most [`Settings::reorder_wait_max`] and an eighth of the latency,
-//! never into the last three round trips before the gap's deadline), so a
-//! packet that is only late is not resent. The wait halves after every
-//! second with no reordering, back to none. It adapts only for a caller that
+//! new gap is held for a little longer than the latest such packet has come
+//! since the path last went a second without reordering (at most
+//! [`Settings::reorder_wait_max`] and an eighth of the latency, never into
+//! the last three round trips before the gap's deadline), so a packet that
+//! is only late is not resent. The wait halves after every second with no
+//! reordering, back to none. It adapts only for a caller that
 //! flags its retransmissions (`REXMITFLG`), since otherwise a retransmission
 //! that fills a gap looks like a late original.
 //!
@@ -96,9 +97,10 @@ pub struct Stats {
     /// Of those, packets whose first NAK was still being held when they came,
     /// so none was sent for them.
     pub nak_held: u64,
-    /// The longest the first NAK of a gap was held for, in microseconds: the
-    /// highest the reorder wait reached (0 if the path never reordered, the
-    /// caller does not flag retransmissions or the hold is off).
+    /// The highest the reorder wait reached, in microseconds (0 if the path
+    /// never reordered, the caller does not flag retransmissions or the hold
+    /// is off). A first NAK is held for at most this, and less where the
+    /// gap's deadline is too near.
     pub max_reorder_wait: u64,
     /// Packets found missing (each counted once).
     pub lost: u64,
@@ -466,7 +468,7 @@ impl Receiver {
                 return;
             }
             *existing = Some(slot);
-            let taken = self.loss.take(p.seq);
+            let taken = self.loss.take(p.seq, deliver_at);
             if !p.retransmitted {
                 self.stats.reordered += 1;
                 if let Some(taken) = taken {
@@ -784,9 +786,9 @@ impl Receiver {
             }
             Control::DropRequest { first, last, .. } => {
                 // The sender no longer has these: stop asking for them. A
-                // held loss this pushes off the list is reported now.
+                // held loss this pushes off the list makes the next timer
+                // due at once, which reports it.
                 self.loss.remove_range(*first, *last);
-                self.nak_due(now);
             }
             _ => {}
         }

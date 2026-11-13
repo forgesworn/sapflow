@@ -10,9 +10,10 @@
 //! A loss can also be listed before it is first asked for ([`LossList::hold`]):
 //! the receiver holds the first report briefly once it has seen the path
 //! reorder packets, in case the missing ones are only late. A held loss is
-//! always reported: when its hold ends (or sooner, never inside the last
-//! three round trips before its deadline), and at once if the list has to
-//! give it up to stay bounded.
+//! reported when its hold ends (or sooner, never inside the last three round
+//! trips before its deadline), and at the next [`LossList::due`] if the
+//! list has to give it up to stay bounded; a drop request or the receiver
+//! giving up on the packets ends it unreported, as it would a reported one.
 
 use crate::seq::Seq;
 
@@ -209,12 +210,18 @@ impl LossList {
 
     /// `s` arrived. Returns whether it was on the list.
     pub fn remove(&mut self, s: Seq) -> bool {
-        self.take(s).is_some()
+        self.take(s, i64::MAX).is_some()
     }
 
-    /// `s` arrived: takes it off the list, and says when its loss was found
-    /// and whether it had been asked for; `None` if it was not listed.
-    pub fn take(&mut self, s: Seq) -> Option<Taken> {
+    /// `s` arrived, to be delivered at `delivers_at`: takes it off the list,
+    /// and says when its loss was found and whether it had been asked for;
+    /// `None` if it was not listed.
+    ///
+    /// The part of a held loss before `s` is due no later than `s` itself,
+    /// which can be well before the deadline of the packet that revealed
+    /// the loss, so its hold is bounded by that instead. A reported loss
+    /// keeps the deadline it had.
+    pub fn take(&mut self, s: Seq, delivers_at: i64) -> Option<Taken> {
         let i = self
             .entries
             .iter()
@@ -229,10 +236,18 @@ impl LossList {
                 self.entries.remove(i);
             }
             (true, false) => e.first = s.next(),
-            (false, true) => e.last = s.prev(),
+            (false, true) => {
+                e.last = s.prev();
+                if e.requests == 0 {
+                    e.deadline = e.deadline.min(delivers_at);
+                }
+            }
             (false, false) => {
                 let mut tail = *e;
                 e.last = s.prev();
+                if e.requests == 0 {
+                    e.deadline = e.deadline.min(delivers_at);
+                }
                 tail.first = s.next();
                 self.entries.insert(i + 1, tail);
                 // At the limit the latest losses are no longer tracked.
@@ -568,7 +583,7 @@ mod tests {
         l.add(s(1), s(1), 5, 2_000_000);
         assert!(l.hold(s(3), s(5), 7, 2_000_000, 30_000, t));
         assert_eq!(
-            l.take(s(1)),
+            l.take(s(1), 2_000_000),
             Some(Taken {
                 found: 5,
                 reported: true
@@ -578,18 +593,70 @@ mod tests {
             found: 7,
             reported: false,
         });
-        assert_eq!(l.take(s(4)), held, "a split keeps the hold");
-        assert_eq!(l.take(s(5)), held);
-        assert_eq!(l.take(s(9)), None);
+        assert_eq!(l.take(s(4), 2_000_000), held, "a split keeps the hold");
+        assert_eq!(l.take(s(5), 2_000_000), held);
+        assert_eq!(l.take(s(9), 2_000_000), None);
         assert_eq!(l.due(30_000, t, 10), vec![(s(3), s(3))]);
         assert_eq!(
-            l.take(s(3)),
+            l.take(s(3), 2_000_000),
             Some(Taken {
                 found: 7,
                 reported: true
             })
         );
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn the_part_of_a_held_loss_before_an_arrival_is_due_by_that_arrival() {
+        let mut l = LossList::new();
+        let t = Timing::rtt(RTT);
+        // Revealed by a packet due at 2 s; held until 40 ms.
+        assert!(l.hold(s(10), s(20), 0, 2_000_000, 40_000, t));
+        // 15 arrives, due at 150 ms: 10 to 14 are due no later, so three
+        // round trips before that has already passed and they are asked for
+        // now; 16 to 20 keep the hold.
+        l.take(s(15), 150_000);
+        assert_eq!(l.next_due(1_000, t), Some(1_000));
+        assert_eq!(l.due(1_000, t, 10), vec![(s(10), s(14))]);
+        // Near its deadline, 10 to 14 is asked for every quarter round trip;
+        // 16 to 20 waits for its hold to end.
+        assert!(!l.due(39_999, t, 10).contains(&(s(16), s(20))));
+        assert!(l.due(40_000, t, 10).contains(&(s(16), s(20))));
+        // The same when the last packet of a held loss arrives.
+        let mut l = LossList::new();
+        assert!(l.hold(s(30), s(35), 0, 2_000_000, 40_000, t));
+        l.take(s(35), 150_000);
+        assert_eq!(l.due(1_000, t, 10), vec![(s(30), s(34))]);
+        // A reported loss keeps the deadline it had: its next request comes
+        // a round trip on, not a quarter, as it would near a 150 ms deadline.
+        let mut l = LossList::new();
+        l.add(s(50), s(55), 0, 2_000_000);
+        l.take(s(52), 150_000);
+        assert_eq!(l.next_due(1_000, t), Some(RTT.max(MIN_INTERVAL)));
+    }
+
+    #[test]
+    fn a_hold_across_the_sequence_wrap_is_split_and_reported() {
+        let mut l = LossList::new();
+        let t = Timing::rtt(RTT);
+        let first = Seq::new(Seq::MAX - 2);
+        let last = Seq::new(2);
+        assert!(l.hold(first, last, 0, 2_000_000, 40_000, t));
+        assert_eq!(l.count(), 6);
+        assert_eq!(
+            l.take(Seq::new(0), 2_000_000),
+            Some(Taken {
+                found: 0,
+                reported: false
+            })
+        );
+        assert!(l.contains(Seq::new(Seq::MAX)) && l.contains(Seq::new(1)));
+        assert!(l.due(39_999, t, 10).is_empty());
+        assert_eq!(
+            l.due(40_000, t, 10),
+            vec![(first, Seq::new(Seq::MAX)), (Seq::new(1), last)]
+        );
     }
 
     #[test]
