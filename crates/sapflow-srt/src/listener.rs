@@ -996,8 +996,6 @@ impl<S: BuildHasher> Listener<S> {
     }
 }
 
-/// The application's passphrase and refresh settings at the key length the
-/// caller chose.
 /// [`Listener::check_key`] for key material copied from a waiting caller
 /// ([`Listener::pending_key_material`]), so it can be checked away from the
 /// listener: in the task that decides on the caller, before anything is
@@ -1011,6 +1009,8 @@ pub fn check_key_material(km: &[u8], crypto: &CryptoConfig) -> Result<KeySize, K
     Ok(config.key_size)
 }
 
+/// The application's passphrase and refresh settings at the key length the
+/// caller chose.
 fn for_km(crypto: &CryptoConfig, km: &[u8]) -> Result<CryptoConfig, KeyCheckError> {
     let mut config = crypto.clone();
     config.key_size = crate::crypto::km_key_size(km)?;
