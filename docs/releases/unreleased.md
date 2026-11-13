@@ -364,8 +364,21 @@ Notes for the release after 0.2.0-rc.1.
   rather than "passphrase, key length or admission handshake refused". One that gives up before the app
   answers is no longer counted by the throttle, and claims nothing. The
   check costs one more key derivation per encrypting caller with a global
-  passphrase, before the accept's own. Scoped sessions are unchanged. The
-  replay guard still applies only with app keys.
+  passphrase, before the accept's own. The replay guard still applies only
+  with app keys.
+- Scoped publish sessions now check an SRT caller's key material against
+  the session's passphrase and key length as soon as its credentials
+  match, before the claim is reserved. A caller with the session's
+  credentials, which travel in clear in the stream id, and the wrong
+  passphrase or key length used to reserve a claim, spend a connection
+  epoch (saved to the session store), resume a stage held for reconnect
+  and drop it again; it is now refused with `BADSECRET`, counted by the
+  throttle, with nothing reserved, saved or resumed, and logged as
+  `reason=BadSecret`. Against a live scoped stage it is now refused for
+  its key (`BADSECRET`, counted) rather than as already live (409).
+  Admitted callers see nothing new: grants, epochs, limits and callbacks
+  are as before, and the accept is as strict. The check is one more key
+  derivation per scoped admission, before the accept's own.
 - `SAPFLOW_SRT_ENCRYPTION=required` set explicitly without
   `SAPFLOW_SRT_PASSPHRASE` now stops startup unless app keys are on, where
   it refuses callers that send no key material. It used to start and
@@ -494,3 +507,7 @@ Notes for the release after 0.2.0-rc.1.
 - `Listener::sent_key_material` (new) says whether a waiting caller sent
   key material, reading the handshake only, so an application can refuse
   before acting on its behalf what `accept` would refuse.
+- `check_key_material` (new) is `Listener::check_key` for key material
+  copied from a waiting caller (`Listener::pending_key_material`), so an
+  application can check it away from the listener before reserving
+  anything; `check_key` now calls it.

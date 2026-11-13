@@ -45,8 +45,11 @@ key negotiation, before creating the publisher queue/task. An SRT claim takes
 over a live stream, so a caller with the wrong passphrase or key length (or
 none, where encryption is required) is refused before anything is claimed,
 and a live or held stream keeps its publisher. Scoped publish sessions, which
-never take over a live stream, still claim first: if key negotiation fails,
-the provisional claim is immediately released. No media is submitted, so
+never take over a live stream, check the key against the session's passphrase
+once the session's credentials match, before the claim is reserved, so a
+wrong key spends no connection epoch and resumes no held stream; if key
+negotiation still fails at accept, the claim is immediately released. No
+media is submitted, so
 there is no healthy/publish/unpublish callback or recording-complete event;
 the recorder waits for its first media part before creating a file. Ordinary
 connection/leave log messages may still describe that provisional claim.
