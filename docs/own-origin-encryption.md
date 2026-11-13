@@ -31,8 +31,11 @@ never downgraded. In this mode the listener does not advertise its key length
 during the handshake (a plaintext caller could read that as a demand), so an
 encrypting caller relies on its own key length: the default 16 needs nothing
 set, but with `SAPFLOW_SRT_PBKEYLEN=32` callers must set `pbkeylen=32` too.
-`required` (the default) keeps the behaviour above. `optional` without a
-passphrase, and any value in scoped control mode, fail at startup.
+`required` (the default) keeps the behaviour above. Without a passphrase,
+`optional` and an explicit `required`, and any value in scoped control mode,
+fail at startup; with `SAPFLOW_SRT_APP_KEYS=1` (the app gives each stream its
+passphrase, `docs/v4v-contract.md`) both are allowed, and `required` then
+refuses callers that send no key material.
 
 Publish credentials still authorise the stream separately. The own listener
 checks publish admission before key derivation, then accepts key negotiation

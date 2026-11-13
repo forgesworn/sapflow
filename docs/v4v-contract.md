@@ -64,6 +64,47 @@ content-type: application/json
   retries is let in once there is room; nothing queues it. Each retry asks
   the app again.
 
+### A passphrase per SRT stream
+
+With `SAPFLOW_SRT_APP_KEYS=1` (off by default; it needs
+`SAPFLOW_PUBLISH_AUTH_URL` and is refused with scoped sessions), the app can
+give each SRT stream its own passphrase, so the publish key, which an SRT
+handshake carries in clear in the stream id, no longer admits on its own.
+
+- SRT requests then carry one more field, `"srtKey":"accepted"`. sapflow
+  sets it and no setting can. RTMP and WHIP requests never carry it, and
+  with the switch off no request does, so the body is as above. An app
+  that relies on a passphrase should refuse an SRT request without the
+  field: a sapflow that sends none admits on the 2xx alone.
+- A 2xx may carry the stream's passphrase in one `sapflow-srt-passphrase`
+  header: 10 to 79 bytes, no NUL (libsrt's limits), exactly as the encoder
+  is given it (libsrt does not percent-decode a passphrase). sapflow then
+  admits the caller only if its SRT key material was made with that
+  passphrase, at key length 16 or 32, whichever the caller chose.
+- The key is checked before the path is claimed. A caller with no key
+  material is refused with `SRT_REJ_UNSECURE` (1011), one with another
+  passphrase with `SRT_REJ_BADSECRET` (1010); either counts as a failed
+  attempt against sapflow's throttle. A stage that is live, or held for a
+  reconnect, keeps its publisher, recording and callbacks: nothing is
+  replaced, no `unpublish` or `recordSegmentComplete` is sent. The app
+  answered 2xx, so it hears nothing of such a refusal; only the encoder
+  does.
+- A 2xx without the header admits as before. A header sent twice, or
+  outside the bounds, refuses as an unusable answer does (`PREDEFINED:503`,
+  not counted). The header is read only from a 2xx to an SRT request.
+- The passphrase is never logged and is kept only until the caller is
+  answered. The "SRT publisher accepted" log line says how each publisher
+  encrypts: `encryption="none"`, `"deployment-key"` (the global
+  `SAPFLOW_SRT_PASSPHRASE`), `"app-key"` or `"session-key"` (scoped), with
+  `key_len`.
+- With app keys and no global passphrase, `SAPFLOW_SRT_ENCRYPTION=required`
+  refuses every caller that sends no key material, in the handshake, before
+  the app is asked. Left unset, plaintext callers still connect.
+- Not for production yet: a passing check proves the key material was made
+  with the passphrase, not that the caller made it. Someone who captured an
+  encoder's handshake can replay it to the same stream until sapflow guards
+  against replay.
+
 ## Ingest addresses v4v hands to encoders
 
 | Template | Example value |
