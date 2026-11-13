@@ -118,33 +118,47 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - A replayed handshake is refused too. A passing check proves only that
   the key material was made with the passphrase, and it crosses the
   network in clear, so a captured conclusion would pass from anywhere.
-  sapflow keeps a digest of the key material of each caller it admits
-  under app keys, in memory: the last 128 per stream and 4,096 in all,
-  oldest dropped first. Key material already kept is refused from any new
-  connection (another address, another caller socket, or the same caller
-  after its connection ended) with `SRT_REJ_BADSECRET` (1010), counted as a
-  failed attempt, before the path is claimed, whether it was checked
-  against the app's passphrase or the global `SAPFLOW_SRT_PASSPHRASE`. An
-  encoder resending its conclusion because the answer was lost is answered
-  on its own connection and never refused.
+  When a caller that sends key material first connects, before the
+  throttle, the app or any limit, it owns that key material (by its
+  address and caller socket id). The same key material from anyone else
+  is refused there and then with `SRT_REJ_BADSECRET` (1010): the app is not
+  asked and nothing is counted against the throttle, so a replayer behind
+  the encoder's own address cannot lock the encoder out. This holds
+  however the owner's attempt ends: still waiting for the app, refused as
+  throttled, refused by the app, or admitted. The owner may send it again
+  (a resend after a lost refusal). Once a caller is admitted, its key
+  material is refused to everyone, the owner included. It covers keys
+  checked against the app's passphrase and the global
+  `SAPFLOW_SRT_PASSPHRASE` alike, and spans streams.
+- What sapflow keeps, in memory: a SHA-256 digest of the part of the key
+  material the check binds, never the key material. Owners: 16,384, the
+  oldest whose connection has ended dropped first. Admitted: the last 128
+  per stream and 4,096 in all, the same way, so admissions elsewhere cannot
+  push out a live stage's. An entry whose connection is waiting or open is
+  never dropped. No time limit.
 - Encoders make fresh key material for every connection, reconnects
   included, so they are never refused for it: checked with libsrt 1.5.1
   (`srt-live-transmit`, a reconnect and a new run), OBS 32.0.4 (a
   reconnect after a dropped link, and one after sapflow restarted, with an
-  app key, 2026-11-13, via `scripts/obs-ingest.js --app-key`, a separate
-  change) and sapflow's own caller. Larix has not been checked.
-- What remains: a restart, or eviction past those bounds, lets an older
-  capture through again; key material is kept only once its caller is
-  accepted, so a handshake that was refused or never answered for another
-  reason (the app down, slow or throttling, the caller giving up, a memory
-  or presentation limit) can be replayed later, as when an encoder keeps
-  retrying with valid key material while the app is down; and a replay that arrives while the encoder whose
-  handshake it copies is still waiting for the app's answer can be
-  admitted first, refusing that encoder until it reconnects with new key
-  material. Rotating the stream's passphrase limits both, since a capture
-  made under an old passphrase fails the key check. The passphrase in the
-  2xx crosses the hook link in clear, like the request: keep that link on
-  the private network.
+  app key, 2026-11-13, via `scripts/obs-ingest.js --app-key`, #101) and
+  sapflow's own caller. An encoder that reused key material on a new
+  connection would be refused, so check Larix and any hardware encoder
+  before turning app keys on; Larix has not been checked.
+- What remains:
+  - A copy that reaches sapflow before the original wins it. That needs an
+    attacker who can delay or drop the encoder's packets on the way, who
+    could deny the encoder service anyway.
+  - A restart forgets every owner and admission, so key material captured
+    before it can be replayed after it, until the app rotates the stream's
+    passphrase (a capture under an old passphrase fails the key check).
+  - So does eviction, which takes a flood of new key material from
+    connections that have ended: owners take minutes of every handshake
+    the listener will answer.
+  - A caller the listener refuses before the application hears of it
+    (connections full, `BACKLOG`; the handshake rate limit; a refused
+    handshake) owns nothing, so its key material can be replayed later.
+  - The passphrase in the 2xx crosses the hook link in clear, like the
+    request: keep that link on the private network.
 
 ## Ingest addresses v4v hands to encoders
 

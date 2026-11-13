@@ -286,25 +286,28 @@ Notes for the release after 0.2.0-rc.1.
   header refuses as an unusable answer does. RTMP and WHIP
   are unchanged, and with the switch off so is every request. The
   passphrase is never logged. See `docs/v4v-contract.md`.
-- With `SAPFLOW_SRT_APP_KEYS`, a replayed SRT handshake is refused before
-  the path is claimed. A passing key check proves only that the key
-  material was made with the passphrase, and it travels in clear, so
-  sapflow keeps a SHA-256 digest of the part of each admitted caller's key
-  material that the check binds, in memory (128 per stream path, 4,096 in
-  all, oldest evicted first, no time limit), and refuses it from any new
-  connection with `BADSECRET`, counted by the failed-attempt throttle and
-  logged without the key material or digest. This covers keys checked
-  against the app's passphrase and the global one alike, and lookups span
-  stream paths. A conclusion the same caller resends while its connection
-  waits or is open is answered there and never refused. Real encoders make
-  fresh key material per connection (sapflow's caller, libsrt 1.5.1 and
-  OBS 32.0.4 checked, reconnects included; Larix not checked). A restart
-  or eviction lets older captures through again, key material is kept
-  only once its caller is accepted (an attempt refused for another reason,
-  such as the app being down, can be replayed later), and a replay that beats
-  the original caller's own admission can win; rotating the stream's
-  passphrase limits both. With the switch off nothing changes: the path is
-  claimed before any key is checked there, so the guard could not help.
+- With `SAPFLOW_SRT_APP_KEYS`, a replayed SRT handshake is refused. A
+  passing key check proves only that the key material was made with the
+  passphrase, and it travels in clear. The first caller to connect with
+  key material owns it, recorded before the throttle, the app or any
+  limit; the same key material from any other address or caller socket is
+  refused at once with `BADSECRET`, without asking the app or counting
+  against the throttle, however the owner's attempt ends, and once a
+  caller is admitted its key material is refused to everyone. sapflow keeps
+  a SHA-256 digest of the part of the key material the check binds, in
+  memory: 16,384 owners and 128 admitted per stream path (4,096 in all),
+  oldest ended first, never one whose connection is waiting or open, no
+  time limit. It covers the app's passphrase and the global one, and
+  spans stream paths. Real encoders make fresh key material per
+  connection (sapflow's caller, libsrt 1.5.1 and OBS 32.0.4 checked,
+  reconnects included); one that reused it would be refused, so check
+  Larix and hardware encoders before turning app keys on. Residuals: a
+  copy that reaches sapflow before the original needs an attacker on the
+  path; a restart forgets every owner; eviction needs a long flood of
+  ended connections; callers the listener refuses before the application
+  hears of them (`BACKLOG`, the handshake rate limit) own nothing. With the
+  switch off nothing changes: the path is claimed before any key is
+  checked there, so the guard could not help.
 - The "SRT publisher accepted" log line gives `encryption` (`none`,
   `deployment-key`, `app-key` or `session-key`) and `key_len`, so the
   logs show which publishers still connect without a passphrase, or with
