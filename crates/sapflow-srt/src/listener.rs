@@ -641,9 +641,7 @@ impl<S: BuildHasher> Listener<S> {
     pub fn check_key(&self, id: ConnId, crypto: &CryptoConfig) -> Result<KeySize, KeyCheckError> {
         let p = self.pending(id).ok_or(KeyCheckError::NotPending)?;
         let km = p.km().ok_or(KeyCheckError::NoKeyMaterial)?;
-        let config = for_km(crypto, km)?;
-        Decryptor::new(&config, km)?;
-        Ok(config.key_size)
+        check_key_material(km, crypto)
     }
 
     /// Accepts a waiting caller only if its key material matches the
@@ -1000,6 +998,19 @@ impl<S: BuildHasher> Listener<S> {
 
 /// The application's passphrase and refresh settings at the key length the
 /// caller chose.
+/// [`Listener::check_key`] for key material copied from a waiting caller
+/// ([`Listener::pending_key_material`]), so it can be checked away from the
+/// listener: in the task that decides on the caller, before anything is
+/// reserved for it. Same result, and same cost (one PBKDF2 derivation); never
+/// [`KeyCheckError::NotPending`] or [`KeyCheckError::NoKeyMaterial`]. The
+/// caller is still answered by the listener, and a failed check must still
+/// end in [`Listener::reject`].
+pub fn check_key_material(km: &[u8], crypto: &CryptoConfig) -> Result<KeySize, KeyCheckError> {
+    let config = for_km(crypto, km)?;
+    Decryptor::new(&config, km)?;
+    Ok(config.key_size)
+}
+
 fn for_km(crypto: &CryptoConfig, km: &[u8]) -> Result<CryptoConfig, KeyCheckError> {
     let mut config = crypto.clone();
     config.key_size = crate::crypto::km_key_size(km)?;

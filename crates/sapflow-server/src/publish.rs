@@ -61,6 +61,15 @@ impl Admitted {
     }
 }
 
+/// Why a scoped SRT caller was refused ([`Publication::begin_scoped_srt`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopedRefusal {
+    Policy(Refusal),
+    /// Its key material does not match the session's passphrase and key
+    /// length, or it sent none. Nothing was reserved or claimed for it.
+    Key(sapflow_srt::KeyCheckError),
+}
+
 /// A live publisher went over the bitrate cap and is dropped.
 #[derive(Debug)]
 pub struct OverRate;
@@ -330,13 +339,51 @@ impl Publication {
         Ok(Admitted { srt_key })
     }
 
+    /// The tests' entry point for an SRT publication: authorised and claimed
+    /// at once, and in scoped mode without a key check. The listener goes
+    /// through `srt::admit`, which checks the key before any claim.
+    #[cfg(test)]
     pub async fn begin_srt(
         app: &Arc<App>,
         req: &PublishRequest,
         from: IpAddr,
     ) -> Result<Self, Refusal> {
-        let Some(manager) = &app.publish_sessions else {
+        if app.publish_sessions.is_none() {
             return Self::begin_authorised(app, req, SourceKind::Ts, from).await;
+        }
+        Self::begin_scoped(app, req, from, None)
+            .await
+            .map_err(|refusal| match refusal {
+                ScopedRefusal::Policy(refusal) => refusal,
+                // Unreachable: nothing was asked to check.
+                ScopedRefusal::Key(_) => Refusal::Request(PublishError::Unauthorized),
+            })
+    }
+
+    /// A scoped SRT caller, with the key material it sent (`None` if none):
+    /// checked against the session's passphrase before anything is reserved
+    /// for it, so a caller the strict accept would refuse burns no connection
+    /// epoch, writes nothing to the session store and resumes no held stage.
+    /// A key refusal counts against the address's throttle.
+    pub async fn begin_scoped_srt(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        from: IpAddr,
+        key_material: Option<Vec<u8>>,
+    ) -> Result<Self, ScopedRefusal> {
+        Self::begin_scoped(app, req, from, Some(key_material)).await
+    }
+
+    async fn begin_scoped(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        from: IpAddr,
+        key_material: Option<Option<Vec<u8>>>,
+    ) -> Result<Self, ScopedRefusal> {
+        let Some(manager) = &app.publish_sessions else {
+            return Err(ScopedRefusal::Policy(Refusal::Request(
+                PublishError::Unauthorized,
+            )));
         };
         if !app
             .auth_throttle
@@ -344,20 +391,36 @@ impl Publication {
             .unwrap_or_else(|e| e.into_inner())
             .allowed(from, Instant::now())
         {
-            return Err(Refusal::Throttled);
+            return Err(ScopedRefusal::Policy(Refusal::Throttled));
         }
-        let scope = manager.admit(req).await.map_err(|error| {
-            if error == crate::publish_sessions::Error::Denied {
+        use crate::publish_sessions::{Error, Refused};
+        let admitted = match key_material {
+            None => manager.admit(req).await.map_err(Refused::Session),
+            Some(key_material) => manager.admit_with_key(req, key_material).await,
+        };
+        let scope = admitted.map_err(|refused| {
+            if matches!(refused, Refused::Session(Error::Denied) | Refused::Key(_)) {
                 app.auth_throttle
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .failed(from, Instant::now());
             }
-            match error {
-                crate::publish_sessions::Error::Busy => Refusal::AlreadyLive,
-                _ => Refusal::Request(PublishError::Unauthorized),
+            match refused {
+                Refused::Key(error) => ScopedRefusal::Key(error),
+                Refused::Session(Error::Busy) => ScopedRefusal::Policy(Refusal::AlreadyLive),
+                Refused::Session(_) => {
+                    ScopedRefusal::Policy(Refusal::Request(PublishError::Unauthorized))
+                }
             }
         })?;
+        Self::claim_scoped(app, req, scope).map_err(ScopedRefusal::Policy)
+    }
+
+    fn claim_scoped(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        scope: ScopedLease,
+    ) -> Result<Self, Refusal> {
         let (limits, grace) = scope
             .limits()
             .map_err(|_| Refusal::Request(PublishError::Unauthorized))?;

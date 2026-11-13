@@ -38,7 +38,7 @@ fn fixture(stub: &Stub, grace: Duration) -> Fixture {
 }
 
 /// Serves SRT for `app` on a loopback port, as `serve` does.
-fn origin(app: &Arc<App>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+pub(crate) fn origin(app: &Arc<App>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let (socket, pending, got) =
         bind_udp(SocketAddr::from(([127, 0, 0, 1], 0)), RCVBUF_MIN).expect("bind");
     let addr = socket.local_addr().expect("addr");
@@ -49,16 +49,16 @@ fn origin(app: &Arc<App>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, task)
 }
 
-fn key(passphrase: &str, size: KeySize) -> CryptoConfig {
+pub(crate) fn key(passphrase: &str, size: KeySize) -> CryptoConfig {
     CryptoConfig::new(passphrase.as_bytes().to_vec(), size).expect("passphrase")
 }
 
 /// One encoder over a real UDP socket.
-struct Encoder {
+pub(crate) struct Encoder {
     caller: Caller,
     socket: TokioUdp,
-    connected: bool,
-    closed: Option<CallerCloseReason>,
+    pub(crate) connected: bool,
+    pub(crate) closed: Option<CallerCloseReason>,
     /// The last conclusion handshake with key material it sent, as an
     /// eavesdropper captures it.
     conclusion: Option<Vec<u8>>,
@@ -87,12 +87,34 @@ impl Encoder {
         encoder
     }
 
+    /// [`call`](Self::call) with another stream id.
+    pub(crate) async fn call_as(
+        origin: SocketAddr,
+        stream_id: &str,
+        crypto: Option<CryptoConfig>,
+    ) -> Self {
+        let mut encoder = Self::start_as(origin, stream_id, crypto, 0).await;
+        encoder
+            .run_until(|e| e.connected || e.closed.is_some())
+            .await;
+        encoder
+    }
+
     /// An encoder for `origin` that has sent nothing yet.
     async fn start(origin: SocketAddr, crypto: Option<CryptoConfig>, drops: u32) -> Self {
+        Self::start_as(origin, STREAM_ID, crypto, drops).await
+    }
+
+    async fn start_as(
+        origin: SocketAddr,
+        stream_id: &str,
+        crypto: Option<CryptoConfig>,
+        drops: u32,
+    ) -> Self {
         let socket = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
         let caller = Caller::new(
             CallerConfig {
-                stream_id: STREAM_ID.into(),
+                stream_id: stream_id.into(),
                 crypto,
                 ..CallerConfig::default()
             },
@@ -119,7 +141,7 @@ impl Encoder {
     }
 
     /// Runs the caller's I/O for `period`.
-    async fn pump(&mut self, period: Duration) {
+    pub(crate) async fn pump(&mut self, period: Duration) {
         let until = Instant::now() + period;
         let mut buf = vec![0u8; 2048];
         loop {
@@ -161,7 +183,7 @@ impl Encoder {
     }
 
     /// Sends the whole fixture, a datagram at a time.
-    async fn send_media(&mut self) {
+    pub(crate) async fn send_media(&mut self) {
         for chunk in MEDIA.chunks(1316) {
             while self.caller.enqueue(Instant::now(), chunk.to_vec()).is_err() {
                 self.pump(Duration::from_millis(2)).await;
@@ -171,12 +193,12 @@ impl Encoder {
         self.pump(Duration::from_millis(200)).await;
     }
 
-    async fn stop(&mut self) {
+    pub(crate) async fn stop(&mut self) {
         self.caller.stop(Instant::now());
         self.pump(Duration::from_millis(50)).await;
     }
 
-    fn rejected(&self) -> Option<u32> {
+    pub(crate) fn rejected(&self) -> Option<u32> {
         match self.closed {
             Some(CallerCloseReason::Rejected(code)) => Some(code),
             _ => None,
@@ -426,9 +448,15 @@ async fn the_passphrase_never_reaches_logs_or_errors() {
     }
     // An admission holding the key prints the path only.
     let req = sapflow_core::PublishRequest::parse_srt_stream_id(STREAM_ID).expect("request");
-    let admission = crate::srt::admit(&fixture.app, STREAM_ID, "127.0.0.1".parse().expect("ip"), 0)
-        .await
-        .expect("admitted");
+    let admission = crate::srt::admit(
+        &fixture.app,
+        STREAM_ID,
+        "127.0.0.1".parse().expect("ip"),
+        0,
+        None,
+    )
+    .await
+    .expect("admitted");
     texts.push(format!("{admission:?}"));
     assert!(matches!(admission, Admission::Pending(_)));
     texts.push(format!("{:?}", fixture.app.config));
@@ -501,7 +529,7 @@ async fn a_caller_gone_before_the_app_answered_claims_nothing_and_is_not_counted
     // More than the throttle's ten: none of them counts.
     for _ in 0..12 {
         let Ok(Admission::Pending(keyed)) =
-            crate::srt::admit(&fixture.app, STREAM_ID, peer.ip(), 0).await
+            crate::srt::admit(&fixture.app, STREAM_ID, peer.ip(), 0, None).await
         else {
             panic!("expected a keyed admission")
         };

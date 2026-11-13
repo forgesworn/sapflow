@@ -247,6 +247,12 @@ impl Session {
         (self.generation, self.attached)
     }
 
+    /// When a stream held for a reconnect ends, if it is held.
+    #[cfg(test)]
+    pub(crate) fn outage_deadline(&self) -> Option<Instant> {
+        self.outage_deadline
+    }
+
     pub fn owns_connection(&self, generation: u64) -> bool {
         self.generation == generation && self.attached
     }
