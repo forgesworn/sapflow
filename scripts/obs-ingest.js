@@ -9,6 +9,20 @@
 //   node scripts/obs-ingest.js --bin <sapflow> --out <dir> --protocol srt|rtmp
 //        [--seconds 60] [--obs-keyint 1] [--bitrate 2500] [--restart-at <s>]
 //        [--base 47400] [--obs /Applications/OBS.app]
+//   node scripts/obs-ingest.js --remote --out <dir> --protocol srt|rtmp
+//        [--seconds 60] [--obs-keyint 1] [--bitrate 2500] < creds.json
+//
+// --remote streams to a real server instead (for a path across the
+// internet). creds.json is {"server": "srt://...", "key": ""} or
+// {"server": "rtmps://.../live", "key": "..."}, read on standard input so
+// the credentials reach no command line; keep it mode 0600, outside the
+// repository, or pipe it from a keychain. No local sapflow is started, and
+// the run lasts --seconds; the server's own logs are the result.
+//
+// In every mode the test profile's files are overwritten before the changed
+// config goes to the Trash, and every OBS log kept (in --out, and in the
+// Trash copy) has the server, keys, URLs and IP addresses removed. Ctrl-C
+// or SIGTERM ends the run early and still restores the config.
 //
 // As scripts/whip-obs.js:
 //   1. refuses to run if OBS is already running (never touches the user's
@@ -40,12 +54,26 @@ const path = require('node:path');
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const bin = opt('bin'), out = opt('out'), protocol = opt('protocol');
-if (!bin || !out || !['srt', 'rtmp'].includes(protocol)) {
-  console.error('--bin, --out and --protocol srt|rtmp are required'); process.exit(2);
+const remote = args.includes('--remote');
+if ((!bin && !remote) || !out || !['srt', 'rtmp'].includes(protocol)) {
+  console.error('--bin (or --remote), --out and --protocol srt|rtmp are required'); process.exit(2);
 }
 const seconds = +opt('seconds', 60), base = +opt('base', 47400);
 const obsKeyint = +opt('obs-keyint', 1), bitrate = +opt('bitrate', 2500);
 const restartAt = opt('restart-at') === undefined ? null : +opt('restart-at');
+let creds = null;
+if (remote) {
+  // A fixed message: a parse error would echo the start of the input.
+  try { creds = JSON.parse(fs.readFileSync(0, 'utf8')); } catch {
+    console.error('--remote reads {"server": ..., "key": ...} as JSON on standard input; that was not JSON'); process.exit(2);
+  }
+  const scheme = protocol === 'srt' ? /^srt:\/\// : /^rtmps?:\/\//;
+  if (!creds || typeof creds.server !== 'string' || !scheme.test(creds.server)
+    || (creds.key !== undefined && typeof creds.key !== 'string')) {
+    console.error(`--remote needs "server", a string starting ${protocol === 'srt' ? 'srt://' : 'rtmp:// or rtmps://'}, and "key", a string, if any`); process.exit(2);
+  }
+  if (restartAt !== null) { console.error('--restart-at restarts a local sapflow; it does not apply to --remote'); process.exit(2); }
+}
 const obsApp = opt('obs', '/Applications/OBS.app');
 const OBS = path.join(obsApp, 'Contents/MacOS/OBS');
 const NAME = 'Ingest-OBS-test';
@@ -56,6 +84,57 @@ const USER = 'obs', PASS = crypto.randomBytes(12).toString('hex');
 const PASSPHRASE = 'obs-' + crypto.randomBytes(12).toString('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 fs.mkdirSync(out, { recursive: true });
+
+// Ctrl-C, SIGTERM or SIGHUP ends the run's waits (pause), so the cleanup
+// still ends OBS and restores the config; without this, OBS (detached) would
+// keep streaming with the key in its profile.
+let interrupted = false;
+const wakers = new Set();
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    if (!interrupted) console.error(`${sig}: ending the run; restoring OBS's config, which takes up to a minute`);
+    interrupted = true;
+    for (const wake of wakers) wake();
+  });
+}
+const pause = (ms) => new Promise((resolve, reject) => {
+  if (interrupted) return reject(new Error('interrupted'));
+  const wake = () => { clearTimeout(timer); wakers.delete(wake); reject(new Error('interrupted')); };
+  const timer = setTimeout(() => { wakers.delete(wake); resolve(); }, ms);
+  wakers.add(wake);
+});
+
+// Everything secret or identifying a log could hold: this run's own
+// credentials, and in remote mode the server, its host, the key and every
+// value in either. Removed by value first, then by shape.
+function secrets() {
+  const found = [PASS, PASSPHRASE];
+  if (creds) {
+    const key = creds.key || '';
+    found.push(creds.server, key, ...key.split(/[?&=:]/));
+    try {
+      const u = new URL(creds.server);
+      found.push(u.host, u.hostname);
+      for (const v of u.searchParams.values()) found.push(v, ...v.split(':'));
+    } catch {}
+  }
+  return [...new Set(found)].filter((x) => x && x.length >= 6).sort((a, b) => b.length - a.length);
+}
+function redact(text) {
+  for (const secret of secrets()) text = text.split(secret).join('<redacted>');
+  return text
+    .replace(/(srt|rtmps?):\/\/\S+/g, '$1://<redacted>')
+    .replace(/(key|streamid|passphrase|pass)=\S+/gi, '$1=<redacted>')
+    .replace(/\b\d{1,3}(\.\d{1,3}){3}\b/g, '<ip>');
+}
+function redactFile(file) {
+  try { fs.writeFileSync(file, redact(fs.readFileSync(file, 'utf8'))); } catch {}
+}
+// The test profile held the server and key, maybe in OBS's backups too.
+function blankProfile() {
+  const pdir = path.join(CONFIG, 'basic/profiles', NAME);
+  try { for (const f of fs.readdirSync(pdir)) fs.writeFileSync(path.join(pdir, f), ''); } catch {}
+}
 
 function trash(p) {
   const dest = path.join(os.homedir(), '.Trash', path.basename(p) + '-' + Date.now());
@@ -85,6 +164,7 @@ function clip() {
 }
 
 function service() {
+  if (remote) return { server: creds.server, key: creds.key || '' };
   if (protocol === 'srt') {
     // OBS's SRT output is FFmpeg's libsrt: latency in microseconds.
     const q = `streamid=publish:live/${EVENT}:${USER}:${PASS}&latency=2000000&passphrase=${PASSPHRASE}&pbkeylen=32`;
@@ -150,7 +230,7 @@ async function waitReady(ms) {
   const until = Date.now() + ms;
   while (Date.now() < until) {
     if ((await playlist()).includes('#EXTINF')) return true;
-    await sleep(250);
+    await pause(250);
   }
   return false;
 }
@@ -190,7 +270,7 @@ function analyse(info) {
   const recs = fs.existsSync(recDir) ? fs.readdirSync(recDir, { recursive: true }).map((f) => path.join(recDir, f)).filter((f) => f.endsWith('.mp4')).sort() : [];
   let obsLog = '';
   try { obsLog = fs.readFileSync(path.join(out, 'obs-own-log.txt'), 'utf8'); } catch {}
-  const obsLines = obsLog.split('\n').filter((l) => /Reconnect|reconnect|dropped|Output .* stopping|Number of (lagged|skipped)|encoder|Stream output/i.test(l))
+  const obsLines = obsLog.split('\n').filter((l) => /Reconnect|reconnect|dropped|Output .* stopping|Number of (lagged|skipped)|encoder|Stream output|Connecting|Connection to|failed/i.test(l))
     .map((l) => l.slice(0, 200)).slice(0, 40);
   return { runs: facts, recordings: recs.map(probe), obs_log: obsLines, ...info };
 }
@@ -204,9 +284,11 @@ function analyse(info) {
   execFileSync('rsync', ['-a', CONFIG + '/', backup + '/']);
   let srv = null, obs = null;
   try {
-    srv = sapflow();
-    await sleep(1000);
-    if (srv.exitCode !== null) throw new Error('sapflow exited at start');
+    if (!remote) {
+      srv = sapflow();
+      await pause(1000);
+      if (srv.exitCode !== null) throw new Error('sapflow exited at start');
+    }
     writeProfile(source);
     if (obsPids().length) throw new Error('OBS started meanwhile; not launching');
     const fd = fs.openSync(path.join(out, 'obs.stdout.log'), 'w');
@@ -214,38 +296,53 @@ function analyse(info) {
     obs = spawn(OBS, ['--profile', NAME, '--collection', NAME, '--startstreaming', '--disable-shutdown-check', '--websocket_port', String(port.websocket)],
       { stdio: ['ignore', fd, fd], detached: true });
     info.obs_pid = obs.pid;
+    info.launched_at = new Date(launched).toISOString();
+    if (remote) {
+      await pause(seconds * 1000);
+      // Whether OBS lasted the run; the server's logs say whether it streamed.
+      if (!running(obs.pid)) throw new Error('OBS exited before the end of the run');
+      throw Object.assign(new Error('done'), { done: true });
+    }
     info.ready = await waitReady(45000);
     info.first_playlist = (await playlist()).split('\n').filter((l) => /^#EXT-X-TARGETDURATION|^#EXTINF/.test(l)).slice(0, 4);
     info.ready_after_launch_s = info.ready ? Math.round((Date.now() - launched) / 100) / 10 : null;
     if (info.ready && restartAt !== null) {
-      await sleep(restartAt * 1000);
+      await pause(restartAt * 1000);
       const stopped = Date.now();
       await stopChild(srv);
-      await sleep(3000);
+      await pause(3000);
       srv = sapflow();
       info.back = await waitReady(60000);
       info.back_after_stop_s = info.back ? Math.round((Date.now() - stopped) / 100) / 10 : null;
     }
-    if (info.ready) await sleep(seconds * 1000);
-    info.extinf_at_end = ((await playlist()).match(/#EXTINF:([\d.]+)/g) || []).map((x) => +x.slice(8));
-  } catch (e) { info.error = String(e && e.message || e); }
+    if (info.ready) await pause(seconds * 1000);
+    if (!remote) info.extinf_at_end = ((await playlist()).match(/#EXTINF:([\d.]+)/g) || []).map((x) => +x.slice(8));
+  } catch (e) { if (!(e && e.done)) info.error = String(e && e.message || e); }
   finally {
     if (obs && running(obs.pid)) {
       try { process.kill(obs.pid, 'SIGTERM'); } catch {}
       for (let i = 0; i < 20 && running(obs.pid); i++) await sleep(500);
       if (running(obs.pid)) { try { process.kill(obs.pid, 'SIGTERM'); } catch {} }
       for (let i = 0; i < 60 && running(obs.pid); i++) await sleep(500);
-      info.obs_ended = !running(obs.pid);
     }
+    if (obs) info.obs_ended = !running(obs.pid);
     await sleep(4000);
     await stopChild(srv);
-    if (obs && running(obs.pid)) { info.restore = 'skipped: OBS still running'; }
-    else {
-      try {
-        const ldir = path.join(CONFIG, 'logs');
-        const newest = fs.readdirSync(ldir).filter((f) => f.endsWith('.txt')).map((f) => [f, fs.statSync(path.join(ldir, f)).mtimeMs]).sort((a, b) => b[1] - a[1])[0];
-        if (newest) fs.copyFileSync(path.join(ldir, newest[0]), path.join(out, 'obs-own-log.txt'));
-      } catch {}
+    if (interrupted) info.error = 'interrupted';
+    redactFile(path.join(out, 'obs.stdout.log'));
+    if (obs && running(obs.pid)) {
+      // Not restored, but the key is not left in the profile.
+      blankProfile();
+      info.restore = 'skipped: OBS still running';
+    } else {
+      const ldir = path.join(CONFIG, 'logs');
+      let logs = [];
+      try { logs = fs.readdirSync(ldir).filter((f) => f.endsWith('.txt')); } catch {}
+      // Every log, so that the Trash copy holds no credentials either.
+      for (const f of logs) redactFile(path.join(ldir, f));
+      const newest = logs.map((f) => [f, fs.statSync(path.join(ldir, f)).mtimeMs]).sort((a, b) => b[1] - a[1])[0];
+      if (newest) fs.copyFileSync(path.join(ldir, newest[0]), path.join(out, 'obs-own-log.txt'));
+      blankProfile();
       const modified = trash(CONFIG);
       execFileSync('rsync', ['-a', backup + '/', CONFIG + '/']);
       const d = spawnSync('diff', ['-r', backup, CONFIG]);
