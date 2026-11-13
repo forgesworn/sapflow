@@ -6,6 +6,13 @@
 //! quarter round trip (at most eight times) once the packet's delivery
 //! deadline is under three round trips away, but never once a
 //! retransmission could no longer arrive before the deadline.
+//!
+//! A loss can also be listed before it is first asked for ([`LossList::hold`]):
+//! the receiver holds the first report briefly once it has seen the path
+//! reorder packets, in case the missing ones are only late. A held loss is
+//! always reported: when its hold ends (or sooner, never inside the last
+//! three round trips before its deadline), and at once if the list has to
+//! give it up to stay bounded.
 
 use crate::seq::Seq;
 
@@ -14,7 +21,8 @@ pub const MAX_FAST_REQUESTS: u32 = 8;
 /// Ranges tracked at most. The list is scanned on every packet, so a
 /// sender that leaves every other packet missing must not grow it with the
 /// buffer; gaps beyond this are reported once and then left to the
-/// too-late drop.
+/// too-late drop. A held loss pushed off the list is reported at the next
+/// [`LossList::due`] all the same.
 pub const MAX_RANGES: usize = 1024;
 /// Within this many round trips of the deadline, ask every quarter round trip.
 const NEAR_DEADLINE_RTTS: i64 = 3;
@@ -35,16 +43,29 @@ pub struct Loss {
     /// When the packet that revealed the loss is to be delivered: the lost
     /// ones are due no later (microseconds, the listener's clock).
     pub deadline: i64,
-    /// When the range was last asked for (microseconds, the listener's
-    /// clock).
+    /// When the range was last asked for or, while its first report is held
+    /// (`requests` is 0), when that report is due (microseconds, the
+    /// listener's clock).
     pub last_request: i64,
     /// How many times the range has been asked for, the first report
-    /// included.
+    /// included; 0 while the first report is held.
     pub requests: u32,
     /// How many requests were made within three round trips of the deadline,
     /// counted up to [`MAX_FAST_REQUESTS`]; after that the ordinary interval
     /// applies.
     pub fast_requests: u32,
+    /// When the loss was found (microseconds, the listener's clock).
+    pub found: i64,
+}
+
+/// What [`LossList::take`] knew of a sequence number that arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    /// When its loss was found (microseconds, the listener's clock).
+    pub found: i64,
+    /// Whether its loss had been asked for: false while the first report
+    /// was still held.
+    pub reported: bool,
 }
 
 /// The round trip and how long to wait before asking again (at least the
@@ -72,6 +93,11 @@ impl Timing {
 pub struct LossList {
     /// Sorted, not overlapping.
     entries: Vec<Loss>,
+    /// Held losses that had to leave `entries` to keep it bounded, before
+    /// their first report: [`due`](Self::due) reports them first. Each holds
+    /// sequence numbers that left `entries`, so between them the two never
+    /// hold more missing numbers than were listed.
+    pushed_out: Vec<(Seq, Seq)>,
 }
 
 impl LossList {
@@ -80,9 +106,9 @@ impl LossList {
         Self::default()
     }
 
-    /// Whether nothing is missing.
+    /// Whether nothing is missing and no report is owed.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.pushed_out.is_empty()
     }
 
     /// Number of ranges on the list; [`count`](Self::count) gives the number
@@ -111,41 +137,92 @@ impl LossList {
 
     /// Records `first..=last` as lost, asked for once at `now`.
     pub fn add(&mut self, first: Seq, last: Seq, now: i64, deadline: i64) {
-        if last < first || self.entries.len() >= MAX_RANGES {
-            return;
-        }
-        let e = Loss {
+        self.insert(Loss {
             first,
             last,
             deadline,
             last_request: now,
             requests: 1,
             fast_requests: 0,
-        };
+            found: now,
+        });
+    }
+
+    /// Records `first..=last` as lost at `now` without asking for it yet:
+    /// its first report is held until `until`, in case the packets are only
+    /// late, but never into the last three round trips before `deadline`,
+    /// where a loss is asked for every quarter round trip. Returns whether it
+    /// was listed. It is not when the list is full, the range overlaps one
+    /// already listed, or the deadline leaves no time to hold; the caller
+    /// must then ask for it at once.
+    pub fn hold(
+        &mut self,
+        first: Seq,
+        last: Seq,
+        now: i64,
+        deadline: i64,
+        until: i64,
+        t: Timing,
+    ) -> bool {
+        let until = until.min(hold_limit(deadline, t.rtt.max(1)));
+        until > now
+            && self.insert(Loss {
+                first,
+                last,
+                deadline,
+                last_request: until,
+                requests: 0,
+                fast_requests: 0,
+                found: now,
+            })
+    }
+
+    /// Lists `e`; false if the list is full, the range is empty or it
+    /// overlaps one already listed.
+    fn insert(&mut self, e: Loss) -> bool {
+        if e.last < e.first || self.entries.len() >= MAX_RANGES {
+            return false;
+        }
         // Gaps are found at the leading edge, so this is nearly always a push.
         let at = self
             .entries
             .iter()
-            .rposition(|x| x.last < first)
+            .rposition(|x| x.last < e.first)
             .map_or(0, |i| i + 1);
-        if self.entries.get(at).is_some_and(|x| x.first <= last) {
+        if self.entries.get(at).is_some_and(|x| x.first <= e.last) {
             // Overlaps what is already known; keep the existing record.
-            return;
+            return false;
         }
         self.entries.insert(at, e);
+        true
+    }
+
+    /// Keeps the list within [`MAX_RANGES`], dropping the latest losses; a
+    /// held one is kept to be reported at the next [`due`](Self::due).
+    fn bound(entries: &mut Vec<Loss>, pushed_out: &mut Vec<(Seq, Seq)>) {
+        for e in entries.drain(MAX_RANGES.min(entries.len())..) {
+            if e.requests == 0 {
+                pushed_out.push((e.first, e.last));
+            }
+        }
     }
 
     /// `s` arrived. Returns whether it was on the list.
     pub fn remove(&mut self, s: Seq) -> bool {
-        let Some(i) = self
+        self.take(s).is_some()
+    }
+
+    /// `s` arrived: takes it off the list, and says when its loss was found
+    /// and whether it had been asked for; `None` if it was not listed.
+    pub fn take(&mut self, s: Seq) -> Option<Taken> {
+        let i = self
             .entries
             .iter()
-            .position(|e| e.first <= s && s <= e.last)
-        else {
-            return false;
-        };
-        let Some(e) = self.entries.get_mut(i) else {
-            return false;
+            .position(|e| e.first <= s && s <= e.last)?;
+        let e = self.entries.get_mut(i)?;
+        let taken = Taken {
+            found: e.found,
+            reported: e.requests > 0,
         };
         match (e.first == s, e.last == s) {
             (true, true) => {
@@ -159,10 +236,10 @@ impl LossList {
                 tail.first = s.next();
                 self.entries.insert(i + 1, tail);
                 // At the limit the latest losses are no longer tracked.
-                self.entries.truncate(MAX_RANGES);
+                Self::bound(&mut self.entries, &mut self.pushed_out);
             }
         }
-        true
+        Some(taken)
     }
 
     /// Forgets everything before `s` (delivered or given up on).
@@ -173,6 +250,15 @@ impl LossList {
             }
             if e.first < s {
                 e.first = s;
+            }
+            true
+        });
+        self.pushed_out.retain_mut(|(first, last)| {
+            if *last < s {
+                return false;
+            }
+            if *first < s {
+                *first = s;
             }
             true
         });
@@ -202,20 +288,37 @@ impl LossList {
                 });
             }
         }
-        kept.truncate(MAX_RANGES);
+        Self::bound(&mut kept, &mut self.pushed_out);
         self.entries = kept;
+        let mut owed = Vec::with_capacity(self.pushed_out.len());
+        for (a, b) in self.pushed_out.drain(..) {
+            if b < first || last < a {
+                owed.push((a, b));
+                continue;
+            }
+            if a < first {
+                owed.push((a, first.prev()));
+            }
+            if last < b {
+                owed.push((last.next(), b));
+            }
+        }
+        self.pushed_out = owed;
     }
 
     /// Forgets every loss.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.pushed_out.clear();
     }
 
-    /// The losses to ask for again at `now`, marked as asked; at most
-    /// `limit` ranges, earliest first.
+    /// The losses to ask for at `now`, marked as asked; at most `limit`
+    /// ranges: held losses pushed off the list first, then the rest earliest
+    /// first.
     pub fn due(&mut self, now: i64, t: Timing, limit: usize) -> Vec<(Seq, Seq)> {
         let rtt = t.rtt.max(1);
-        let mut out = Vec::new();
+        let owed = self.pushed_out.len().min(limit);
+        let mut out: Vec<(Seq, Seq)> = self.pushed_out.drain(..owed).collect();
         for e in &mut self.entries {
             if out.len() >= limit {
                 break;
@@ -237,12 +340,22 @@ impl LossList {
     /// has just run at `now`: never earlier than `now`, and nothing for a
     /// loss a retransmission could no longer fill in time.
     pub fn next_due(&self, now: i64, t: Timing) -> Option<i64> {
+        if !self.pushed_out.is_empty() {
+            return Some(now);
+        }
         self.entries
             .iter()
             .filter_map(|e| e.next_request(now, t))
             .map(|at| at.max(now))
             .min()
     }
+}
+
+/// The latest a loss's first report may be held to: three round trips
+/// before its deadline, where [`LossList::due`] starts asking every quarter
+/// round trip.
+fn hold_limit(deadline: i64, rtt: i64) -> i64 {
+    deadline.saturating_sub(NEAR_DEADLINE_RTTS.saturating_mul(rtt))
 }
 
 impl Loss {
@@ -254,9 +367,14 @@ impl Loss {
     /// When to ask for this loss next, seen from `now`: a round trip after
     /// the last request, or a quarter round trip once near the deadline;
     /// `None` once a retransmission asked for then could not arrive in time
-    /// (it needs a round trip: the NAK there, the packet back).
+    /// (it needs a round trip: the NAK there, the packet back). A held first
+    /// report is always made: when its hold ends, or once three round trips
+    /// from the deadline if the round trip has grown since.
     fn next_request(&self, now: i64, t: Timing) -> Option<i64> {
         let rtt = t.rtt.max(1);
+        if self.requests == 0 {
+            return Some(self.last_request.min(hold_limit(self.deadline, rtt)));
+        }
         let ordinary = self
             .last_request
             .saturating_add(t.retry.max(rtt).max(MIN_INTERVAL));
@@ -428,6 +546,175 @@ mod tests {
             asked += l.due(t, Timing::rtt(3), 10).len();
         }
         assert_eq!(asked, 10, "every 10 ms over 100 ms");
+    }
+
+    #[test]
+    fn a_held_loss_is_due_when_its_hold_ends_then_as_usual() {
+        let mut l = LossList::new();
+        let t = Timing::rtt(RTT);
+        assert!(l.hold(s(1), s(2), 0, 2_000_000, 20_000, t));
+        assert!(!l.is_empty());
+        assert_eq!(l.next_due(0, t), Some(20_000), "the timer wakes for it");
+        assert!(l.due(19_999, t, 10).is_empty(), "not before");
+        assert_eq!(l.due(20_000, t, 10), vec![(s(1), s(2))]);
+        assert_eq!(l.next_due(20_000, t), Some(20_000 + RTT));
+        assert_eq!(l.due(20_000 + RTT, t, 10).len(), 1);
+    }
+
+    #[test]
+    fn take_says_when_a_loss_was_found_and_whether_it_was_asked_for() {
+        let mut l = LossList::new();
+        let t = Timing::rtt(RTT);
+        l.add(s(1), s(1), 5, 2_000_000);
+        assert!(l.hold(s(3), s(5), 7, 2_000_000, 30_000, t));
+        assert_eq!(
+            l.take(s(1)),
+            Some(Taken {
+                found: 5,
+                reported: true
+            })
+        );
+        let held = Some(Taken {
+            found: 7,
+            reported: false,
+        });
+        assert_eq!(l.take(s(4)), held, "a split keeps the hold");
+        assert_eq!(l.take(s(5)), held);
+        assert_eq!(l.take(s(9)), None);
+        assert_eq!(l.due(30_000, t, 10), vec![(s(3), s(3))]);
+        assert_eq!(
+            l.take(s(3)),
+            Some(Taken {
+                found: 7,
+                reported: true
+            })
+        );
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn a_hold_never_reaches_the_last_three_round_trips() {
+        let t = Timing::rtt(RTT);
+        let deadline = 1_000_000;
+        let limit = deadline - 3 * RTT;
+        // Within room: as asked.
+        let mut l = LossList::new();
+        assert!(l.hold(s(1), s(1), 0, deadline, limit - 1, t));
+        assert_eq!(l.next_due(0, t), Some(limit - 1));
+        // Asked past it: cut short.
+        let mut l = LossList::new();
+        assert!(l.hold(s(1), s(1), limit - 10_000, deadline, limit + 10_000, t));
+        assert_eq!(l.next_due(limit - 10_000, t), Some(limit));
+        // Already there: not held at all, and nothing listed.
+        for now in [limit, limit + 1, deadline - RTT, deadline] {
+            let mut l = LossList::new();
+            assert!(!l.hold(s(1), s(1), now, deadline, now + 10_000, t), "{now}");
+            assert!(l.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_held_report_comes_sooner_if_the_round_trip_grows_and_is_always_made() {
+        let deadline = 1_000_000;
+        let mut l = LossList::new();
+        assert!(l.hold(s(1), s(1), 0, deadline, 40_000, Timing::rtt(RTT)));
+        // The round trip grows so far that the hold now reaches into the
+        // last three: the report is due at that point instead.
+        let slow = Timing::rtt(330_000);
+        assert_eq!(l.next_due(0, slow), Some(deadline - 3 * 330_000));
+        // Grown beyond any useful retransmission: still asked for once,
+        // now, where a reported loss would no longer be.
+        let hopeless = Timing::rtt(2_000_000);
+        assert_eq!(l.next_due(10_000, hopeless), Some(10_000));
+        assert_eq!(l.due(10_000, hopeless, 10), vec![(s(1), s(1))]);
+        assert_eq!(l.next_due(10_000, hopeless), None);
+    }
+
+    #[test]
+    fn a_full_list_refuses_a_hold() {
+        let mut l = LossList::new();
+        let t = Timing::rtt(RTT);
+        for i in 0..MAX_RANGES as u32 {
+            assert!(l.hold(s(i * 2), s(i * 2), 0, 2_000_000, 20_000, t));
+        }
+        assert!(!l.hold(s(5_000), s(5_000), 0, 2_000_000, 20_000, t));
+        assert!(!l.contains(s(5_000)));
+        assert!(
+            !l.hold(s(0), s(0), 0, 2_000_000, 20_000, t),
+            "nor an overlap"
+        );
+        assert!(!l.hold(s(9), s(8), 0, 2_000_000, 20_000, t), "nor nothing");
+    }
+
+    /// A list full of held losses, each three long, from `s(0)`.
+    fn full_of_holds() -> LossList {
+        let mut l = LossList::new();
+        let t = Timing::rtt(RTT);
+        for i in 0..MAX_RANGES as u32 {
+            assert!(l.hold(s(i * 4), s(i * 4 + 2), 0, 2_000_000, 20_000, t));
+        }
+        l
+    }
+
+    #[test]
+    fn a_held_loss_pushed_off_a_full_list_is_reported_first() {
+        let t = Timing::rtt(RTT);
+        let last = (MAX_RANGES as u32 - 1) * 4;
+        let mut l = full_of_holds();
+        // A split at the limit pushes the latest loss off the list...
+        assert!(l.remove(s(1)));
+        assert_eq!(l.ranges(), MAX_RANGES);
+        assert!(!l.contains(s(last)));
+        // ...but it is owed its report, at once.
+        assert_eq!(l.next_due(5, t), Some(5));
+        let first = l.due(5, t, 3);
+        assert_eq!(first, vec![(s(last), s(last + 2))]);
+        assert_eq!(l.next_due(5, t), Some(20_000), "the rest wait");
+        // The same through a drop request that splits a range.
+        let mut l = full_of_holds();
+        l.remove_range(s(5), s(5));
+        assert_eq!(l.due(5, t, 3), vec![(s(last), s(last + 2))]);
+        // A reported loss pushed off is not reported again.
+        let mut l = LossList::new();
+        for i in 0..MAX_RANGES as u32 {
+            l.add(s(i * 4), s(i * 4 + 2), 0, 2_000_000);
+        }
+        assert!(l.remove(s(1)));
+        assert!(l.due(5, t, 10).is_empty());
+    }
+
+    #[test]
+    fn a_limit_on_one_report_carries_pushed_off_losses_over() {
+        let t = Timing::rtt(RTT);
+        let mut l = full_of_holds();
+        assert!(l.remove(s(1)));
+        assert!(l.remove(s(5)));
+        assert_eq!(l.due(5, t, 1).len(), 1);
+        assert_eq!(l.next_due(5, t), Some(5));
+        assert_eq!(l.due(5, t, 1).len(), 1);
+        assert_eq!(l.next_due(5, t), Some(20_000));
+    }
+
+    #[test]
+    fn pushed_off_losses_go_with_delivery_drop_requests_and_clearing() {
+        let t = Timing::rtt(RTT);
+        let last = (MAX_RANGES as u32 - 1) * 4;
+        let mut l = full_of_holds();
+        assert!(l.remove(s(1)));
+        l.remove_before(s(last + 1));
+        assert_eq!(l.due(5, t, 10), vec![(s(last + 1), s(last + 2))]);
+        let mut l = full_of_holds();
+        assert!(l.remove(s(1)));
+        l.remove_range(s(last + 1), s(last + 1));
+        assert_eq!(
+            l.due(5, t, 10),
+            vec![(s(last), s(last)), (s(last + 2), s(last + 2))]
+        );
+        let mut l = full_of_holds();
+        assert!(l.remove(s(1)));
+        l.clear();
+        assert!(l.is_empty());
+        assert_eq!(l.next_due(5, t), None);
     }
 
     #[test]

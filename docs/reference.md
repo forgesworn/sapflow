@@ -343,6 +343,24 @@ follows the observed behaviour.
   `docs/interop.md` measured for the patched srt-protocol, with the
   ordinary interval widened from one RTT, which raced retransmissions
   already on their way (`docs/interop.md`).
+- **Reorder tolerance (sapflow-srt's own, not libsrt's default):** libsrt's
+  receiver, and sapflow-srt's until it has seen the path reorder, sends a
+  NAK at the first sequence gap, so a packet that is only late is resent.
+  sapflow-srt watches for a missing packet that arrives as an original
+  rather than a retransmission, and from then on holds the first NAK of
+  each new gap for 5/4 of how late that packet came plus 1 ms: at most
+  `SAPFLOW_SRT_REORDER_WAIT_MAX_MS` (default 50) and an eighth of the
+  latency, and never into the last three RTTs before the gap's delivery
+  time, where re-requests come every quarter RTT; a gap already that close
+  is reported at once. The wait halves after each second with no reordering, back to none. A held
+  gap is reported from the timer when the wait ends, and at once if the
+  loss list is full or has to drop it. Only for a caller that sets
+  `REXMITFLG`: without it a retransmission that fills a gap looks like an
+  original a round trip late, and real loss would push the wait to its cap.
+  libsrt has a comparable option, `SRTO_LOSSMAXTTL` (reorder tolerance in
+  packets, off by default); this one is in time, adapts and is on by
+  default. The close log's `nak_held` and `max_reorder_wait_us` show it at
+  work.
 - **Observed:** ffmpeg (libsrt 1.5.3) sets the order flag on every data
   packet and sends payloads of whole TS packets (188 to 1,316 bytes);
   `srt-live-transmit` leaves the flag clear and sends 1,456-byte payloads

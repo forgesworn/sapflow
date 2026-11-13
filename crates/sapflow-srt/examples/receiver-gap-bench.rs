@@ -22,6 +22,8 @@ fn receiver() -> Receiver {
             buffer: 32_768,
             peer_idle: 5_000_000,
             max_payload: 1456,
+            retransmit_flag: true,
+            reorder_wait_max: 50_000,
         },
         0,
         77,

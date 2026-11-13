@@ -287,16 +287,22 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                             lost = stats.lost,
                             dropped = stats.dropped,
                             // Reordered: missing packets that came as
-                            // originals after their NAK was queued, so the
-                            // sender's retransmission was not needed (for a
-                            // caller that flags retransmissions, as libsrt
-                            // does). Duplicates were already held; belated
-                            // came after delivery or give-up, from
-                            // reordering or a repeated NAK under loss.
+                            // originals, not retransmissions (for a caller
+                            // that flags retransmissions, as libsrt does).
+                            // nak_held of them came while their first NAK
+                            // was held for reordering, so none was sent; the
+                            // rest were NAKed and resent for nothing, and
+                            // usually show as duplicates. Duplicates were
+                            // already held; belated came after delivery or
+                            // give-up, from reordering or a repeated NAK
+                            // under loss. max_reorder_wait_us: the longest a
+                            // first NAK was held (0 if never).
                             reordered = stats.reordered,
                             duplicates = stats.duplicates,
                             belated = stats.belated,
                             naks_sent = stats.naks_sent,
+                            nak_held = stats.nak_held,
+                            max_reorder_wait_us = stats.max_reorder_wait,
                             "SRT connection closed"
                         );
                     }
@@ -383,6 +389,7 @@ fn listener_config(config: &crate::config::Config) -> Config {
             || (config.srt_crypto.is_some() && !config.srt_allow_plaintext),
         crypto: config.srt_crypto.clone(),
         allow_plaintext: config.srt_allow_plaintext,
+        reorder_wait_max: config.srt_reorder_wait_max,
         ..Config::default()
     }
 }
