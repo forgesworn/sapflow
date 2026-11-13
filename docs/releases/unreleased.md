@@ -299,7 +299,9 @@ Notes for the release after 0.2.0-rc.1.
   waits or is open is answered there and never refused. Real encoders make
   fresh key material per connection (sapflow's caller, libsrt 1.5.1 and
   OBS 32.0.4 checked, reconnects included; Larix not checked). A restart
-  or eviction lets older captures through again, and a replay that beats
+  or eviction lets older captures through again, key material is kept
+  only once its caller is accepted (an attempt refused for another reason,
+  such as the app being down, can be replayed later), and a replay that beats
   the original caller's own admission can win; rotating the stream's
   passphrase limits both. With the switch off nothing changes: the path is
   claimed before any key is checked there, so the guard could not help.

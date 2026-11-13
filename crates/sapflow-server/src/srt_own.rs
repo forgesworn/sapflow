@@ -468,14 +468,19 @@ fn accept_pending(
             return None;
         }
     };
-    // Only a caller that sent key material has any to replay.
+    // Only a caller that sent key material has any to replay. One whose key
+    // passed but cannot be told apart is refused, never admitted unguarded
+    // (unreachable: the check has already parsed its key material).
     let seen = listener
         .pending_key_material(id)
         .and_then(sapflow_srt::crypto::bound_key_material)
         .zip(listener.caller_socket(id))
         .map(|(bound, socket)| Seen::new(bound, peer, socket, id));
-    if let Some(seen) = &seen
-        && replay.is_replay(seen, |c| listener.caller_socket(c))
+    let keyed = !matches!(encryption, Encryption::None);
+    if (keyed && seen.is_none())
+        || seen
+            .as_ref()
+            .is_some_and(|seen| replay.is_replay(seen, |c| listener.caller_socket(c)))
     {
         // As a wrong passphrase: the replayer learns nothing new.
         listener.reject(id, RejectCode::BADSECRET);

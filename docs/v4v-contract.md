@@ -130,9 +130,15 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - Encoders make fresh key material for every connection, reconnects
   included, so they are never refused for it: checked with libsrt 1.5.1
   (`srt-live-transmit`, a reconnect and a new run), OBS 32.0.4 (a
-  reconnect) and sapflow's own caller. Larix has not been checked.
+  reconnect after a dropped link, and one after sapflow restarted, with an
+  app key, 2026-11-13, via `scripts/obs-ingest.js --app-key`, a separate
+  change) and sapflow's own caller. Larix has not been checked.
 - What remains: a restart, or eviction past those bounds, lets an older
-  capture through again; and a replay that arrives while the encoder whose
+  capture through again; key material is kept only once its caller is
+  accepted, so a handshake that was refused or never answered for another
+  reason (the app down, slow or throttling, the caller giving up, a memory
+  or presentation limit) can be replayed later, as when an encoder keeps
+  retrying with valid key material while the app is down; and a replay that arrives while the encoder whose
   handshake it copies is still waiting for the app's answer can be
   admitted first, refusing that encoder until it reconnects with new key
   material. Rotating the stream's passphrase limits both, since a capture
