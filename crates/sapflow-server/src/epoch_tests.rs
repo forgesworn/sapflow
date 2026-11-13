@@ -1652,9 +1652,19 @@ async fn the_roll_budget_survives_a_reconnect_and_resets_with_a_new_presentation
         "kept across the reconnect"
     );
     run.end(publisher).await;
-    let first = run.states();
-    assert_eq!(first.len(), 3, "{first:?}");
-    assert_eq!(first[2].1, "epoch-rate", "{first:?}");
+    // Up to three files are written at once (recorder::PATH_WRITERS), so
+    // their callbacks can come in any order.
+    let mut first = run.states();
+    first.sort();
+    assert_eq!(
+        first,
+        [
+            ("finalised".into(), String::new()),
+            ("finalised".into(), String::new()),
+            ("incomplete".into(), "epoch-rate".into()),
+        ],
+        "one file marked once the burst is spent"
+    );
     // A new presentation: a full budget again.
     let mut publisher = run.begin();
     run.feed(&mut publisher, &epochs_of(&[true, false, true]))
