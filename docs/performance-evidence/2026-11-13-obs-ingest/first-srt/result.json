@@ -1,0 +1,81 @@
+{
+ "runs": [
+  {
+   "ready_ms": [
+    4287
+   ],
+   "connected": 1,
+   "srt_closed": [
+    "INFO sapflow::srt_own: SRT connection closed reason=\"shutdown\" received=5568 retransmitted=0 lost=0 dropped=0 reordered=0 duplicates=0 belated=0 naks_sent=0"
+   ],
+   "recordings": [],
+   "warnings": [],
+   "target": [
+    "INFO sapflow_hls::muxer: target duration fixed from the first segment; a segment longer than this is cut and video waits for the next keyframe (set the encoder's keyframe interval to at most this) target_secs=2"
+   ]
+  }
+ ],
+ "recordings": [
+  {
+   "file": "recordings/live/event-obs/1794529771.mp4",
+   "streams": [
+    {
+     "codec_name": "h264",
+     "profile": "High",
+     "codec_type": "video",
+     "width": 1280,
+     "height": 720,
+     "has_b_frames": 2,
+     "r_frame_rate": "30/1",
+     "start_time": "0.066667",
+     "duration": "18.066667"
+    },
+    {
+     "codec_name": "aac",
+     "profile": "LC",
+     "codec_type": "audio",
+     "r_frame_rate": "0/0",
+     "start_time": "0.022667",
+     "duration": "18.049333"
+    }
+   ],
+   "video_frames": 542,
+   "keyframe_gaps_s": [
+    1
+   ],
+   "decode_errors": 0
+  }
+ ],
+ "protocol": "srt",
+ "seconds": 5,
+ "obs_keyint": 1,
+ "bitrate": 2500,
+ "restart_at": null,
+ "load": 13.80126953125,
+ "obs_version": "32.0.4",
+ "ready": true,
+ "first_playlist": [
+  "#EXT-X-TARGETDURATION:2",
+  "#EXTINF:1.00000,",
+  "#EXTINF:1.00000,",
+  "#EXTINF:1.00000,"
+ ],
+ "ready_after_launch_s": 5,
+ "extinf_at_end": [
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1,
+  1
+ ],
+ "obs_ended": true,
+ "restore_diff_exit": 0
+}

@@ -21,6 +21,10 @@ is tried.
 | 2026-10-21 | OBS 32.1.2 (libsrt 1.5.2) | SRT, own receiver (the default) | OBS's default x264 (8.33 s keyframes), browser source, `latency=2000000`; served by 8ee5704 | Servable in 19.7 s (the long GOP); a segment decodes cleanly (250 frames, AAC). OBS quit and restarted 62 s later: resumed the held stream, one discontinuity, same chunk names |
 | 2026-10-21 | OBS 32.1.2 (libsrt 1.5.2) | SRT with `passphrase=` and `pbkeylen=16`, own receiver | as above, server `SAPFLOW_SRT_PASSPHRASE` set | Servable in 19.6 s, decodes cleanly; with one letter of the passphrase wrong, refused in the handshake ("wrong passphrase or key length") |
 | 2026-10-21 | Larix Broadcaster (iPhone) | SRT with a passphrase (AES-128), own receiver | Larix defaults over Wi-Fi, 2 s latency; served by 8ee5704 | Servable in 6.0 s, a segment decodes cleanly (60 frames, AAC). With the server's passphrase changed by one letter: refused nine times, about every 3 s; with it changed back, Larix reconnected by itself |
+| 2026-11-13 | OBS 32.0.4 (macOS, x264) | SRT, AES-256 | `scripts/obs-ingest.js`: CBR 2500 kbit/s, OBS's defaults otherwise (veryfast, High, B-frames), 1 s keyframes, `latency=2000000`, `whole` HLS and recording as the reference deployment; served by 3e32000 | Servable 4.3 s after connecting; 1 s segments, target duration 2; the recording decodes cleanly (High, B-frames), audio and video start within 45 ms |
+| 2026-11-13 | OBS 32.0.4 (macOS, x264) | RTMP | as above, credentials in the key | Servable 3.2 s after connecting, but the first segment was 1.999 s, so the target duration was 3 for the whole stream (2 over SRT): OBS floors its millisecond timestamps, so the keyframe a second in is stamped 999 ms and missed the 1 s minimum. With a keyframe within 10 ms of the minimum now ending the segment: first segment 0.999 s, target 2 |
+| 2026-11-13 | OBS 32.0.4 (macOS, x264) | RTMP | OBS's own keyframe setting (auto: 8.33 s) | Servable 9.6 s after connecting; 8.33 s segments, target 9; the window keeps 7 segments (58 s) under `SAPFLOW_WINDOW_SECONDS`' default, where it kept 24 (200 s); decodes cleanly |
+| 2026-11-13 | OBS 32.0.4 (macOS, x264) | SRT, AES-256, and RTMP | 1 s keyframes; sapflow stopped 20 s in and started again 3 s later, as at a redeploy | OBS reconnected by itself, with no prompt: servable again 11.5 s (SRT) and 8.6 s (RTMP) after the stop. Each restart left two recordings, both decoding cleanly; the SRT one cut by the stop is marked `srt-listener-stopped` |
 
 Output checked for the 1 s keyframe runs: H.264 High 1280x720 30 fps and
 AAC-LC 48 kHz stereo, 1 s segments, 200 ms parts, a keyframe at the start of
@@ -29,6 +33,15 @@ each segment.
 With OBS's defaults the stream plays, but segments follow the keyframes, so
 viewers join up to about 8 s behind. v4v's advice to set 1 s keyframes
 matters.
+
+Stopping sapflow (SIGTERM) with a recording open sends no
+`recordSegmentComplete` for it, and with a publisher live no `unpublish`
+either; the file stays on disk. Checked on 2026-11-13 with a callback
+receiver and an RTMP publisher: stopped while live, only `publish` arrived;
+stopped inside the reconnect grace, `publish` and `unpublish`; only with
+the grace allowed to pass did `recordSegmentComplete` (finalised) follow.
+So a restart during a show, or within `SAPFLOW_RECONNECT_GRACE` of its end,
+leaves the app without that recording. Open.
 
 ## Reproducing irregular encoder timing
 

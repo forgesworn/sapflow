@@ -42,6 +42,11 @@ const START_OFFSET: Duration = Duration::ZERO;
 /// iOS needs the playlist to open with this many gap segments.
 pub const LEADING_GAPS: u64 = 7;
 
+/// How far short of `MuxerConfig::segment_min` a keyframe may be and still
+/// end a video segment: more than a millisecond's rounding, far less than a
+/// frame at any usual rate.
+const SEGMENT_MIN_SLACK: Duration = Duration::from_millis(10);
+
 /// Charged open-segment video plus retained AAC payload, including pending
 /// AAC. Pending video, Bytes backing capacity and TS/PES allocations are
 /// separate; this is not a whole-process or allocator/RSS limit.
@@ -1564,7 +1569,12 @@ impl Muxer {
         let cur = self.pending_video.take().expect("checked pending video");
         self.pending_video = Some(next);
         let since_segment = ticks_to_duration(next_dts - seg.start_dts, VIDEO_TIMESCALE);
-        let ends_segment = next_sync && since_segment >= self.cfg.segment_min;
+        // A keyframe within SEGMENT_MIN_SLACK of the minimum counts as at it:
+        // OBS over RTMP floors its millisecond timestamps, so at 30 fps the
+        // keyframe a second in is stamped 999 ms, and the first segment ran
+        // to the next keyframe, fixing a target a second longer for good.
+        let ends_segment =
+            next_sync && since_segment.saturating_add(SEGMENT_MIN_SLACK) >= self.cfg.segment_min;
         self.last_frame_ticks = Some(next_dts - cur.dts);
         let frame = Frame {
             dts: cur.dts,
