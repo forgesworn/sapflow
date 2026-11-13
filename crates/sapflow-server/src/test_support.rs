@@ -69,6 +69,7 @@ pub(crate) fn app(record: bool) -> (Arc<App>, Scratch) {
     }
     (
         Arc::new(App {
+            srt_replay: Default::default(),
             recording_limits: Arc::new(crate::recorder::RecordingLimits::new(
                 config.max_publishers,
             )),

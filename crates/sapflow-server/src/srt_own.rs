@@ -74,7 +74,6 @@ fn incomplete_close(reason: Option<CloseReason>, dropped: u64) -> Option<Incompl
 struct Engine {
     listener: Listener,
     publishers: HashMap<ConnId, Publisher>,
-    replay: ReplayGuard,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -200,7 +199,6 @@ async fn run(
     let mut engine = Engine {
         listener: Listener::new(listener_config(&app.config), Instant::now()),
         publishers: HashMap::new(),
-        replay: ReplayGuard::default(),
     };
     let mut admissions = JoinSet::new();
     let (ended_tx, mut ended_rx) = mpsc::channel::<ConnId>(app.config.max_publishers.max(1));
@@ -212,7 +210,6 @@ async fn run(
         let Engine {
             listener,
             publishers,
-            replay,
         } = &mut engine;
         let deadline = listener.poll_timeout();
         if deadline != armed {
@@ -231,7 +228,7 @@ async fn run(
                 if let Some(publisher)=publishers.remove(&id) && let Some(scope)=publisher.scope {scope.protocol_stopped();}
             }
             Some(result)=admissions.join_next(),if !admissions.is_empty()=>{
-                if let Ok(admission)=result {complete_admission(&app,listener,publishers,replay,&ended_tx,admission);}
+                if let Ok(admission)=result {complete_admission(&app,listener,publishers,&ended_tx,admission);}
             }
         }
         let now = Instant::now();
@@ -257,7 +254,11 @@ async fn run(
                     // otherwise lock the encoder out.
                     if app.config.srt_app_keys
                         && let Some(seen) = seen(listener, id, peer)
-                        && replay.connect(seen, |c| listener.caller_socket(c))
+                        && app
+                            .srt_replay
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .connect(seen, |c| listener.caller_socket(c))
                     {
                         listener.reject(id, RejectCode::BADSECRET);
                         app.log_refusal("srt", &"key material belongs to another caller");
@@ -351,7 +352,6 @@ fn complete_admission(
     app: &Arc<App>,
     listener: &mut Listener,
     publishers: &mut HashMap<ConnId, Publisher>,
-    replay: &mut ReplayGuard,
     ended: &mpsc::Sender<ConnId>,
     (id, peer, result): (ConnId, SocketAddr, Result<Admission, Refused>),
 ) {
@@ -361,9 +361,14 @@ fn complete_admission(
             return;
         }
         Ok(Admission::Pending(pending)) => {
-            let Some((publication, encryption)) =
-                accept_pending(app, listener, replay, id, peer, pending)
-            else {
+            let Some((publication, encryption)) = accept_pending(
+                app,
+                listener,
+                &mut app.srt_replay.lock().unwrap_or_else(|e| e.into_inner()),
+                id,
+                peer,
+                pending,
+            ) else {
                 return;
             };
             (publication, None, QUEUE, encryption)
@@ -495,6 +500,19 @@ fn accept_pending(
         app.log_refusal("srt", &"key material already admitted another connection");
         return None;
     }
+    // Kept, and written to the store, before the claim: once this caller's
+    // media can reach the stage, a restart must not forget its key material.
+    // If the store cannot be written the caller is refused and nothing is
+    // claimed: a recorded copy of its connection could otherwise be replayed
+    // after a restart. Rare and cheap: one write of a few hundred kilobytes
+    // at most, for a caller whose key was just checked.
+    if let Some(seen) = seen
+        && let Err(error) = replay.record(&req.path.as_path(), seen, |c| listener.caller_socket(c))
+    {
+        tracing::error!(%error, "SRT replay store not written; caller refused");
+        listener.reject(id, RejectCode::http(503));
+        return None;
+    }
     let publication = match Publication::claim_admitted(app, &req, SourceKind::Ts, admitted) {
         Ok(publication) => publication,
         Err(refusal) => {
@@ -513,9 +531,6 @@ fn accept_pending(
         drop(publication);
         refused_key(app, peer);
         return None;
-    }
-    if let Some(seen) = seen {
-        replay.record(&req.path.as_path(), seen, |c| listener.caller_socket(c));
     }
     Some((publication, encryption))
 }
@@ -759,7 +774,6 @@ mod tests {
                     let mut engine = Engine {
                         listener: Listener::new(Config::default(), Instant::now()),
                         publishers: HashMap::new(),
-                        replay: ReplayGuard::default(),
                     };
                     // Engine Drop must report failure before closing the sender.
                     engine.publishers.insert(ConnId(1), publisher);

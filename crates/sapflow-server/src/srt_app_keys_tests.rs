@@ -1070,3 +1070,70 @@ async fn key_material_from_a_refused_attempt_stays_its_owners() {
         let _ = server.await;
     }
 }
+
+/// An app whose replay guard keeps its admitted tier in the store at `path`.
+fn with_store(fixture: &Fixture, path: &std::path::Path) {
+    let (store, records) = crate::srt_replay_store::ReplayStore::open(path).expect("store");
+    *fixture.app.srt_replay.lock().expect("guard") =
+        crate::srt_replay::ReplayGuard::with_store(store, records);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_recorded_connection_replayed_after_a_restart_is_refused() {
+    // Without the store a restart would forget the admission, and a replay
+    // of the recorded handshake would restore its keys: its recorded media
+    // would decrypt onto the stage again.
+    let scratch = crate::srt_replay_store::tests::Scratch::new();
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let conclusion = {
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        with_store(&fixture, &scratch.path());
+        let (addr, server) = origin(&fixture.app);
+        let mut live = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+        assert!(live.connected, "{:?}", live.closed);
+        live.send_media().await;
+        wait_for(&mut fixture, &mut live, "publish").await;
+        live.stop().await;
+        server.abort();
+        let _ = server.await;
+        // The process ends: its guard, and the store's lock, go with it.
+        *fixture.app.srt_replay.lock().expect("guard") = Default::default();
+        live.conclusion.clone().expect("captured")
+    };
+    let asked = stub.count();
+    let fixture = fixture(&stub, Duration::ZERO);
+    with_store(&fixture, &scratch.path());
+    let (addr, server) = origin(&fixture.app);
+    let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    let answered = replay(&elsewhere, addr, &conclusion, None, true).await;
+    assert_eq!(answered, Answered::Rejected(RejectCode::BADSECRET.0));
+    assert_eq!(stub.count(), asked, "refused before the app is asked");
+    assert!(fixture.app.streams.get("event-a").is_none(), "no stage");
+    // A real encoder, with fresh key material, publishes as before.
+    let mut back = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert!(back.connected, "{:?}", back.closed);
+    back.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_caller_is_refused_when_the_store_cannot_be_written() {
+    let scratch = crate::srt_replay_store::tests::Scratch::new();
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let fixture = fixture(&stub, Duration::ZERO);
+    let (mut store, records) =
+        crate::srt_replay_store::ReplayStore::open(&scratch.path()).expect("store");
+    store.fail_before_rename = true;
+    *fixture.app.srt_replay.lock().expect("guard") =
+        crate::srt_replay::ReplayGuard::with_store(store, records);
+    let (addr, server) = origin(&fixture.app);
+    let refused = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert_eq!(refused.rejected(), Some(RejectCode::http(503).0));
+    assert!(
+        fixture.app.streams.get("event-a").is_none(),
+        "nothing claimed"
+    );
+    server.abort();
+    let _ = server.await;
+}

@@ -26,6 +26,7 @@ mod shutdown;
 mod srt;
 mod srt_own;
 mod srt_replay;
+mod srt_replay_store;
 mod stream;
 #[cfg(test)]
 mod test_support;
@@ -68,6 +69,9 @@ pub struct App {
     pub streams: Arc<Registry>,
     pub callbacks: Callbacks,
     pub recording_limits: Arc<recorder::RecordingLimits>,
+    /// Key material of SRT callers, kept across SRT listener restarts and,
+    /// with `SAPFLOW_SRT_REPLAY_STORE`, across process restarts.
+    pub srt_replay: std::sync::Mutex<srt_replay::ReplayGuard>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -158,7 +162,18 @@ async fn run(config: Config) -> std::io::Result<()> {
         ),
         None => None,
     };
+    let srt_replay = match &config.srt_replay_store {
+        Some(path) => {
+            let (store, records) = srt_replay_store::ReplayStore::open(path).map_err(|e| {
+                std::io::Error::other(format!("SAPFLOW_SRT_REPLAY_STORE {}: {e}", path.display()))
+            })?;
+            tracing::info!(admitted = records.len(), "SRT replay store read");
+            srt_replay::ReplayGuard::with_store(store, records)
+        }
+        None => srt_replay::ReplayGuard::default(),
+    };
     let app = Arc::new(App {
+        srt_replay: std::sync::Mutex::new(srt_replay),
         recording_limits: Arc::new(recorder::RecordingLimits::new(config.max_publishers)),
         publish_sessions,
         callbacks: Callbacks::start(config.callback_url.clone(), config.callback_secret.clone()),

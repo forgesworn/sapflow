@@ -352,7 +352,7 @@ pub fn validate_snapshot_bytes(bytes: &[u8]) -> Result<(), StoreError> {
     decode_document(bytes).map(|_| ())
 }
 
-fn private_file(file: &File) -> Result<(), StoreError> {
+pub(crate) fn private_file(file: &File) -> Result<(), StoreError> {
     let meta = file.metadata().map_err(|e| io_error("file metadata", e))?;
     if !meta.is_file()
         || meta.mode() & 0o7777 != 0o600
@@ -363,7 +363,7 @@ fn private_file(file: &File) -> Result<(), StoreError> {
     }
     Ok(())
 }
-fn open_parent(path: &Path) -> Result<(File, OsString), StoreError> {
+pub(crate) fn open_parent(path: &Path) -> Result<(File, OsString), StoreError> {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
