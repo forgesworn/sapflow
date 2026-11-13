@@ -47,8 +47,9 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            SAPFLOW_SRT_APP_KEYS=1: digests of admitted
                            callers' key material, kept across restarts so a
                            recorded handshake and its media cannot be
-                           replayed after one. Unreadable or malformed at
-                           start refuses to start
+                           replayed after one. In scoped mode it defaults
+                           to srt-replay beside SAPFLOW_SESSION_STORE.
+                           Unreadable or malformed at start refuses to start
   SAPFLOW_SRT_REORDER_WAIT_MAX_MS  once a caller's path reorders packets, hold
                            a new gap's first NAK up to this long, so a packet
                            that is only late is not resent (default 50, 0 to
@@ -635,6 +636,25 @@ impl Config {
                 "SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_PUBLISH_AUTH_URL: the app returns each stream's passphrase".into(),
             ));
         }
+        // Scoped sessions keep their digests beside the session store, whose
+        // private directory already outlives restarts, unless told otherwise.
+        let srt_replay_store = match (srt_replay_store, &control) {
+            (Some(path), Some(control)) if path == control.store => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_REPLAY_STORE must not be SAPFLOW_SESSION_STORE".into(),
+                ));
+            }
+            (None, Some(control)) => {
+                let path = control.store.with_file_name("srt-replay");
+                if path == control.store {
+                    return Err(ConfigError::Invalid(
+                        "SAPFLOW_SESSION_STORE is named srt-replay; set SAPFLOW_SRT_REPLAY_STORE to another file".into(),
+                    ));
+                }
+                Some(path)
+            }
+            (store, _) => store,
+        };
         if srt_app_keys && srt_replay_store.is_none() {
             return Err(ConfigError::Invalid(
                 "SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_SRT_REPLAY_STORE: an absolute file path in a private (0700) directory on a persistent volume, where admitted callers' key material digests survive restarts".into(),
@@ -2143,6 +2163,44 @@ mod tests {
             Err(ConfigError::Invalid(m)) if m.contains("scoped control mode")
         ));
         assert!(HELP.contains("SAPFLOW_SRT_APP_KEYS"));
+    }
+
+    #[test]
+    fn scoped_mode_keeps_the_replay_store_beside_the_session_store() {
+        let scoped = |extra: &[(&'static str, &'static str)]| {
+            let mut env = vec![
+                ("SAPFLOW_CONTROL_ADDR", "127.0.0.1:9000"),
+                (
+                    "SAPFLOW_CONTROL_TOKEN",
+                    "independent-control-token-32-bytes-minimum",
+                ),
+                ("SAPFLOW_SESSION_STORE", "/var/lib/sapflow/sessions.json"),
+            ];
+            env.extend_from_slice(extra);
+            load(&env, &[])
+        };
+        let c = scoped(&[]).expect("scoped");
+        assert_eq!(
+            c.srt_replay_store.as_deref(),
+            Some(std::path::Path::new("/var/lib/sapflow/srt-replay"))
+        );
+        let c = scoped(&[("SAPFLOW_SRT_REPLAY_STORE", "/srv/replay/digests")]).expect("own");
+        assert_eq!(
+            c.srt_replay_store.as_deref(),
+            Some(std::path::Path::new("/srv/replay/digests"))
+        );
+        let Err(ConfigError::Invalid(error)) =
+            scoped(&[("SAPFLOW_SRT_REPLAY_STORE", "/var/lib/sapflow/sessions.json")])
+        else {
+            panic!("the session store as the replay store accepted")
+        };
+        assert_eq!(
+            error,
+            "SAPFLOW_SRT_REPLAY_STORE must not be SAPFLOW_SESSION_STORE"
+        );
+        // Outside scoped mode and app keys there is no store by default.
+        let open = load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &[]).expect("open");
+        assert!(open.srt_replay_store.is_none());
     }
 
     #[test]

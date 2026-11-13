@@ -1950,3 +1950,293 @@ async fn a_wrong_key_reserves_nothing_and_leaves_a_held_stage_held() {
     server.abort();
     let _ = server.await;
 }
+
+/// A scoped stage held for a reconnect on the real SRT loop: its encoder
+/// published and left, and its conclusion was captured on the way.
+struct HeldScoped {
+    scratch: Scratch,
+    manager: PublishSessions,
+    app: Arc<crate::App>,
+    addr: std::net::SocketAddr,
+    server: tokio::task::JoinHandle<()>,
+    /// The encoder that left, its socket still bound at the same address.
+    left: crate::srt_own::app_key_tests::Encoder,
+    conclusion: Vec<u8>,
+    stream_id: String,
+}
+
+impl HeldScoped {
+    /// The replay guard keeps its admitted tier in `srt-replay` beside the
+    /// session store, as scoped mode does by default.
+    async fn start() -> Self {
+        use crate::srt_own::app_key_tests::{Encoder, key, origin};
+        let scratch = Scratch::new();
+        let manager = scratch.open(true).await;
+        prepare(&manager).await;
+        let (mut app, mut callbacks) = fresh_media_app(&manager);
+        let config = &mut Arc::get_mut(&mut app).expect("unshared app fixture").config;
+        config.control = Some(scratch.config());
+        config.recordings = Some(scratch.0.join("recordings"));
+        config.record_min_free = 0;
+        Self::open_replay_store(&app, &scratch);
+        let (addr, server) = origin(&app);
+        let stream_id = format!("publish:live/{EVENT}:{SID}:{PASSWORD}");
+        let right = Some(key(TRANSPORT_SECRET, sapflow_srt::crypto::KeySize::Aes256));
+        let mut live = Encoder::call_as(addr, &stream_id, right).await;
+        assert!(live.connected, "{:?}", live.closed);
+        live.send_media().await;
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            seen.extend(fresh_events(&mut callbacks));
+            if seen.iter().any(|e| e == "publish") {
+                break;
+            }
+            live.pump(Duration::from_millis(20)).await;
+        }
+        assert!(seen.iter().any(|e| e == "publish"), "{seen:?}");
+        live.stop().await;
+        for _ in 0..200 {
+            seen.extend(fresh_events(&mut callbacks));
+            if seen.iter().any(|e| e == "unpublish") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen.iter().any(|e| e == "unpublish"), "{seen:?}");
+        let conclusion = live.conclusion.clone().expect("captured");
+        Self {
+            scratch,
+            manager,
+            app,
+            addr,
+            server,
+            left: live,
+            conclusion,
+            stream_id,
+        }
+    }
+
+    fn open_replay_store(app: &Arc<crate::App>, scratch: &Scratch) {
+        let (store, records) =
+            crate::srt_replay_store::ReplayStore::open(&scratch.0.join("srt-replay"))
+                .expect("replay store");
+        *app.srt_replay.lock().expect("guard") =
+            crate::srt_replay::ReplayGuard::with_store(store, records);
+    }
+
+    /// Who owns the stage, its outage deadline and whether it records.
+    fn held(&self) -> ((u64, bool), Option<std::time::Instant>, bool) {
+        let stream = self.app.streams.get(EVENT).expect("held stage mapped");
+        let session = stream.session();
+        (
+            session.owner(),
+            session.outage_deadline(),
+            session.recorder.is_some(),
+        )
+    }
+
+    async fn epoch(&self) -> u64 {
+        self.manager
+            .status(SID)
+            .await
+            .expect("receipt")
+            .connection_epoch
+    }
+
+    /// Both stores' bytes and modification times.
+    fn on_disk(&self) -> Vec<(Vec<u8>, std::time::SystemTime)> {
+        ["sessions.json", "srt-replay"]
+            .iter()
+            .map(|name| {
+                let path = self.scratch.0.join(name);
+                (
+                    fs::read(&path).expect("store"),
+                    fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .expect("mtime"),
+                )
+            })
+            .collect()
+    }
+
+    /// Nothing moved: the hold, the epoch and both stores.
+    async fn unchanged_since(
+        &self,
+        held: ((u64, bool), Option<std::time::Instant>, bool),
+        epoch: u64,
+        disk: &[(Vec<u8>, std::time::SystemTime)],
+        what: &str,
+    ) {
+        assert_eq!(self.held(), held, "{what}: the hold");
+        assert_eq!(self.epoch().await, epoch, "{what}: the epoch");
+        assert!(self.on_disk() == disk, "{what}: a store was written");
+    }
+
+    /// The encoder's genuine reconnect, with fresh key material, resumes.
+    async fn genuine_reconnect_resumes(
+        &self,
+        held: ((u64, bool), Option<std::time::Instant>, bool),
+        epoch: u64,
+    ) {
+        use crate::srt_own::app_key_tests::{Encoder, key};
+        let right = Some(key(TRANSPORT_SECRET, sapflow_srt::crypto::KeySize::Aes256));
+        let mut back = Encoder::call_as(self.addr, &self.stream_id, right).await;
+        assert!(back.connected, "{:?}", back.closed);
+        assert_eq!(self.held().0, (held.0.0 + 1, true), "resumed");
+        assert_eq!(self.epoch().await, epoch + 1);
+        back.stop().await;
+    }
+}
+
+/// A captured scoped conclusion replayed within its grant against the stage
+/// it published, now held for a reconnect: its key passes, and resuming
+/// would let the recorded media decrypt onto the stage. Refused before
+/// anything is reserved, from another address and from the encoder's own
+/// address with another socket id or (its connection over) the same one: no
+/// epoch, no store write, no resume, and the throttle is not charged.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_scoped_conclusion_never_resumes_a_held_stage() {
+    use crate::srt_own::app_key_tests::{Answered, replay, uncharged};
+    use sapflow_srt::RejectCode;
+    let captured = crate::log_capture::Capture::start();
+    let stage = HeldScoped::start().await;
+    let (held, epoch, disk) = (stage.held(), stage.epoch().await, stage.on_disk());
+    assert!(!held.0.1 && held.1.is_some() && held.2, "held, recording");
+    let elsewhere = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    for (own_address, caller_socket, what) in [
+        (false, None, "another address, the same caller socket"),
+        (
+            false,
+            Some(0x0123_4567),
+            "another address and caller socket",
+        ),
+        (
+            true,
+            Some(0x0765_4321),
+            "the encoder's address, another socket",
+        ),
+        (
+            true,
+            None,
+            "the encoder's own address and socket, its connection over",
+        ),
+    ] {
+        let (from, induct) = if own_address {
+            (&stage.left.socket, false)
+        } else {
+            (&elsewhere, true)
+        };
+        let answered = replay(from, stage.addr, &stage.conclusion, caller_socket, induct).await;
+        assert_eq!(
+            answered,
+            Answered::Rejected(RejectCode::BADSECRET.0),
+            "{what}"
+        );
+        stage.unchanged_since(held, epoch, &disk, what).await;
+    }
+    let logs = captured.text();
+    assert!(!logs.contains("resumed=true"), "{logs}");
+    stage.genuine_reconnect_resumes(held, epoch).await;
+    assert!(
+        uncharged(&stage.app, "127.0.0.1"),
+        "replays were not charged"
+    );
+    stage.server.abort();
+}
+
+/// The encoder's attempt is refused before its key is checked (throttled,
+/// as when someone behind its address used up the allowance): its key
+/// material was never admitted, but it was owned from the moment it
+/// connected, so a copy from elsewhere within the grant is refused too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_throttled_scoped_attempt_leaves_its_key_material_owned() {
+    use crate::srt_own::app_key_tests::{Answered, Encoder, key, replay};
+    use sapflow_srt::RejectCode;
+    let stage = HeldScoped::start().await;
+    let (held, epoch) = (stage.held(), stage.epoch().await);
+    {
+        let mut throttle = stage.app.auth_throttle.lock().expect("throttle");
+        for _ in 0..10 {
+            throttle.failed("127.0.0.1".parse().expect("ip"), std::time::Instant::now());
+        }
+    }
+    let right = Some(key(TRANSPORT_SECRET, sapflow_srt::crypto::KeySize::Aes256));
+    let throttled = Encoder::call_as(stage.addr, &stage.stream_id, right).await;
+    assert_eq!(throttled.rejected(), Some(RejectCode::http(402).0));
+    let copy = throttled.conclusion.clone().expect("captured");
+    // The window passes.
+    *stage.app.auth_throttle.lock().expect("throttle") =
+        sapflow_core::limits::AuthThrottle::new(10, Duration::from_secs(60));
+    let elsewhere = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let answered = replay(&elsewhere, stage.addr, &copy, None, true).await;
+    assert_eq!(answered, Answered::Rejected(RejectCode::BADSECRET.0));
+    assert_eq!(stage.held(), held);
+    assert_eq!(stage.epoch().await, epoch);
+    stage.genuine_reconnect_resumes(held, epoch).await;
+    stage.server.abort();
+}
+
+/// The SRT loop restarts and its replay guard is read back from the store
+/// (no owners, no connections): the captured conclusion of the connection
+/// that published is still refused, so its recorded media cannot be sent to
+/// the held stage again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_scoped_replay_after_a_restart_is_refused_from_the_store() {
+    use crate::srt_own::app_key_tests::{Answered, origin, replay};
+    use sapflow_srt::RejectCode;
+    let mut stage = HeldScoped::start().await;
+    let (held, epoch) = (stage.held(), stage.epoch().await);
+    stage.server.abort();
+    let _ = (&mut stage.server).await;
+    // Only what the store holds survives.
+    *stage.app.srt_replay.lock().expect("guard") = Default::default();
+    HeldScoped::open_replay_store(&stage.app, &stage.scratch);
+    let (addr, server) = origin(&stage.app);
+    stage.addr = addr;
+    stage.server = server;
+    let elsewhere = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let answered = replay(&elsewhere, addr, &stage.conclusion, Some(0x0abc_def0), true).await;
+    assert_eq!(answered, Answered::Rejected(RejectCode::BADSECRET.0));
+    assert_eq!(stage.held(), held);
+    assert_eq!(stage.epoch().await, epoch);
+    stage.genuine_reconnect_resumes(held, epoch).await;
+    stage.server.abort();
+}
+
+/// A genuine reconnect whose key material the replay store cannot keep is
+/// refused before anything is reserved: a restart could forget it, and a
+/// recorded copy of the connection could then be replayed. The hold, the
+/// epoch and the session store stay as they were; once the store can be
+/// written, the next attempt resumes the stage.
+#[tokio::test(flavor = "current_thread")]
+async fn a_scoped_caller_is_refused_when_the_replay_store_cannot_be_written() {
+    use crate::srt_own::app_key_tests::{Encoder, key};
+    use sapflow_srt::RejectCode;
+    let stage = HeldScoped::start().await;
+    let (held, epoch) = (stage.held(), stage.epoch().await);
+    let sessions = || fs::read(stage.scratch.0.join("sessions.json")).expect("store");
+    let before = sessions();
+    let store = stage
+        .app
+        .srt_replay
+        .lock()
+        .expect("guard")
+        .store()
+        .expect("replay store");
+    store.lock().expect("store").fail_before_rename = true;
+    let right = Some(key(TRANSPORT_SECRET, sapflow_srt::crypto::KeySize::Aes256));
+    let refused = Encoder::call_as(stage.addr, &stage.stream_id, right).await;
+    assert_eq!(refused.rejected(), Some(RejectCode::http(503).0));
+    assert_eq!(stage.held(), held);
+    assert_eq!(stage.epoch().await, epoch);
+    assert!(sessions() == before, "the session store was written");
+    store.lock().expect("store").fail_before_rename = false;
+    stage.genuine_reconnect_resumes(held, epoch).await;
+    stage.server.abort();
+}

@@ -265,14 +265,17 @@ async fn run(
                     // refused here however the original's attempt ends.
                     // Not charged to the throttle: nothing costly was done,
                     // and a replayer behind the encoder's address could
-                    // otherwise lock the encoder out.
-                    if app.config.srt_app_keys
-                        && let Some(seen) = seen(listener, id, peer)
+                    // otherwise lock the encoder out. With app keys, and with
+                    // scoped sessions, whose admission task also checks it
+                    // against the admitted tier before reserving anything.
+                    let guarded = app.config.srt_app_keys || app.publish_sessions.is_some();
+                    let seen = guarded.then(|| seen(listener, id, peer)).flatten();
+                    if let Some(seen) = &seen
                         && app
                             .srt_replay
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .connect(seen, |c| listener.caller_socket(c))
+                            .connect(seen.clone(), |c| listener.caller_socket(c))
                     {
                         listener.reject(id, RejectCode::BADSECRET);
                         app.log_refusal("srt", &"key material belongs to another caller");
@@ -297,6 +300,7 @@ async fn run(
                             peer.ip(),
                             active,
                             key_material,
+                            seen,
                         )
                         .await;
                         (id, peer, result)
@@ -383,6 +387,14 @@ fn complete_admission(
     ended: &mpsc::Sender<ConnId>,
     (id, peer, result): (ConnId, SocketAddr, Result<Admission, Refused>),
 ) {
+    if app.publish_sessions.is_some() {
+        // A scoped admission task remembered without evicting, since only
+        // this loop can say which connections are waiting or open.
+        app.srt_replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim(|c| listener.caller_socket(c));
+    }
     let (publication, scope, capacity, encryption) = match result {
         Err(error) => {
             listener.reject(id, reject_code(error));
@@ -821,6 +833,8 @@ pub(crate) fn listener_config_for_test(config: &crate::config::Config) -> Config
 fn reject_code(reason: Refused) -> RejectCode {
     match reason {
         Refused::Key(error) => error.reject_code().unwrap_or(RejectCode::BADSECRET),
+        // As a wrong passphrase: the replayer learns nothing new.
+        Refused::Replay => RejectCode::BADSECRET,
         reason => RejectCode::http(reason.status()),
     }
 }

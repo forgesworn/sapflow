@@ -67,6 +67,7 @@ pub const OWNED: usize = 16_384;
 
 /// A caller's key material as the guard compares it, with who sent it.
 /// Prints nothing of the key material.
+#[derive(Clone)]
 pub struct Seen {
     digest: [u8; 32],
     peer: SocketAddr,
@@ -207,6 +208,44 @@ impl ReplayGuard {
     /// [`PER_PATH`] and the oldest ended entry of all past [`TOTAL`]. From
     /// now on it is refused to everyone. With a store, do not claim or
     /// accept the caller until [`persist`] has written it.
+    /// [`remember`](Self::remember) where the listener cannot be asked which
+    /// connections are still waiting or open (a scoped admission task):
+    /// nothing is evicted, so the tier may run over its bounds until the SRT
+    /// loop next calls [`trim`](Self::trim). Over by at most the admissions
+    /// in flight.
+    pub fn remember_untrimmed(&mut self, path: &str, seen: Seen) {
+        self.push(path, seen.digest, Some((seen.conn, seen.caller_socket)));
+        self.generation += 1;
+    }
+
+    /// Evicts what [`remember_untrimmed`](Self::remember_untrimmed) left over
+    /// the bounds, as [`remember`](Self::remember) would have: each path's
+    /// oldest ended entries past [`PER_PATH`], then past [`TOTAL`] the
+    /// oldest ended entry of the path holding the most. Never one whose
+    /// connection is waiting or open. Cheap when within the bounds.
+    pub fn trim(&mut self, caller_socket: impl Fn(ConnId) -> Option<u32>) {
+        let over: Vec<Box<str>> = self
+            .admitted
+            .iter()
+            .filter(|(_, q)| q.len() > PER_PATH)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in over {
+            while self.admitted.get(&path).map_or(0, VecDeque::len) > PER_PATH {
+                let Some(at) = self.oldest_ended(&path, &caller_socket) else {
+                    break;
+                };
+                self.evict(&path, at);
+            }
+        }
+        while self.admitted_len > TOTAL {
+            let Some((crowded, at)) = self.crowded_oldest_ended(&caller_socket) else {
+                break;
+            };
+            self.evict(&crowded, at);
+        }
+    }
+
     pub fn remember(
         &mut self,
         path: &str,
@@ -283,6 +322,19 @@ impl ReplayGuard {
             && let Some((crowded, at)) = self.crowded_oldest_ended(caller_socket)
         {
             self.evict(&crowded, at);
+        }
+        self.push(path, digest, conn);
+    }
+
+    /// Adds an entry, replacing any with the same digest, evicting nothing.
+    fn push(&mut self, path: &str, digest: [u8; 32], conn: Option<(ConnId, u32)>) {
+        if let Some(old) = self.admitted_index.get(&digest).cloned()
+            && let Some(at) = self
+                .admitted
+                .get(&old)
+                .and_then(|q| q.iter().position(|e| e.digest == digest))
+        {
+            self.evict(&old, at);
         }
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -370,6 +422,49 @@ pub fn persist(
     store.write(&bytes)?;
     store.set_written(now);
     Ok(())
+}
+
+/// A scoped SRT caller's replay check, for
+/// [`crate::publish_sessions::PublishSessions::admit_with_key`] to run once
+/// its key has passed and before anything is reserved for it: key material
+/// that already admitted a connection is refused; otherwise it is
+/// remembered, and with a store written before the hook returns, so the
+/// claim waits for it. The file work runs in a blocking task.
+pub fn scoped_check(
+    app: &Arc<crate::App>,
+    path: String,
+    seen: Seen,
+) -> crate::publish_sessions::BeforeReserve {
+    use crate::publish_sessions::Refused;
+    let app = app.clone();
+    Box::new(move || {
+        Box::pin(async move {
+            let (store, generation) = {
+                let mut guard = app.srt_replay.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.admitted(&seen) {
+                    return Err(Refused::Replay);
+                }
+                guard.remember_untrimmed(&path, seen);
+                match guard.store() {
+                    Some(store) => (store, guard.generation()),
+                    None => return Ok(()),
+                }
+            };
+            let writer = app.clone();
+            match tokio::task::spawn_blocking(move || {
+                persist(&writer.srt_replay, &store, generation)
+            })
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "SRT replay store not written; caller refused");
+                    Err(Refused::Unrecorded)
+                }
+                Err(_) => Err(Refused::Unrecorded),
+            }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -623,6 +718,32 @@ mod tests {
         }
         // The tenant's own oldest went first.
         assert!(!guard.admitted(&seen(1000, 7000, 0, 0)));
+    }
+
+    #[test]
+    fn untrimmed_admissions_are_trimmed_to_the_bounds_by_the_loop() {
+        let mut guard = ReplayGuard::default();
+        let live = only(1, 7);
+        guard.remember_untrimmed("live/event-victim", seen(0, 5000, 7, 1));
+        for i in 1..4 {
+            guard.remember_untrimmed("live/event-victim", seen(i, 5000, i, i + 1));
+        }
+        let flood = u32::try_from(TOTAL * 2).expect("small");
+        for i in 0..flood {
+            let path = format!("live/event-tenant-{}", i % 40);
+            guard.remember_untrimmed(&path, seen(1000 + i, 6000, i, i + 10));
+        }
+        assert!(guard.sizes().1 > TOTAL, "untrimmed");
+        guard.trim(&live);
+        assert!(guard.sizes().1 <= TOTAL);
+        assert!(guard.admitted.values().all(|q| q.len() <= PER_PATH));
+        for i in 0..4 {
+            assert!(guard.admitted(&seen(i, 7000, 0, 0)), "victim entry {i}");
+        }
+        assert!(
+            !guard.admitted(&seen(1000, 7000, 0, 0)),
+            "the tenant's oldest"
+        );
     }
 
     #[test]
