@@ -25,7 +25,9 @@
 // (SAPFLOW_SRT_APP_KEYS=1, encryption required, no global passphrase): a
 // stub publish-auth hook on loopback answers sapflow's SRT request with the
 // stream's passphrase in the `sapflow-srt-passphrase` header, and OBS's URL
-// carries only the path in its stream ID and that passphrase. With
+// carries only the path in its stream ID and that passphrase. The replay
+// store sapflow then requires is <out>/srt-replay/ (private, 0700), kept
+// across a --restart-at restart as on a real redeploy. With
 // --app-key-wrong, OBS is given a different passphrase and should never be
 // admitted.
 //
@@ -228,13 +230,21 @@ function writeProfile(source) {
 }
 
 let runs = 0;
+// The replay store's directory: private, and reached without symlinks, as
+// sapflow requires (on macOS /tmp is one, so resolve --out first).
+function replayStore() {
+  const dir = path.join(fs.realpathSync(out), 'srt-replay');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return path.join(dir, 'srt-replay');
+}
 function sapflow() {
   runs += 1;
   const env = {
     ...process.env,
     SAPFLOW_HTTP_ADDR: `127.0.0.1:${port.hls}`, SAPFLOW_SRT_ADDR: `127.0.0.1:${port.srt}`, SAPFLOW_RTMP_ADDR: `127.0.0.1:${port.rtmp}`,
     ...(appKey ? {
-      SAPFLOW_SRT_APP_KEYS: '1', SAPFLOW_SRT_ENCRYPTION: 'required',
+      SAPFLOW_SRT_APP_KEYS: '1', SAPFLOW_SRT_ENCRYPTION: 'required', SAPFLOW_SRT_REPLAY_STORE: replayStore(),
       SAPFLOW_PUBLISH_AUTH_URL: `http://127.0.0.1:${port.hook}/auth`,
     } : {
       SAPFLOW_PUBLISH_USER: USER, SAPFLOW_PUBLISH_PASS: PASS,
