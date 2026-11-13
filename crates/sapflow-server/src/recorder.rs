@@ -47,6 +47,8 @@ pub struct RecordingLimits {
     paths: Mutex<HashMap<String, Weak<PathLimits>>>,
     path_bytes: usize,
     path_writers: usize,
+    /// All of `writers`: every permit is back once every writer has ended.
+    writer_capacity: usize,
     #[cfg(test)]
     test_files: Mutex<Option<Arc<tests::GatedFiles>>>,
 }
@@ -97,20 +99,49 @@ impl RecordingLimits {
         self.path_writers - self.path(path).writers.available_permits()
     }
 
+    /// Default limits whose recording files never finish writing, for tests
+    /// of what waits on writers.
+    #[cfg(test)]
+    pub(crate) fn with_stalled_files(max_publishers: usize) -> Self {
+        let limits = Self::new(max_publishers);
+        *limits
+            .test_files
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(Arc::new(tests::GatedFiles::default()));
+        limits
+    }
+
+    /// Waits until every recording writer has ended: its file synced and its
+    /// `recordSegmentComplete` queued, or the recording failed. A writer
+    /// returns its permit only after both.
+    pub async fn writers_finished(&self) {
+        let capacity = u32::try_from(self.writer_capacity).unwrap_or(u32::MAX);
+        let _all = self.writers.acquire_many(capacity).await;
+    }
+
+    /// How many recording writers have not ended yet.
+    pub fn writers_running(&self) -> usize {
+        self.writer_capacity
+            .saturating_sub(self.writers.available_permits())
+    }
+
     fn with_capacities(
         bytes: usize,
         path_bytes: usize,
         writers: usize,
         path_writers: usize,
     ) -> Self {
+        let writers = writers.min(Semaphore::MAX_PERMITS);
         Self {
             // The ceiling remains valid when Semaphore's representable count
             // is smaller, notably for a 512 MiB byte count on 32-bit targets.
             bytes: Arc::new(Semaphore::new(bytes.min(Semaphore::MAX_PERMITS))),
-            writers: Arc::new(Semaphore::new(writers.min(Semaphore::MAX_PERMITS))),
+            writers: Arc::new(Semaphore::new(writers)),
             paths: Mutex::new(HashMap::new()),
             path_bytes: path_bytes.min(Semaphore::MAX_PERMITS),
             path_writers: path_writers.min(Semaphore::MAX_PERMITS),
+            writer_capacity: writers,
             #[cfg(test)]
             test_files: Mutex::new(None),
         }
@@ -197,10 +228,12 @@ pub enum IncompleteReason {
     /// after this file, or before it, were served but not recorded
     /// (`SAPFLOW_RECORDING_ROLL_*`).
     EpochRate,
+    /// sapflow was stopped (SIGTERM or ctrl-c) while the publisher was live.
+    ServerStopped,
 }
 
 impl IncompleteReason {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::TransportDrop,
         Self::TransportTimeout,
         Self::IngestQueueFull,
@@ -216,6 +249,7 @@ impl IncompleteReason {
         Self::DiskLow,
         Self::EpochUnrecorded,
         Self::EpochRate,
+        Self::ServerStopped,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -235,6 +269,7 @@ impl IncompleteReason {
             Self::DiskLow => "disk-low",
             Self::EpochUnrecorded => "epoch-unrecorded",
             Self::EpochRate => "epoch-rate",
+            Self::ServerStopped => "server-stopped",
         }
     }
 
@@ -1721,6 +1756,50 @@ mod tests {
             .await;
         assert_eq!(files.live.load(Ordering::SeqCst), 0);
         assert!(receivers.iter().all(|receiver| receiver.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_writers_ends_only_when_the_last_writer_has_queued_its_callback() {
+        let scratch = ScopedScratch::new("writers-finished");
+        let (tracks, parts) = fixture_parts();
+        let size = parts[0].data.len();
+        let (limits, files) = gated_limits(size * 8, size * 2, 4);
+        // Nothing has started a writer: there is nothing to wait for.
+        tokio::time::timeout(Duration::from_millis(100), limits.writers_finished())
+            .await
+            .expect("no writer running");
+        let scope = crate::publish_observer::fixture_scope("writers-finished", 1, 1, 1);
+        let (callbacks, mut events) = crate::callback::test_queue(scope.clone(), 2);
+        let factory =
+            RecorderFactory::new(&scratch.0, &scope.key().path, callbacks, 0, limits.clone());
+        let mut recorder = factory.start();
+        recorder.feed(tracks, vec![parts[0].clone()]);
+        drop(recorder);
+        drop(factory);
+        files.blocked(0, false).await;
+        assert_eq!(limits.writers_running(), 1);
+        // A writer that never finishes holds the wait until its caller's
+        // deadline, which is what bounds a stop.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), limits.writers_finished())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            limits.writers_running(),
+            1,
+            "a timed-out wait holds no permit"
+        );
+        files.release(0, true, false);
+        tokio::time::timeout(Duration::from_secs(3), limits.writers_finished())
+            .await
+            .expect("released writer ends");
+        assert_eq!(limits.writers_running(), 0);
+        let completion = events
+            .try_recv()
+            .expect("callback queued before the permit");
+        let body: serde_json::Value = serde_json::from_slice(&completion.body).expect("JSON");
+        assert_eq!(body["event"], "recordSegmentComplete");
     }
 
     #[tokio::test]

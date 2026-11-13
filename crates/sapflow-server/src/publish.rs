@@ -39,6 +39,8 @@ pub enum Refusal {
     /// no usable answer: unreachable, too slow, or neither 2xx nor 401/403.
     /// Carries nothing the app said.
     AuthUnavailable,
+    /// sapflow is stopping (SIGTERM or ctrl-c) and takes no new publisher.
+    Stopping,
 }
 
 /// Proof that [`Publication::admit`] admitted a request; spent by
@@ -377,6 +379,7 @@ impl Publication {
                 ClaimError::PublisherLimit => Refusal::PublisherLimit,
                 ClaimError::PresentationLimit => Refusal::PresentationLimit,
                 ClaimError::MemoryLimit => Refusal::MemoryLimit,
+                ClaimError::Stopping => Refusal::Stopping,
             })?;
         tracing::info!(
             path = %req.path.as_path(),
@@ -511,6 +514,7 @@ impl Publication {
                 "stream ready"
             );
             self.callbacks.send(&self.stream.path, StreamEvent::Publish);
+            session.owe_unpublish(self.generation, self.callbacks.clone());
         }
         // A new init segment: the old recording ends here (its file is
         // finished and reported once its late audio is settled) and a new
@@ -592,9 +596,9 @@ impl Drop for Publication {
             }
             return;
         }
-        if self.published {
-            self.callbacks
-                .send(&self.stream.path, StreamEvent::Unpublish);
+        // Unless a stop has sent it already (Registry::stop_all).
+        if let Some(callbacks) = self.stream.session().take_unpublish(self.generation) {
+            callbacks.send(&self.stream.path, StreamEvent::Unpublish);
         }
         // The last complete AAC PES can create the first servable part only
         // at EOF. Registry decides whether to hold after draining it.

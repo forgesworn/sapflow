@@ -12,7 +12,7 @@ use bytes::Bytes;
 use sapflow_core::{StreamEvent, StreamPath, callback_url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::http_lite::{self, Endpoint, ParsedResponse};
 use crate::publish_observer::{CallbackScope, CallbackTicket, RecordingObservation};
@@ -29,6 +29,25 @@ pub(crate) struct Queued {
     name: &'static str,
     pub(crate) body: Bytes,
     ticket: Option<CallbackTicket>,
+    _pending: Pending,
+}
+
+/// Counts one event from enqueue until the sender is done with it, delivered
+/// or failed, or until it is dropped unsent. An empty channel is not enough:
+/// the event being sent, through all its attempts, has left it.
+struct Pending(Arc<watch::Sender<usize>>);
+
+impl Pending {
+    fn new(count: &Arc<watch::Sender<usize>>) -> Self {
+        count.send_modify(|n| *n += 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 #[derive(Clone)]
@@ -36,24 +55,27 @@ pub struct Callbacks {
     tx: Option<mpsc::Sender<Queued>>,
     scope: Option<Arc<CallbackScope>>,
     recording: Option<RecordingObservation>,
+    /// Events queued and not yet done with, shared by every clone.
+    pending: Arc<watch::Sender<usize>>,
 }
 
 impl Callbacks {
     /// Starts the sender. With no URL configured, events are only logged.
     pub fn start(url: Option<String>, secret: Option<String>) -> Self {
         let Some(url) = url else {
-            return Self {
-                tx: None,
-                scope: None,
-                recording: None,
-            };
+            return Self::with_queue(None);
         };
         let (tx, rx) = mpsc::channel(QUEUE);
         tokio::spawn(run(url, secret, rx));
+        Self::with_queue(Some(tx))
+    }
+
+    fn with_queue(tx: Option<mpsc::Sender<Queued>>) -> Self {
         Self {
-            tx: Some(tx),
+            tx,
             scope: None,
             recording: None,
+            pending: Arc::new(watch::Sender::new(0)),
         }
     }
 
@@ -62,7 +84,21 @@ impl Callbacks {
             tx: self.tx.clone(),
             scope: Some(scope),
             recording: None,
+            pending: self.pending.clone(),
         }
+    }
+
+    /// Events queued that the sender has not finished with yet.
+    pub fn pending(&self) -> usize {
+        *self.pending.borrow()
+    }
+
+    /// Waits until every queued event has been delivered or has failed. Events
+    /// queued meanwhile are waited for too. The caller bounds the wait: one
+    /// event can take four attempts of up to five seconds each.
+    pub async fn drained(&self) {
+        let mut pending = self.pending.subscribe();
+        let _ = pending.wait_for(|n| *n == 0).await;
     }
 
     pub(crate) fn for_recording(&self) -> Result<(Self, Option<RecordingObservation>), ()> {
@@ -153,6 +189,7 @@ impl Callbacks {
             name: event.name(),
             body: Bytes::from(body),
             ticket,
+            _pending: Pending::new(&self.pending),
         };
         if let Err(error) = tx.try_send(queued) {
             let (mut queued, unavailable) = match error {
@@ -225,14 +262,7 @@ impl Callbacks {
 #[cfg(test)]
 pub(crate) fn legacy_test_queue(capacity: usize) -> (Callbacks, mpsc::Receiver<Queued>) {
     let (tx, rx) = mpsc::channel(capacity);
-    (
-        Callbacks {
-            tx: Some(tx),
-            scope: None,
-            recording: None,
-        },
-        rx,
-    )
+    (Callbacks::with_queue(Some(tx)), rx)
 }
 
 #[cfg(test)]
@@ -241,14 +271,9 @@ pub(crate) fn test_queue(
     capacity: usize,
 ) -> (Callbacks, mpsc::Receiver<Queued>) {
     let (tx, rx) = mpsc::channel(capacity);
-    (
-        Callbacks {
-            tx: Some(tx),
-            scope: Some(scope),
-            recording: None,
-        },
-        rx,
-    )
+    let mut callbacks = Callbacks::with_queue(Some(tx));
+    callbacks.scope = Some(scope);
+    (callbacks, rx)
 }
 
 /// Why an attempt got no status. Neither carries the error text: it may
@@ -634,11 +659,7 @@ mod tests {
         );
         assert_eq!(rx.len(), 0);
         assert_eq!(scope.observations.callback_state(), "failed");
-        let legacy = Callbacks {
-            tx: None,
-            scope: None,
-            recording: None,
-        };
+        let legacy = Callbacks::with_queue(None);
         let body = legacy
             .body(&scope.key().path, &StreamEvent::Publish)
             .expect("legacy");
@@ -920,6 +941,67 @@ mod tests {
             .collect();
         assert_eq!(sequences, [1, 2, 3, 4]);
         state_is(&scope, "delivered", Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn an_event_counts_until_the_sender_is_done_with_it() {
+        // Without a URL nothing is queued, so there is nothing to wait for.
+        let unsent = Callbacks::start(None, None);
+        unsent.send(
+            &fixture_scope("a", 1, 1, 1).key().path,
+            StreamEvent::Publish,
+        );
+        assert_eq!(unsent.pending(), 0);
+        tokio::time::timeout(Duration::from_millis(50), unsent.drained())
+            .await
+            .expect("nothing queued");
+
+        // Taken off the queue is not done: the sender's event in flight,
+        // through all its attempts, still counts.
+        let scope = fixture_scope("a", 1, 1, 1);
+        let (callbacks, mut rx) = test_queue(scope.clone(), 4);
+        let scoped = callbacks.scoped(scope.clone());
+        scoped.send(&scope.key().path, StreamEvent::Publish);
+        assert_eq!(callbacks.pending(), 1, "shared by every clone");
+        let in_flight = rx.recv().await.expect("queued");
+        assert_eq!(callbacks.pending(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), callbacks.drained())
+                .await
+                .is_err()
+        );
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_millis(50), callbacks.drained())
+            .await
+            .expect("done with");
+
+        // A queue that refused the event never counts it.
+        drop(rx);
+        callbacks.send(&scope.key().path, StreamEvent::Unpublish);
+        assert_eq!(callbacks.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_queue_drains_when_every_event_is_delivered_or_has_failed() {
+        for (status, delivered) in [(204, true), (403, false)] {
+            let receiver = Receiver::start(move |_| answer_status(status)).await;
+            let scope = fixture_scope("a", 1, 1, 1);
+            let callbacks = Callbacks::start(Some(receiver.url()), None).scoped(scope.clone());
+            for event in [StreamEvent::Publish, health(), StreamEvent::Unpublish] {
+                callbacks.send(&scope.key().path, event);
+            }
+            tokio::time::timeout(Duration::from_secs(2), callbacks.drained())
+                .await
+                .expect("bounded drain");
+            assert_eq!(callbacks.pending(), 0);
+            assert_eq!(
+                receiver.count(),
+                3,
+                "every event answered before it is done"
+            );
+            let counts = scope.observations.counts();
+            assert_eq!(counts.callbacks_delivered, if delivered { 3 } else { 0 });
+        }
     }
 
     #[tokio::test]

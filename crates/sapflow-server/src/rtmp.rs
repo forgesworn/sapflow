@@ -342,6 +342,7 @@ impl Conn<'_> {
                             Refusal::MemoryLimit => {
                                 ("NetStream.Publish.Denied", "media memory limit")
                             }
+                            Refusal::Stopping => ("NetStream.Publish.Denied", "server stopping"),
                             _ => ("NetStream.Publish.Denied", "refused"),
                         };
                         // Send the refusal, then close.
