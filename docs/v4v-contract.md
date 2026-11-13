@@ -300,8 +300,9 @@ while encoders connect:
 
 - A file that was finished, but whose callback was never delivered (v4v was
   down, the stop deadline passed, the queue was full), gets the callback it
-  had: the same `recordingState`, `recordingReason`, `segmentDuration` and
-  `segmentPath`.
+  had, byte for byte: the same `recordingState`, `recordingReason`,
+  `segmentDuration`, `segmentPath` and, for a scoped recording, identity and
+  `eventSequence`.
 - A file whose writer never finished (SIGKILL, OOM kill, crash, power cut,
   or a stop whose deadline came first) gets `recordingState: "incomplete"`
   with `recordingReason: "server-interrupted"` and, as `segmentDuration`,
@@ -316,22 +317,40 @@ while encoders connect:
 
 These callbacks go one at a time, at least a second apart (60 a minute at
 most, half of the 120 v4v takes from one address, leaving the rest to live
-stages), through the same queue as live events, each with the usual four
-attempts. One is forgotten only when v4v answers it 2xx. A failure (v4v not
-yet up after a power cut that restarted both, or answering 5xx) is tried
-again while sapflow runs, 30 s later, then at doubling waits up to every 10
-minutes, until it is delivered or expires; after three failures in a row the
-rest of that round waits too. A 4xx (a wrong token after a redeploy, say)
-is not retried in that run, but kept for the next start, so it is sent at
-each start until v4v takes it or it expires. A start sends at most 4,096,
-oldest first.
+stages), on a sender of their own, so a slow answer never holds up a live
+stage's `publish`: two attempts each, of up to ten minutes, since v4v copies
+and hashes the whole file before it answers (a four-hour show at 4,000
+kbit/s is about 8 GB, some seven minutes at 20 MB/s). One is forgotten only
+when v4v answers it 2xx. A failure (v4v not yet up after a power cut that
+restarted both, or answering 408, 429 or 5xx) is tried again while sapflow
+runs, 30 s later, then 60 s and 120 s; after three retry rounds it waits for
+the next start, so a receiver that keeps failing is not asked without end.
+After three failures in a row the rest of a round waits too. A 4xx other
+than 408 and 429 (a wrong token after a redeploy, say) is not retried in
+that run, but kept for the next start, so it is sent at each start until
+v4v takes it or it expires. A start sends at most 4,096, oldest first.
+A stop does not wait for a recovered callback in flight: it stays owed.
+
+Every callback, live or recovered, treats 408 and 429 as "try again", not
+as a refusal, and waits as long as a `Retry-After` header (seconds) or a
+`retryAfterMs` in the JSON body asks, up to a minute, before its next
+attempt.
+
+v4v follow-up: since every attempt that times out makes v4v copy the file
+again, its importer should answer before it copies (and copy in the
+background), or first check the path, size and modification time against
+a part it already holds and answer at once.
 
 A live callback that fails while sapflow keeps running (v4v down through all
 four attempts) stays owed too, but is sent only at the next start.
 
 Delivery is at least once: a callback v4v answered just before a crash, its
-record not yet removed, is sent again at the next start. v4v already treats
-the same file a second time as the same part (`kept`, `same-part`).
+record not yet removed, is sent again at the next start, as the same body.
+v4v's legacy importer treats the same file with the same bytes a second
+time as the same part (`kept`, `same-part`); recovery never changes a
+file's bytes. A scoped receiver can dedupe on `recordingId` and
+`eventSequence`, which a resend repeats. A file reported `server-interrupted`
+was never reported live, so it has no earlier report to differ from.
 
 v4v rejects a callback whose path does not match the prepared session.
 

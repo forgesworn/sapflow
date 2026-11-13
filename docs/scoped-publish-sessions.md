@@ -240,7 +240,11 @@ epoch. Status must not describe that cancelled owner as live or held.
 Scoped callbacks carry `contractVersion`, `eventId`, `eventGeneration`,
 `sessionId`, `connectionEpoch` and positive JavaScript-safe `eventSequence`.
 Publication and recorder share one sequence within an epoch. The receiver fences
-telemetry by the current identity, epoch and increasing sequence. A matching
+telemetry by the current identity, epoch and increasing sequence; it must not
+fence recording completions by sequence. With the recording outbox on (recording
+and a callback URL set), a completion carries the sequence its recording
+reserved when its file was created, so it can be below telemetry already
+delivered from the same epoch: match completions by `recordingId`. A matching
 final recording from an older connection epoch may finish after reconnect; it
 requires its independent bounded `recordingId` receipt and an identity recheck
 after any asynchronous copy. A replaced session/generation never becomes current
@@ -299,15 +303,15 @@ survives a restart in the recording outbox and is sent at the next start
 ([recordings reported after a restart](v4v-contract.md#recordings-reported-after-a-restart)).
 A scoped recovered completion carries the recording's own identity:
 `eventId`, `eventGeneration`, `sessionId`, `connectionEpoch`, `recordingId`
-and `recordingTracks`, as its live completion would. Its `eventSequence` is
-one the recording reserved from its connection's sequence when its file was
-created, since after a restart there is no connection to take one from. So
-live sequences skip one number for each scoped recording, and a recovered
-completion's sequence is lower than events the receiver has already seen
-from that epoch. Match a recovered completion by `recordingId`, as any
-completion from an older epoch is, and never fence it by sequence. A
-completion that was finished before the restart keeps its state and reason;
-one whose writer never finished is `incomplete` with `server-interrupted`.
+and `recordingTracks`, and the `eventSequence` the recording reserved when its
+file was created, since after a restart there is no connection to take one
+from. The live completion uses that same reserved sequence, so a resend of a
+finished recording is the same body, sequence and all, and a receiver that
+dedupes on it sees the same event; live sequences have no gap. A completion
+that was finished before the restart keeps its state and reason; one whose
+writer never finished is `incomplete` with `server-interrupted`, a different
+body for the same `recordingId`, which the receiver must accept as the
+recording's report rather than refuse as a conflict.
 
 The V4V connector supports explicit acknowledgement to abandon automatic
 recording adoption after a terminal incomplete/failed receipt. It rechecks fresh
