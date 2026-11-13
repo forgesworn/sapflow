@@ -153,11 +153,13 @@ Notes for the release after 0.2.0-rc.1.
   its `recordSegmentComplete`, and a stage still live never had its
   `unpublish`, so v4v kept the stage live and refused its encoder's next
   connection. sapflow now ends every stream at once with no reconnect
-  grace and closes its listeners; a publish request already under way is
-  refused (SRT `503`, RTMP `NetStream.Publish.Denied` "server stopping",
-  WHIP 503). It then waits up to 7.5 s for its recordings to finish and its
-  callbacks to be sent or fail, logs which happened, with counts, and
-  exits. A live stage gets `unpublish` and a file marked `incomplete` with
+  grace and closes its encoder listeners (HLS keeps serving until the
+  exit); a publish request already under way is refused (RTMP
+  `NetStream.Publish.Denied` "server stopping", WHIP 503), and an SRT
+  caller still in its handshake gets no answer and times out. It then
+  waits up to 7.5 s for its recordings to finish and its callbacks to be
+  sent or fail, logs which happened, with counts, and exits; a second
+  SIGTERM or ctrl-c exits at once. A live stage gets `unpublish` and a file marked `incomplete` with
   the new reason `server-stopped`; a stage held for a reconnect ends as at
   the end of its grace. The runtime then has half a second for blocking
   file work, so the exit fits Docker's default 10 s. A SIGKILL, or a file

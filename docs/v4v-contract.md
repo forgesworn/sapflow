@@ -125,6 +125,10 @@ stream at once, with no grace:
   `recordingReason: "server-stopped"`, or the reason its file already had.
 - A stage held for a reconnect, which has had its `unpublish`, gets
   `recordSegmentComplete` as when its grace runs out, normally `finalised`.
+- A file from the stage's previous codec epoch, still held for late audio,
+  gets its own `recordSegmentComplete`, normally `finalised`.
+
+With recording off, no `recordSegmentComplete` follows.
 
 sapflow waits up to 7.5 s for its files and callbacks, then exits, inside
 Docker's default 10 s stop timeout. A file still being written or a callback
