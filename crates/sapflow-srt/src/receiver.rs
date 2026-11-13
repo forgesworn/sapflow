@@ -2,6 +2,18 @@
 //! buffer, timestamp-based delivery (TSBPD) with too-late packet drop, ACKs,
 //! NAKs, RTT, keepalives and the idle timeout.
 //!
+//! A gap is reported in a NAK as soon as it is seen, as libsrt does, until
+//! the path is seen to reorder: a missing packet that then arrives as an
+//! original rather than a retransmission. From then on the first NAK of each
+//! new gap is held for a little longer than the latest such packet has come
+//! since the path last went a second without reordering (at most
+//! [`Settings::reorder_wait_max`] and an eighth of the latency, never into
+//! the last three round trips before the gap's deadline), so a packet that
+//! is only late is not resent. The wait halves after every second with no
+//! reordering, back to none. It adapts only for a caller that
+//! flags its retransmissions (`REXMITFLG`), since otherwise a retransmission
+//! that fills a gap looks like a late original.
+//!
 //! Times are microseconds on the listener's clock (`i64`, never negative in
 //! practice); packet timestamps are extended to 64 bits so nothing here
 //! wraps except the sequence numbers, which are compared circularly.
@@ -33,6 +45,13 @@ const MAX_HOLD_BEYOND_LATENCY: i64 = 1_000_000;
 const ACKS_REMEMBERED: usize = 64;
 /// Consecutive-original arrival gaps used for the link-capacity median.
 const PACKET_PAIR_GAPS: usize = 16;
+/// The reorder wait halves after this long with no reordered packet...
+const REORDER_DECAY: i64 = 1_000_000;
+/// ...down to none below this.
+const REORDER_FLOOR: i64 = 1_000;
+/// The wait covers the latest reordered packet's lateness, a quarter more,
+/// and this.
+const REORDER_MARGIN: i64 = 1_000;
 
 /// Per-connection receiver settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +64,14 @@ pub struct Settings {
     pub peer_idle: i64,
     /// Largest data payload accepted, in bytes; larger packets are ignored.
     pub max_payload: usize,
+    /// The caller set the retransmission flag (`REXMITFLG`) in its
+    /// handshake, so its retransmissions can be told from originals. The
+    /// reorder wait adapts only then.
+    pub retransmit_flag: bool,
+    /// The longest the first NAK of a new gap may be held while the path
+    /// reorders (microseconds); never more than an eighth of `latency`, and
+    /// 0 turns the hold off.
+    pub reorder_wait_max: i64,
 }
 
 /// Counts for one connection.
@@ -61,11 +88,20 @@ pub struct Stats {
     /// Copies of packets already delivered or given up on.
     pub belated: u64,
     /// Missing packets that then arrived as originals, not retransmissions:
-    /// the path reordered them. Each had already been queued in a NAK, so
-    /// the sender resends it for nothing. This relies on the caller setting
-    /// the retransmission flag (`REXMITFLG`), as libsrt does; a caller that
-    /// never sets it has its retransmissions counted here too.
+    /// the path reordered them. Those whose NAK had already gone out were
+    /// resent for nothing; [`nak_held`](Self::nak_held) counts the rest. This
+    /// relies on the caller setting the retransmission flag (`REXMITFLG`), as
+    /// libsrt does; a caller that never sets it has its retransmissions
+    /// counted here too.
     pub reordered: u64,
+    /// Of those, packets whose first NAK was still being held when they came,
+    /// so none was sent for them.
+    pub nak_held: u64,
+    /// The highest the reorder wait reached, in microseconds (0 if the path
+    /// never reordered, the caller does not flag retransmissions or the hold
+    /// is off). A first NAK is held for at most this, and less where the
+    /// gap's deadline is too near.
+    pub max_reorder_wait: u64,
     /// Packets found missing (each counted once).
     pub lost: u64,
     /// Missing packets skipped at their delivery time.
@@ -238,6 +274,11 @@ pub struct Receiver {
     next_km: i64,
     /// One distinct KM attempt after a decrypted forward key-slot change.
     early_km: bool,
+    /// How long the first NAK of a new gap is held (microseconds); 0 until
+    /// the path is seen to reorder.
+    reorder_wait: i64,
+    /// When `reorder_wait` was last raised or halved.
+    reorder_at: i64,
 }
 
 impl Receiver {
@@ -286,6 +327,8 @@ impl Receiver {
             crypto: None,
             next_km: 0,
             early_km: false,
+            reorder_wait: 0,
+            reorder_at: now,
         }
     }
 
@@ -341,10 +384,11 @@ impl Receiver {
     }
 
     /// Takes a data packet that arrived at `now`: checks its encryption,
-    /// buffers it, reports any gap in a NAK, sends a light ACK after enough
-    /// packets and releases contiguous data that is due. Missing packets
-    /// expire in [`on_timer`](Self::on_timer), after the adapter has drained a
-    /// bounded batch of ready input.
+    /// buffers it, reports any gap in a NAK (at once, or after the reorder
+    /// wait from [`on_timer`](Self::on_timer)), sends a light ACK after
+    /// enough packets and releases contiguous data that is due. Missing
+    /// packets expire in [`on_timer`](Self::on_timer), after the adapter has
+    /// drained a bounded batch of ready input.
     pub fn on_data(&mut self, now: i64, p: &DataPacket) {
         self.now = self.now.max(now);
         if self.closed.is_some() {
@@ -424,19 +468,39 @@ impl Receiver {
                 return;
             }
             *existing = Some(slot);
-            self.loss.remove(p.seq);
+            let taken = self.loss.take(p.seq, deliver_at);
             if !p.retransmitted {
                 self.stats.reordered += 1;
+                if let Some(taken) = taken {
+                    if !taken.reported {
+                        self.stats.nak_held += 1;
+                    }
+                    self.reordered(now, now.saturating_sub(taken.found));
+                }
             }
         } else {
             if idx > self.buf.len() {
-                // A gap: report it at once.
+                // A gap: report it at once, or hold the report while the
+                // path reorders. A hold the loss list cannot take is
+                // reported at once too.
                 let first = self.head.add(self.buf.len() as u32);
                 let last = p.seq.prev();
                 self.stats.lost += first.distance_to(last) as u64 + 1;
-                self.loss.add(first, last, now, deliver_at);
-                self.stats.naks_sent += 1;
-                self.queue(now, Control::Nak(vec![(first, last)]));
+                let wait = self.reorder_wait(now);
+                let held = wait > 0
+                    && self.loss.hold(
+                        first,
+                        last,
+                        now,
+                        deliver_at,
+                        now.saturating_add(wait),
+                        self.timing(),
+                    );
+                if !held {
+                    self.loss.add(first, last, now, deliver_at);
+                    self.stats.naks_sent += 1;
+                    self.queue(now, Control::Nak(vec![(first, last)]));
+                }
                 self.buf.resize_with(idx, || None);
             }
             self.buf.push_back(Some(slot));
@@ -454,6 +518,50 @@ impl Receiver {
         // already queued in its socket. Deliver contiguous ready data here,
         // but let its timer call expire gaps after the bounded receive batch.
         self.release(now, false);
+    }
+
+    /// The most the reorder wait may reach: the setting, within an eighth of
+    /// the latency; 0 (no hold) for a caller that does not flag its
+    /// retransmissions.
+    fn reorder_cap(&self) -> i64 {
+        if !self.settings.retransmit_flag {
+            return 0;
+        }
+        self.settings
+            .reorder_wait_max
+            .min(self.settings.latency / 8)
+            .max(0)
+    }
+
+    /// The reorder wait at `now`: halved for every second since it was last
+    /// raised, and none below a millisecond.
+    fn reorder_wait(&mut self, now: i64) -> i64 {
+        while self.reorder_wait > 0 && now.saturating_sub(self.reorder_at) >= REORDER_DECAY {
+            self.reorder_wait /= 2;
+            if self.reorder_wait < REORDER_FLOOR {
+                self.reorder_wait = 0;
+            }
+            self.reorder_at = self.reorder_at.saturating_add(REORDER_DECAY);
+        }
+        self.reorder_wait
+    }
+
+    /// An original filled a gap found `lateness` ago: hold later gaps' first
+    /// NAKs long enough to cover that, up to the cap.
+    fn reordered(&mut self, now: i64, lateness: i64) {
+        let cap = self.reorder_cap();
+        if cap == 0 {
+            return;
+        }
+        let want = (lateness.max(0).saturating_mul(5) / 4)
+            .saturating_add(REORDER_MARGIN)
+            .min(cap);
+        self.reorder_wait = self.reorder_wait(now).max(want);
+        self.reorder_at = now;
+        self.stats.max_reorder_wait = self
+            .stats
+            .max_reorder_wait
+            .max(u64::try_from(self.reorder_wait).unwrap_or(0));
     }
 
     /// `seq` is beyond the buffer: deliver or give up the oldest packets to
@@ -677,7 +785,9 @@ impl Receiver {
                 self.closed = Some(CloseReason::Shutdown);
             }
             Control::DropRequest { first, last, .. } => {
-                // The sender no longer has these: stop asking for them.
+                // The sender no longer has these: stop asking for them. A
+                // held loss this pushes off the list makes the next timer
+                // due at once, which reports it.
                 self.loss.remove_range(*first, *last);
             }
             _ => {}
@@ -762,6 +872,8 @@ mod tests {
             buffer: 64,
             peer_idle: 5_000 * MS,
             max_payload: 1456,
+            retransmit_flag: true,
+            reorder_wait_max: 50 * MS,
         }
     }
 
@@ -1587,6 +1699,360 @@ mod tests {
         );
         r.on_timer(150 * MS);
         assert!(!sent(&mut r).iter().any(|c| matches!(c, Control::Nak(_))));
+    }
+
+    /// At v4v's 2 s latency, so a new gap has room to be held (the reorder
+    /// cap is then the 50 ms setting).
+    fn rx2(retransmit_flag: bool) -> Receiver {
+        Receiver::new(
+            Settings {
+                latency: 2_000 * MS,
+                buffer: 32_768,
+                retransmit_flag,
+                ..settings()
+            },
+            0,
+            77,
+            Seq::new(ISN),
+            0,
+        )
+    }
+
+    fn nak_ranges(c: &[Control]) -> Vec<(Seq, Seq)> {
+        c.iter()
+            .filter_map(|c| match c {
+                Control::Nak(r) => Some(r.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Original `ISN + off`, stamped `ts`, arriving at `at`.
+    fn orig(r: &mut Receiver, off: u32, at: i64, ts: i64) {
+        r.on_data(at, &data(ISN + off, ts as u32, b"x"));
+    }
+
+    /// 0 at 0, 2 at 2 ms and 1 at 12 ms: 1 came 10 ms after its gap was
+    /// found, so the wait is 10 x 5/4 + 1 = 13.5 ms. Returns the time.
+    fn adapt(r: &mut Receiver) -> i64 {
+        orig(r, 0, 0, 0);
+        orig(r, 2, 2 * MS, 2 * MS);
+        assert_eq!(
+            nak_ranges(&sent(r)),
+            vec![(Seq::new(ISN + 1), Seq::new(ISN + 1))],
+            "no reordering seen yet: at once, as before"
+        );
+        orig(r, 1, 12 * MS, MS);
+        assert_eq!(r.stats().reordered, 1);
+        assert_eq!(r.stats().nak_held, 0, "its NAK had gone out");
+        12 * MS
+    }
+
+    /// Runs only the timer, at each time it asks for, until `end`; returns
+    /// each NAK range with the time it was sent.
+    fn timer_naks(r: &mut Receiver, end: i64) -> Vec<(i64, (Seq, Seq))> {
+        let mut out = Vec::new();
+        for _ in 0..100_000 {
+            // As an adapter would: a timer already past runs now.
+            let at = r.next_timer().max(r.now);
+            if at > end || r.closed().is_some() {
+                return out;
+            }
+            r.on_timer(at);
+            out.extend(nak_ranges(&sent(r)).into_iter().map(|range| (at, range)));
+        }
+        panic!("the timer does not advance");
+    }
+
+    #[test]
+    fn reordered_originals_within_the_wait_send_no_nak_once_adapted() {
+        let mut r = rx2(true);
+        let mut t = adapt(&mut r);
+        assert_eq!(r.reorder_wait, 13_500);
+        assert_eq!(r.stats().max_reorder_wait, 13_500);
+        // Fifty more pairs swapped, each original 10 ms late.
+        for k in 0..50 {
+            let a = 3 + 2 * k;
+            t += MS;
+            orig(&mut r, a + 1, t, t);
+            t += 10 * MS;
+            orig(&mut r, a, t, t - 11 * MS);
+            r.on_timer(t);
+        }
+        assert!(nak_ranges(&sent(&mut r)).is_empty(), "no NAK for any");
+        assert!(timer_naks(&mut r, t + 3_000 * MS).is_empty());
+        let st = r.stats();
+        assert_eq!((st.reordered, st.nak_held, st.naks_sent), (51, 50, 1));
+        assert_eq!((st.lost, st.dropped, st.delivered), (51, 0, 103));
+    }
+
+    #[test]
+    fn genuine_loss_is_reported_from_the_timer_when_the_wait_ends() {
+        let mut r = rx2(true);
+        let t = adapt(&mut r) + MS;
+        // 3 never comes.
+        orig(&mut r, 4, t, t);
+        assert!(nak_ranges(&sent(&mut r)).is_empty(), "held");
+        let due = t + 13_500;
+        assert_eq!(r.loss.next_due(r.now, r.timing()), Some(due));
+        assert!(r.next_timer() <= due, "the timer wakes for it");
+        // Nothing but the timer from here: the report comes when the wait
+        // ends, then the ordinary re-requests.
+        let naks = timer_naks(&mut r, t + 2_100 * MS);
+        let s3 = (Seq::new(ISN + 3), Seq::new(ISN + 3));
+        assert_eq!(naks.first(), Some(&(due, s3)));
+        assert!(naks.len() > 1 && naks.iter().all(|(_, range)| *range == s3));
+        assert_eq!(r.stats().nak_held, 0);
+        assert_eq!(r.stats().dropped, 1);
+    }
+
+    #[test]
+    fn without_the_retransmission_flag_the_wait_never_adapts() {
+        let mut r = rx2(false);
+        orig(&mut r, 0, 0, 0);
+        let mut t = 0;
+        for k in 0..20 {
+            let a = 1 + 2 * k;
+            t += MS;
+            orig(&mut r, a + 1, t, t);
+            t += 10 * MS;
+            orig(&mut r, a, t, t - 11 * MS);
+        }
+        assert_eq!(nak_ranges(&sent(&mut r)).len(), 20, "every gap at once");
+        let st = r.stats();
+        assert_eq!((st.reordered, st.nak_held, st.max_reorder_wait), (20, 0, 0));
+        assert_eq!(r.reorder_wait, 0);
+        // Nor with the flag when retransmissions fill the gaps.
+        let mut r = rx2(true);
+        orig(&mut r, 0, 0, 0);
+        orig(&mut r, 2, MS, MS);
+        let mut p = data(ISN + 1, 0, b"x");
+        p.retransmitted = true;
+        r.on_data(40 * MS, &p);
+        assert_eq!(r.reorder_wait, 0);
+        assert_eq!(r.stats().reordered, 0);
+    }
+
+    #[test]
+    fn the_wait_is_capped_by_the_setting_and_an_eighth_of_the_latency() {
+        let reorder = |r: &mut Receiver, late: i64| {
+            orig(r, 0, 0, 0);
+            orig(r, 2, MS, MS);
+            orig(r, 1, MS + late, 0);
+            r.reorder_wait
+        };
+        assert_eq!(reorder(&mut rx2(true), 500 * MS), 50 * MS);
+        let mut r = rx();
+        assert_eq!(reorder(&mut r, 100 * MS), LATENCY / 8);
+        assert_eq!(r.stats().max_reorder_wait, 25_000);
+        let mut r = Receiver::new(
+            Settings {
+                latency: 2_000 * MS,
+                reorder_wait_max: 0,
+                ..settings()
+            },
+            0,
+            77,
+            Seq::new(ISN),
+            0,
+        );
+        assert_eq!(reorder(&mut r, 10 * MS), 0, "0 turns it off");
+    }
+
+    #[test]
+    fn no_hold_near_the_deadline() {
+        // At 200 ms with the starting 100 ms round trip, every gap is
+        // already within three round trips of its deadline.
+        let mut r = rx();
+        orig(&mut r, 0, 0, 0);
+        orig(&mut r, 2, MS, MS);
+        orig(&mut r, 1, 11 * MS, 0);
+        assert!(r.reorder_wait > 0);
+        sent(&mut r);
+        orig(&mut r, 4, 12 * MS, 12 * MS);
+        assert_eq!(
+            nak_ranges(&sent(&mut r)),
+            vec![(Seq::new(ISN + 3), Seq::new(ISN + 3))]
+        );
+        // At 2 s, a gap revealed by a packet due in 250 ms: at once.
+        let mut r = rx2(true);
+        let t = adapt(&mut r) + 1_800 * MS;
+        orig(&mut r, 4, t - 10 * MS, t - 1_760 * MS);
+        assert!(r.reorder_wait > 0);
+        assert_eq!(
+            nak_ranges(&sent(&mut r)),
+            vec![(Seq::new(ISN + 3), Seq::new(ISN + 3))]
+        );
+        // Its original, 10 ms late, keeps the wait at 13.5 ms...
+        orig(&mut r, 3, t, t - 1_761 * MS);
+        assert_eq!(r.reorder_wait, 13_500);
+        // ...but a gap due in 310 ms is held only until 300 ms (three of
+        // the starting round trips) before: 10 ms.
+        orig(&mut r, 6, t, t - 1_690 * MS);
+        assert!(nak_ranges(&sent(&mut r)).is_empty());
+        let naks = timer_naks(&mut r, t + 20 * MS);
+        assert_eq!(
+            naks.first(),
+            Some(&(t + 10 * MS, (Seq::new(ISN + 5), Seq::new(ISN + 5))))
+        );
+    }
+
+    #[test]
+    fn the_wait_halves_every_quiet_second_back_to_none() {
+        let mut r = rx2(true);
+        let t = adapt(&mut r);
+        assert_eq!(r.reorder_wait(t + 999 * MS), 13_500);
+        assert_eq!(r.reorder_wait(t + 1_000 * MS), 6_750);
+        assert_eq!(r.reorder_wait(t + 2_500 * MS), 3_375);
+        assert_eq!(r.reorder_wait(t + 3_000 * MS), 1_687);
+        assert_eq!(r.reorder_wait(t + 4_000 * MS), 0, "under 1 ms is none");
+        assert_eq!(r.stats().max_reorder_wait, 13_500);
+        // Then a gap is reported at once again.
+        let t = t + 4_000 * MS;
+        orig(&mut r, 3, t, t);
+        orig(&mut r, 5, t, t);
+        assert_eq!(
+            nak_ranges(&sent(&mut r)),
+            vec![(Seq::new(ISN + 4), Seq::new(ISN + 4))]
+        );
+        // A long quiet spell goes straight to none, and new reordering
+        // raises it again.
+        let mut r = rx2(true);
+        let t = adapt(&mut r);
+        assert_eq!(r.reorder_wait(t + 60_000 * MS), 0);
+        let mut r = rx2(true);
+        let t = adapt(&mut r) + 1_500 * MS;
+        orig(&mut r, 3, t, t);
+        orig(&mut r, 5, t, t);
+        orig(&mut r, 4, t + 2 * MS, t);
+        assert_eq!(r.reorder_wait, 6_750, "halved once, above 2 x 5/4 + 1 ms");
+        orig(&mut r, 7, t + 3 * MS, t);
+        orig(&mut r, 6, t + 23 * MS, t);
+        assert_eq!(r.reorder_wait, 26_000);
+    }
+
+    #[test]
+    fn a_full_loss_list_never_loses_an_unreported_gap() {
+        use crate::loss::MAX_RANGES;
+        let mut r = rx2(true);
+        let t = adapt(&mut r) + MS;
+        // Gaps of three, more than the list holds, all found at once.
+        let gaps = MAX_RANGES as u32 + 10;
+        for k in 1..=gaps {
+            orig(&mut r, 2 + 4 * k, t, t);
+        }
+        let missing = |k: u32| (Seq::new(ISN + 4 * k - 1), Seq::new(ISN + 4 * k + 1));
+        // The list took the first ones on hold; the rest are asked for at
+        // once.
+        let at_once = nak_ranges(&sent(&mut r));
+        assert_eq!(
+            at_once,
+            (MAX_RANGES as u32 + 1..=gaps)
+                .map(missing)
+                .collect::<Vec<_>>()
+        );
+        // An original filling the middle of the first gap splits it, which
+        // pushes the latest held one off the full list: reported now.
+        orig(&mut r, 4, t + MS, t);
+        assert_eq!(nak_ranges(&sent(&mut r)), vec![missing(MAX_RANGES as u32)]);
+        // Every other gap is reported when the wait ends.
+        let held: Vec<_> = timer_naks(&mut r, t + 14 * MS)
+            .into_iter()
+            .map(|(_, range)| range)
+            .collect();
+        let mut expected = vec![
+            (Seq::new(ISN + 3), Seq::new(ISN + 3)),
+            (Seq::new(ISN + 5), Seq::new(ISN + 5)),
+        ];
+        expected.extend((2..MAX_RANGES as u32).map(missing));
+        assert_eq!(held, expected);
+    }
+
+    /// A small deterministic generator for the schedule below.
+    struct XorShift(u64);
+    impl XorShift {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    #[test]
+    fn under_heavy_reordering_and_loss_every_lost_packet_is_reported_in_time() {
+        for seed in [1, 7, 42] {
+            let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let mut r = rx2(true);
+            // A packet every 10 us for 200 ms; 2% lost, half the rest late
+            // by up to 30 ms: well over MAX_RANGES gaps open at once.
+            let n = 20_000u32;
+            let mut arrivals = Vec::new();
+            let mut lost = Vec::new();
+            for i in 0..n {
+                let sent_at = i64::from(i) * 10;
+                if i > 0 && rng.below(100) < 2 {
+                    lost.push(i);
+                    continue;
+                }
+                let late = if rng.below(2) == 0 {
+                    rng.below(30_000) as i64
+                } else {
+                    0
+                };
+                arrivals.push((sent_at + late, i, sent_at));
+            }
+            arrivals.sort_unstable();
+            // When each gap was found: the first arrival of a later packet.
+            let mut found = vec![i64::MAX; n as usize];
+            let mut latest = None::<u32>;
+            for &(at, i, _) in &arrivals {
+                if latest.is_none_or(|l| i > l) {
+                    for j in latest.map_or(0, |l| l + 1)..i {
+                        found[j as usize] = at;
+                    }
+                    latest = Some(i);
+                }
+            }
+            let mut first_nak = vec![None::<i64>; n as usize];
+            let mut note = |naks: Vec<(i64, (Seq, Seq))>| {
+                for (at, (a, b)) in naks {
+                    let mut s = a;
+                    loop {
+                        let i = Seq::new(ISN).distance_to(s) as usize;
+                        if let Some(slot) = first_nak.get_mut(i) {
+                            slot.get_or_insert(at);
+                        }
+                        if s == b {
+                            break;
+                        }
+                        s = s.next();
+                    }
+                }
+            };
+            for &(at, i, ts) in &arrivals {
+                note(timer_naks(&mut r, at - 1));
+                orig(&mut r, i, at, ts);
+                note(
+                    nak_ranges(&sent(&mut r))
+                        .into_iter()
+                        .map(|x| (at, x))
+                        .collect(),
+                );
+            }
+            note(timer_naks(&mut r, 2_400 * MS));
+            assert!(r.stats().max_reorder_wait > 0, "seed {seed}: adapted");
+            assert!(r.stats().nak_held > 0, "seed {seed}: held some");
+            for i in lost {
+                let nak = first_nak[i as usize];
+                let gap = found[i as usize];
+                assert!(
+                    nak.is_some_and(|at| at >= gap && at <= gap + 50 * MS),
+                    "seed {seed}: {i} found at {gap}, first NAK {nak:?}"
+                );
+            }
+        }
     }
 
     /// Compare the cached lookup and public timer with the original linear

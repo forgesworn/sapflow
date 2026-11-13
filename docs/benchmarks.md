@@ -1840,7 +1840,8 @@ close counters are in
   matching `duplicates` and the retransmissions, and 0 in every other trial.
   Whether venue links reorder like this is what that counter will show in
   the field; this jitter (independent per packet, at about 4 ms between
-  packets) reorders far more than most links do.
+  packets) reorders far more than most links do. The receiver now holds its first
+  NAK while the path reorders; see the next section.
 - **No slow start.** Every sapflow trial listed its first segment 2.7 to
   2.8 s after the encoder started (`ready_ms`), under loss, jitter and
   reordering alike: the 2 s latency plus the first segment.
@@ -1848,6 +1849,97 @@ close counters are in
   harness's qualification on one decode message where its output starts,
   so its delivered percentages read 0; its files held 895 of 900 video
   packets in every condition. Its overhead column is unaffected.
+
+## SRT reorder tolerance on Linux, before and after (2026-11-13)
+
+The receiver now holds the first NAK of a new gap once it has seen the path
+reorder (`docs/reference.md`, "Reorder tolerance"). `scripts/srt-loss.sh` in
+the same Linux container (arm64) as the section above, with three receivers
+in every condition: sapflow at main 3e32000 (`own-old`), sapflow with the
+reorder wait (`own-new`) and libsrt's `srt-live-transmit` 1.5.1 (Debian);
+the sender is libsrt in every trial. AES-256, 30 ms each way, random 2% or
+bursty 5% loss (bursts of 8), three seeds, at 2000 and 200 ms latency,
+under no jitter, 0 to 20 ms letting packets overtake ("reordering"), 0 to
+20 ms keeping order ("order kept"), and 0 to 100 ms reordering, beyond the
+50 ms cap. Overhead is retransmissions over originals, counted at the
+proxy. `held` is the close log's `nak_held` (reordered packets whose NAK
+was still held when they came), `wait` its `max_reorder_wait_us`. Results,
+plans, summaries and sapflow's close counters are in
+[`performance-evidence/2026-11-13-srt-reorder-linux`](performance-evidence/2026-11-13-srt-reorder-linux/).
+
+| Jitter | Latency | Loss | Overhead, main | this | libsrt | Video delivered, main | this | Held | Wait |
+|--------|--------:|------|---:|---:|---:|---:|---:|---:|---:|
+| reordering | 2000 ms | random 2% | 66.5% | 3.1% | 69.4% | 100% | 100% | 5,796 of 5,885 | 43 ms |
+| reordering | 2000 ms | burst 5% | 65.1% | 6.4% | 69.7% | 100% | 100% | 5,563 of 5,650 | 41 ms |
+| reordering | 200 ms | random 2% | 67.7% | 67.4% | 69.2% | 100% | 100% | 0 | 25 ms |
+| reordering | 200 ms | burst 5% | 68.9% | 68.6% | 69.9% | 95.3% | 96.1% | 0 | 25 ms |
+| none | 2000 ms | random 2% | 2.0% | 2.0% | 2.0% | 100% | 100% | 0 | 0 |
+| none | 2000 ms | burst 5% | 5.4% | 5.5% | 5.8% | 100% | 100% | 0 | 0 |
+| none | 200 ms | random 2% | 2.5% | 2.6% | 2.1% | 100% | 100% | 0 | 0 |
+| none | 200 ms | burst 5% | 7.4% | 6.4% | 5.8% | 100% | 98.1% | 0 | 0 |
+| order kept | 2000 ms | random 2% | 2.0% | 2.0% | 2.8% | 100% | 100% | 0 | 0 |
+| order kept | 2000 ms | burst 5% | 5.3% | 5.4% | 7.5% | 100% | 100% | 0 | 0 |
+| order kept | 200 ms | random 2% | 3.4% | 3.4% | 2.9% | 99.1% | 99.5% | 0 | 0 |
+| order kept | 200 ms | burst 5% | 8.6% | 9.1% | 7.4% | 94.6% | 94.5% | 0 | 0 |
+| 100 ms reordering | 2000 ms | random 2% | 75.4% | 26.2% | 87.4% | 100% | 99.8% | 4,070 of 6,557 | 50 ms |
+| 100 ms reordering | 2000 ms | burst 5% | 73.8% | 26.8% | 88.8% | 100% | 100% | 3,919 of 6,373 | 50 ms |
+| 100 ms reordering | 200 ms | random 2% | 93.2% | 91.8% | 87.5% | 43.6% | 43.1% | 0 | 25 ms |
+| 100 ms reordering | 200 ms | burst 5% | 88.6% | 88.1% | 89.0% | 43.3% | 45.4% | 0 | 25 ms |
+
+Means over three seeds; `tables.md` in the evidence has the spreads.
+Video is counted against the same receiver's clean run, and the two cells
+where one trial held more packets than that (100.8% on average) read 100%.
+
+- **At 2000 ms, reordering no longer costs uplink.** Overhead fell from
+  about two thirds of all packets to about the loss rate: 3.1% at 2%
+  random loss, 6.4% at 5% bursty, and 1.0% (from 65.5%) with no loss. The
+  hold covered 98% of the reordered packets; the rest came after their NAK
+  had gone out. Every video and audio packet was delivered, as before.
+- **Without reordering nothing changes.** With no jitter, or jitter that
+  keeps order, no original ever filled a gap, so the wait stayed at none
+  and every gap was NAKed at once. A throwaway replay of the recorded lossy publish
+  (`crates/sapflow-srt/tests/fixtures`) through both builds' listeners,
+  with extra deterministic loss, stretched timing and injected drop
+  requests over 52 variants, sent byte-identical datagrams from each.
+- **At 200 ms the hold all but never engages here.** The round trip is
+  60 ms plus up to 20 ms of jitter each way, so three round trips take
+  about as long as the latency and a new gap seldom has room before the
+  last three: the wait rose to its 25 ms cap (an eighth of the latency), but
+  none of the 5,600 to 5,900 reordered packets a trial came while its NAK
+  was held, and overhead is as before. On a shorter round trip the hold
+  does engage at 200 ms: the same replay with every third or sixth pair of
+  originals swapped, at the trace's 200 ms latency, sent 20 of about 12,800
+  datagrams differently, each a NAK for the same loss held 1.1 to 25 ms,
+  and delivered exactly the same packets.
+- **Packets dropped at 200 ms under bursty loss vary from run to run more
+  than between the builds.** With no jitter, main dropped none in the run
+  above while the branch dropped 3, 11 and 14, so that cell was run again
+  with eight seeds and main twice: 2.9 ± 3.3 and 3.2 ± 4.4 packets for main,
+  4.6 ± 4.2 for the branch, video 98.8%, 98.6% and 98.0%. Under reordering,
+  eight more seeds gave 10.1 ± 8.9 for main and 14.4 ± 8.2 for the branch
+  (t 1.0), video 96.0% and 95.2%; with order kept main dropped 14.0 ± 4.4
+  and the branch 13.0 ± 9.9. With the wait at none the builds send the same
+  datagrams for the same packets (the replay above), so in the no-jitter
+  cells this is loss falling on different datagrams in each run
+  (`none200aa` and `reorder200` in the evidence).
+- **Jitter beyond the cap still gains.** At 100 ms the wait sat at its 50
+  ms cap and caught the reordered packets that came within it, about 62% of
+  them, so overhead fell to about a third of before rather than back to it.
+  At 2000 ms delivery was unchanged; the 99.8% is one trial five video
+  packets short with no SRT packet given up, and main had one such trial
+  in the burst row. At 200 ms that jitter is half the latency and both
+  builds lost over half the video.
+- **The wait reached 28 to 50 ms under 20 ms of jitter with loss** (41 to
+  43 ms on average), against 28 ms with no loss. It only halves after a
+  second with no reordering, so under steady reordering the single latest
+  original of a trial sets this maximum. The proxy's jitter is bounded at
+  20 ms, so something else delayed a few originals by up to about 40 ms; it
+  was not looked into. It is not retransmissions counted as originals:
+  `lost` less `reordered`, the real losses, was 162 to 176 a trial at 2%
+  random loss with reordering against 159 to 171 without, and 310 to 550
+  against 336 to 535 under bursts. The cap bounds it either way.
+- **libsrt's delivery is again not comparable**: its clean runs failed on
+  one decode message where its output starts, as in the section above.
 
 ## RTMPS through Caddy layer4 with PROXY protocol v2 (2026-11-12)
 

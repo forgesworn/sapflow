@@ -235,11 +235,18 @@ Notes for the release after 0.2.0-rc.1.
   segments, as above.
 - The "SRT connection closed" log line also gives `reordered`,
   `duplicates`, `belated` and `naks_sent`. `reordered` counts missing
-  packets that arrived as originals after the receiver had queued their
-  NAK: retransmissions the path did not need, for a caller that flags its
-  retransmissions as libsrt does. That is field data for whether the
-  receiver should wait a little before sending a NAK, as it now sends one at
-  the first gap.
+  packets that arrived as originals, not retransmissions, for a caller that
+  flags its retransmissions as libsrt does: the path reordered them. Those
+  whose NAK had gone out were resent for nothing.
+- The SRT receiver now waits before its first NAK of a gap once it has
+  seen the caller's path reorder packets, so a packet that is only late is
+  no longer resent (see sapflow-srt below). `SAPFLOW_SRT_REORDER_WAIT_MAX_MS`
+  (`--srt-reorder-wait-max-ms`) caps the wait: default 50, 0 to 1000, and 0
+  sends every NAK at the first gap as before. The "SRT connection closed"
+  log line also gives `nak_held`, the reordered packets whose NAK was still
+  held when they came (so none was sent), and `max_reorder_wait_us`, the
+  longest wait reached. Until a caller's path reorders, and for a caller
+  that does not flag its retransmissions, nothing changes.
 - WHIP logs at debug how each session's start was aligned, each keyframe
   request and arrival, and its receive counters once a second.
 - A `test-feedback` feature, off in every other build, lets
@@ -315,3 +322,39 @@ Notes for the release after 0.2.0-rc.1.
   the caller sets the retransmission flag, as libsrt does). `Stats` is not
   `#[non_exhaustive]`, so code that builds one with a struct literal needs
   `..Default::default()`.
+- Reorder tolerance in the receiver. It still sends a NAK at the first
+  sequence gap, as libsrt does by default, until a missing packet arrives
+  as an original rather than a retransmission. It then holds the first NAK
+  of each new gap for 5/4 of the latest such packet's lateness plus 1 ms
+  (the latest since the path last went a second without reordering), at most
+  `Config::reorder_wait_max` (new, default 50 ms) and an eighth of the
+  latency, and never into the last three round trips before the gap's
+  delivery time; the wait halves after every second with no reordering,
+  back to none. A held gap is reported from the timer when the wait ends,
+  or at once if the loss list cannot keep it. The wait adapts only for a
+  caller that set `REXMITFLG` in its handshake, since otherwise a
+  retransmission that fills a gap looks like a late original. In the Linux
+  lab with 0 to 20 ms of reordering jitter at 2000 ms latency,
+  retransmissions fell from 66.5% of originals to 3.1% at 2% random loss
+  and from 65.1% to 6.4% at 5% bursty loss, delivering everything as
+  before. Without reordering nothing changed, and at 200 ms latency, where
+  on that 60 ms path a gap almost never had room to be held, overhead and
+  delivery were as before within the run-to-run spread
+  (`docs/benchmarks.md`).
+- `receiver::Settings` gains `retransmit_flag` and `reorder_wait_max`, and
+  `listener::Config` gains `reorder_wait_max`; neither struct is
+  `#[non_exhaustive]`, so a struct literal needs the new fields (or, for
+  `Config`, `..Config::default()`).
+- `receiver::Stats` gains `nak_held` (reordered packets whose first NAK was
+  still held when they came) and `max_reorder_wait` (microseconds).
+  `reordered` still counts every gap filled by an original, whether or not
+  its NAK had gone out. As above, a struct literal needs
+  `..Default::default()`.
+- `loss::LossList` gains `hold`, which lists a loss with its first report
+  held, and `take`, which says when a loss was found and whether it had
+  been asked for, and bounds the hold of the part of a held loss before
+  the packet that arrived by that packet's delivery time. `loss::Loss` gains
+  `found`, and its `requests` is 0 while the first report is held. A held
+  loss the list has to give up to stay within `MAX_RANGES` is reported at
+  the next `due`, ahead of the rest; until then `next_due` returns `now`,
+  and `is_empty` is false even when no range is listed.

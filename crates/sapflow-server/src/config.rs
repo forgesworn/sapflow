@@ -31,6 +31,11 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            settings are present they must agree
   SAPFLOW_SRT_ENCRYPTION   required (default) or optional: with a passphrase,
                            optional also admits callers that send none
+  SAPFLOW_SRT_REORDER_WAIT_MAX_MS  once a caller's path reorders packets, hold
+                           a new gap's first NAK up to this long, so a packet
+                           that is only late is not resent (default 50, 0 to
+                           1000; never over an eighth of the latency; 0 NAKs
+                           every gap at once, as libsrt does)
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_RTMP_PROXY_ADDR  a second RTMP listener, for a TLS front that sends
                            PROXY protocol v2 (RTMPS through Caddy layer4 or
@@ -179,6 +184,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_CIPHER",
     "SAPFLOW_SRT_PBKEYLEN",
     "SAPFLOW_SRT_ENCRYPTION",
+    "SAPFLOW_SRT_REORDER_WAIT_MAX_MS",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
     "SAPFLOW_WHIP_ADDR",
@@ -413,6 +419,9 @@ pub struct Config {
     pub srt_crypto: Option<CryptoConfig>,
     /// With `srt_crypto`, also admit SRT callers that do not encrypt.
     pub srt_allow_plaintext: bool,
+    /// The longest an SRT connection holds a new gap's first NAK while its
+    /// path reorders packets; zero reports every gap at once.
+    pub srt_reorder_wait_max: Duration,
     pub rtmp_addr: Option<SocketAddr>,
     /// A second RTMP listener behind a PROXY protocol v2 front
     /// (`SAPFLOW_RTMP_PROXY_ADDR`), and the one peer it accepts.
@@ -839,6 +848,18 @@ impl Config {
             }
         };
 
+        let srt_reorder_wait_max = match vals.get("SAPFLOW_SRT_REORDER_WAIT_MAX_MS") {
+            None => Duration::from_millis(50),
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n <= 1000)
+                .map(Duration::from_millis)
+                .ok_or_else(|| {
+                    ConfigError::Invalid("SAPFLOW_SRT_REORDER_WAIT_MAX_MS: 0 to 1000".into())
+                })?,
+        };
+
         // Keep recognising the removed viewer backend switch so obsolete
         // deployments fail explicitly rather than silently changing backend.
         match vals.get("SAPFLOW_HTTP_IMPL").map(String::as_str) {
@@ -891,6 +912,7 @@ impl Config {
             health_interval,
             srt_crypto,
             srt_allow_plaintext,
+            srt_reorder_wait_max,
             record_min_free,
             recording_roll,
             max_publish_bps,
@@ -1613,6 +1635,31 @@ mod tests {
             ));
         }
         assert!(!HELP.contains("SAPFLOW_SRT_IMPL"));
+    }
+
+    #[test]
+    fn srt_reorder_wait_max() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let key = "SAPFLOW_SRT_REORDER_WAIT_MAX_MS";
+        let wait =
+            |env: &[(&str, &str)], args: &[&str]| load(env, args).map(|c| c.srt_reorder_wait_max);
+        assert_eq!(wait(&[open], &[]).ok(), Some(Duration::from_millis(50)));
+        assert_eq!(wait(&[open, (key, "0")], &[]).ok(), Some(Duration::ZERO));
+        assert_eq!(
+            wait(&[open, (key, "1000")], &[]).ok(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            wait(&[open, (key, "20")], &["--srt-reorder-wait-max-ms=30"]).ok(),
+            Some(Duration::from_millis(30))
+        );
+        for bad in ["1001", "-1", "5ms", "x"] {
+            assert!(
+                matches!(wait(&[open, (key, bad)], &[]), Err(ConfigError::Invalid(m)) if m.contains(key)),
+                "{bad}"
+            );
+        }
+        assert!(HELP.contains(key));
     }
 
     #[test]

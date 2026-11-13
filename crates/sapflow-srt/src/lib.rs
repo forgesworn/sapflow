@@ -17,7 +17,8 @@
 //! - [`loss`]: the receiver's loss list and when to ask again.
 //! - [`rtt`]: round-trip time from ACK/ACKACK pairs.
 //! - [`receiver`]: one connection: buffer, timestamp-based delivery with
-//!   too-late drop, ACKs, NAKs, keepalives, idle timeout.
+//!   too-late drop, ACKs, NAKs (held briefly once the path reorders),
+//!   keepalives, idle timeout.
 //! - [`listener`]: handshakes (version 5, SYN cookies keyed per process),
 //!   stream ids, limits, and the connections.
 //!

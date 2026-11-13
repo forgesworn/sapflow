@@ -65,6 +65,12 @@ pub struct Config {
     /// does encrypt must still match the secret. Ignored when
     /// `require_encryption` is set.
     pub allow_plaintext: bool,
+    /// The longest a connection may hold the first NAK of a new gap once the
+    /// path is seen to reorder packets, so a packet that is only late is not
+    /// resent; never more than an eighth of the latency. Only for callers
+    /// that flag their retransmissions (`REXMITFLG`). Zero turns it off,
+    /// reporting every gap at once as libsrt does.
+    pub reorder_wait_max: Duration,
 }
 
 impl Default for Config {
@@ -79,6 +85,7 @@ impl Default for Config {
             crypto: None,
             require_encryption: false,
             allow_plaintext: false,
+            reorder_wait_max: Duration::from_millis(50),
         }
     }
 }
@@ -449,6 +456,7 @@ impl<S: BuildHasher> Listener<S> {
         let max_payload = MTU_MAX - OVERHEAD;
         let buffer = self.config.buffer_packets.max(32);
         let peer_idle = duration_micros(self.config.peer_idle);
+        let reorder_wait_max = duration_micros(self.config.reorder_wait_max);
         let Some(c) = self.conns.get_mut(&id.0) else {
             return false;
         };
@@ -503,6 +511,10 @@ impl<S: BuildHasher> Listener<S> {
                 buffer,
                 peer_idle,
                 max_payload: max_payload as usize,
+                // Without the flag a retransmission that fills a gap looks
+                // like a late original, so the reorder wait never adapts.
+                retransmit_flag: req.flags & srt_flags::REXMITFLG != 0,
+                reorder_wait_max,
             },
             t,
             c.caller_socket,
@@ -856,10 +868,19 @@ mod tests {
     }
 
     fn conclusion(socket: u32, cookie: u32, extra: Vec<Extension>) -> Vec<u8> {
+        conclusion_with_flags(socket, cookie, 0xBF, extra)
+    }
+
+    fn conclusion_with_flags(
+        socket: u32,
+        cookie: u32,
+        flags: u32,
+        extra: Vec<Extension>,
+    ) -> Vec<u8> {
         let mut extensions = vec![
             Extension::HsReq(SrtHandshake {
                 version: 0x01_05_04,
-                flags: 0xBF,
+                flags,
                 receiver_delay: 2000,
                 sender_delay: 2000,
             }),
@@ -899,6 +920,11 @@ mod tests {
 
     /// Induction then conclusion; returns the connection.
     fn connect(l: &mut Listener<Fixed>, t: Instant, socket: u32) -> ConnId {
+        connect_with_flags(l, t, socket, 0xBF)
+    }
+
+    /// The same, the caller sending these SRT flags.
+    fn connect_with_flags(l: &mut Listener<Fixed>, t: Instant, socket: u32, flags: u32) -> ConnId {
         l.handle_datagram(t, peer(), &induction(socket));
         let hs = sent_handshakes(l);
         let [(dest, reply)] = hs.as_slice() else {
@@ -909,7 +935,11 @@ mod tests {
         assert_eq!(reply.extension, SRT_MAGIC);
         assert_eq!(reply.kind, HandshakeKind::Induction);
         assert_eq!(reply.peer_ip[..4], [1, 2, 0, 192]);
-        l.handle_datagram(t, peer(), &conclusion(socket, reply.cookie, vec![]));
+        l.handle_datagram(
+            t,
+            peer(),
+            &conclusion_with_flags(socket, reply.cookie, flags, vec![]),
+        );
         match l.poll_event() {
             Some(Event::Connect {
                 id,
@@ -989,6 +1019,93 @@ mod tests {
         // Due 2000 ms after its timestamp, which is 100 µs after the
         // conclusion's.
         assert_eq!(t - t0, Duration::from_micros(2_000_100));
+    }
+
+    /// NAK ranges among the datagrams queued to send.
+    fn sent_naks<S: BuildHasher>(l: &mut Listener<S>) -> Vec<(Seq, Seq)> {
+        std::iter::from_fn(|| l.poll_transmit())
+            .filter_map(|(_, b)| match Packet::parse(&b) {
+                Ok(Packet::Control(ControlPacket {
+                    body: Control::Nak(ranges),
+                    ..
+                })) => Some(ranges),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn the_reorder_wait_adapts_only_for_callers_that_flag_retransmissions() {
+        let s = |v: u32| Seq::new(1000 + v);
+        for flagged in [true, false] {
+            let flags = if flagged {
+                0xBF
+            } else {
+                0xBF & !srt_flags::REXMITFLG
+            };
+            let t0 = Instant::now();
+            let mut l = listener(t0);
+            let id = connect_with_flags(&mut l, t0, 0x1234, flags);
+            assert!(l.accept(id, t0));
+            sent_handshakes(&mut l);
+            let at = |us: u64| t0 + Duration::from_micros(us);
+            let send = |l: &mut Listener<Fixed>, seq: u32, us: u64| {
+                let mut b = Vec::new();
+                DataPacket {
+                    seq: s(seq),
+                    position: Position::Only,
+                    in_order: false,
+                    key: 0,
+                    retransmitted: false,
+                    message: seq + 1,
+                    timestamp: 1000 + us as u32,
+                    dest: id.0,
+                    payload: b"ts",
+                }
+                .encode(&mut b);
+                l.handle_datagram(at(us), peer(), &b);
+            };
+            // 0, then 2 before 1, which comes 10 ms after its gap was found.
+            send(&mut l, 0, 0);
+            send(&mut l, 2, 2_000);
+            assert_eq!(sent_naks(&mut l), vec![(s(1), s(1))]);
+            send(&mut l, 1, 12_000);
+            // Now 4 before 3, which never comes.
+            send(&mut l, 4, 13_000);
+            if !flagged {
+                // Without the flag: at once, as before.
+                assert_eq!(sent_naks(&mut l), vec![(s(3), s(3))]);
+                assert_eq!(
+                    l.connection_stats(id).map(|st| st.max_reorder_wait),
+                    Some(0)
+                );
+                continue;
+            }
+            assert!(sent_naks(&mut l).is_empty(), "held");
+            // The listener's own timer brings the report when the 13.5 ms
+            // wait ends, with no packet arriving meanwhile.
+            let due = at(13_000 + 13_500);
+            let mut woke_for_it = false;
+            while let Some(next) = l.poll_timeout() {
+                assert!(next <= due, "the timer skipped the held NAK");
+                woke_for_it = next == due;
+                l.handle_timeout(next);
+                let naks = sent_naks(&mut l);
+                if next < due {
+                    assert!(naks.is_empty(), "{naks:?} before the wait ended");
+                } else {
+                    assert_eq!(naks, vec![(s(3), s(3))]);
+                    break;
+                }
+            }
+            assert!(woke_for_it);
+            let st = l.connection_stats(id).expect("open");
+            assert_eq!(
+                (st.max_reorder_wait, st.nak_held, st.reordered),
+                (13_500, 0, 1)
+            );
+        }
     }
 
     #[test]
