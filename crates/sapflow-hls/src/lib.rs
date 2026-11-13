@@ -52,6 +52,9 @@ mod terminal_ts_tests;
 mod recording_timing_tests;
 
 #[cfg(test)]
+mod recorded_prefix_tests;
+
+#[cfg(test)]
 mod recording_checkpoint_tests;
 
 #[cfg(test)]
