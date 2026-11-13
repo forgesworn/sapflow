@@ -229,7 +229,10 @@ overrides.
   container holds 1935 (`docker port mediamtx`, `docker port sapflow`).
 - [ ] `<recordings-dir>` is writable by the image's non-root user (uid 65532),
   mediamtx can still write to it, and v4v's read-only mount can read what
-  sapflow writes (the dry run proves the last).
+  sapflow writes (the dry run proves the last). sapflow creates
+  `<recordings-dir>/.sapflow-outbox` (0700) there itself for the callbacks
+  it still owes at a crash; nothing else needs to be writable. A log line
+  `recording outbox unavailable` means a crash would lose those reports.
 - [ ] Free disk: sapflow records only above `SAPFLOW_RECORD_MIN_FREE_GB`
   (2 by default) and stops if it falls below. At v4v's top recommended
   bitrate (4,000 kbit/s) a show is about 2 GB an hour. Leave room for the

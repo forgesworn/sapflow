@@ -839,30 +839,109 @@ pub fn rebase_part_for_file_timed(
     if data.len() > MAX_FILE_FRAGMENT_BYTES {
         return Err(InvalidFileFragment);
     }
-    fn u32_at(data: &[u8], at: usize) -> Result<u32, InvalidFileFragment> {
-        Ok(u32::from_be_bytes(
-            data.get(at..at + 4)
-                .ok_or(InvalidFileFragment)?
-                .try_into()
-                .map_err(|_| InvalidFileFragment)?,
-        ))
-    }
-    fn box_at(data: &[u8], at: usize, limit: usize) -> Result<(usize, &[u8]), InvalidFileFragment> {
-        let size = u32_at(data, at)? as usize;
-        let end = at.checked_add(size).ok_or(InvalidFileFragment)?;
-        if size < 8 || end > limit {
-            return Err(InvalidFileFragment);
-        }
-        Ok((end, data.get(at + 4..at + 8).ok_or(InvalidFileFragment)?))
-    }
     let (moof_end, kind) = box_at(data, 0, data.len())?;
-    if kind != b"moof" || moof_end > 1024 * 1024 {
+    if kind != b"moof" || moof_end > MAX_MOOF_BYTES {
         return Err(InvalidFileFragment);
     }
     let (end, kind) = box_at(data, moof_end, data.len())?;
     if kind != b"mdat" || end != data.len() {
         return Err(InvalidFileFragment);
     }
+    let fields = moof_tracks(data, moof_end, audio_rate)?;
+    let base = match *origin {
+        Some(base) => base,
+        None => {
+            let first = fields
+                .iter()
+                .min_by(|a, b| {
+                    (u128::from(a.ticks) * u128::from(b.rate))
+                        .cmp(&(u128::from(b.ticks) * u128::from(a.rate)))
+                })
+                .ok_or(InvalidFileFragment)?;
+            FileTimeBase {
+                ticks: first.ticks,
+                timescale: first.rate,
+            }
+        }
+    };
+    let mut output = data.to_vec();
+    let lead = lead_track(&fields);
+    let mut end = std::time::Duration::ZERO;
+    for TrackFragment {
+        offset,
+        wide,
+        ticks,
+        rate,
+        track,
+        length,
+    } in fields
+    {
+        let shift =
+            u64::try_from(u128::from(base.ticks) * u128::from(rate) / u128::from(base.timescale))
+                .map_err(|_| InvalidFileFragment)?;
+        let value = ticks.checked_sub(shift).ok_or(InvalidFileFragment)?;
+        if track == lead {
+            end = media_end(value, length, rate)?;
+        }
+        if wide {
+            output[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+        } else {
+            output[offset..offset + 4].copy_from_slice(
+                &u32::try_from(value)
+                    .map_err(|_| InvalidFileFragment)?
+                    .to_be_bytes(),
+            );
+        }
+    }
+    *origin = Some(base);
+    Ok((Bytes::from(output), end))
+}
+
+/// Largest `moof` box accepted in a fragment.
+const MAX_MOOF_BYTES: usize = 1024 * 1024;
+
+fn u32_at(data: &[u8], at: usize) -> Result<u32, InvalidFileFragment> {
+    Ok(u32::from_be_bytes(
+        data.get(at..at.checked_add(4).ok_or(InvalidFileFragment)?)
+            .ok_or(InvalidFileFragment)?
+            .try_into()
+            .map_err(|_| InvalidFileFragment)?,
+    ))
+}
+
+/// The box at `at`: where it ends, and its type. It must end by `limit`.
+fn box_at(data: &[u8], at: usize, limit: usize) -> Result<(usize, &[u8]), InvalidFileFragment> {
+    let size = u32_at(data, at)? as usize;
+    let end = at.checked_add(size).ok_or(InvalidFileFragment)?;
+    if size < 8 || end > limit {
+        return Err(InvalidFileFragment);
+    }
+    Ok((end, data.get(at + 4..at + 8).ok_or(InvalidFileFragment)?))
+}
+
+/// One `traf` of our own `moof`.
+struct TrackFragment {
+    /// Where the `tfdt` value starts.
+    offset: usize,
+    /// Whether that value is 64-bit (`tfdt` version 1).
+    wide: bool,
+    /// The decode time of the first sample.
+    ticks: u64,
+    /// The track's timescale.
+    rate: u32,
+    track: u32,
+    /// The samples' total duration.
+    length: u64,
+}
+
+/// The track fragments of the `moof` at the start of `data`, which ends at
+/// `moof_end`. Only our fixed structure: `mfhd`, then a `traf` per track of
+/// `tfhd`, `tfdt` and `trun`.
+fn moof_tracks(
+    data: &[u8],
+    moof_end: usize,
+    audio_rate: Option<u32>,
+) -> Result<Vec<TrackFragment>, InvalidFileFragment> {
     let mut fields = Vec::with_capacity(2);
     let mut at = 8;
     let mut seen = 0u8;
@@ -956,7 +1035,14 @@ pub fn rebase_part_for_file_timed(
             }
             seen |= bit;
             let (offset, wide, ticks) = field.ok_or(InvalidFileFragment)?;
-            fields.push((offset, wide, ticks, rate, track, length));
+            fields.push(TrackFragment {
+                offset,
+                wide,
+                ticks,
+                rate,
+                track,
+                length,
+            });
         } else if kind != b"mfhd" {
             return Err(InvalidFileFragment);
         }
@@ -965,52 +1051,142 @@ pub fn rebase_part_for_file_timed(
     if fields.is_empty() {
         return Err(InvalidFileFragment);
     }
-    let base = match *origin {
-        Some(base) => base,
-        None => {
-            let (_, _, ticks, rate, _, _) = fields
-                .iter()
-                .min_by(|a, b| {
-                    (u128::from(a.2) * u128::from(b.3)).cmp(&(u128::from(b.2) * u128::from(a.3)))
-                })
-                .ok_or(InvalidFileFragment)?;
-            FileTimeBase {
-                ticks: *ticks,
-                timescale: *rate,
-            }
-        }
-    };
-    let mut output = data.to_vec();
-    let lead = if fields.iter().any(|f| f.4 == VIDEO_TRACK) {
+    Ok(fields)
+}
+
+/// The track whose end is the fragment's end: video if it has any, else audio.
+fn lead_track(fields: &[TrackFragment]) -> u32 {
+    if fields.iter().any(|f| f.track == VIDEO_TRACK) {
         VIDEO_TRACK
     } else {
         AUDIO_TRACK
-    };
-    let mut end = std::time::Duration::ZERO;
-    for (offset, wide, ticks, rate, track, length) in fields {
-        let shift =
-            u64::try_from(u128::from(base.ticks) * u128::from(rate) / u128::from(base.timescale))
-                .map_err(|_| InvalidFileFragment)?;
-        let value = ticks.checked_sub(shift).ok_or(InvalidFileFragment)?;
-        if track == lead {
-            let ticks = value.checked_add(length).ok_or(InvalidFileFragment)?;
-            let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(rate);
-            end = std::time::Duration::from_nanos(
-                u64::try_from(nanos).map_err(|_| InvalidFileFragment)?,
-            );
-        }
-        if wide {
-            output[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
-        } else {
-            output[offset..offset + 4].copy_from_slice(
-                &u32::try_from(value)
-                    .map_err(|_| InvalidFileFragment)?
-                    .to_be_bytes(),
-            );
-        }
     }
-    *origin = Some(base);
-    Ok((Bytes::from(output), end))
+}
+
+fn media_end(
+    ticks: u64,
+    length: u64,
+    rate: u32,
+) -> Result<std::time::Duration, InvalidFileFragment> {
+    let ticks = ticks.checked_add(length).ok_or(InvalidFileFragment)?;
+    let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(rate);
+    Ok(std::time::Duration::from_nanos(
+        u64::try_from(nanos).map_err(|_| InvalidFileFragment)?,
+    ))
+}
+
+/// What of a recording file sapflow wrote can be decoded: its init segment,
+/// then each `moof` + `mdat` fragment that is whole on disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordedPrefix {
+    /// Whole fragments after the init segment.
+    pub fragments: u64,
+    /// Bytes from the file's start to the end of the last whole fragment.
+    pub bytes: u64,
+    /// Where the whole fragments' media ends: the latest of their video's
+    /// decode time plus its samples' durations, or their audio's if a
+    /// fragment has no video, as the recording writer measures a file.
+    pub media_end: std::time::Duration,
+}
+
+/// Largest init segment ([`init_segment_for_audio_tracks`]) accepted.
+const MAX_INIT_BOX_BYTES: u64 = 1024 * 1024;
+
+/// Reads the first `len` bytes of a recording file (an init segment, then
+/// fragments [`rebase_part_for_file`] made) and returns its decodable prefix. A file whose writer was
+/// killed may end in part of a fragment, or in zeros where the disk had
+/// not written its data: everything from the first box that is not one of
+/// ours, or does not fit in `len`, is left out, and so is a fragment whose
+/// `mdat` does not end inside the file. Only `moof` boxes and box headers
+/// are read; media is skipped. Our fixed structure only, not arbitrary MP4.
+///
+/// Errors only for I/O; a file that is not ours, or holds no whole
+/// fragment, has zero [`RecordedPrefix::fragments`].
+pub fn recorded_prefix<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
+    len: u64,
+    audio_rate: Option<u32>,
+) -> std::io::Result<RecordedPrefix> {
+    /// The 8-byte box header at `at`, or None past the end or on a short read.
+    fn header<R: std::io::Read + std::io::Seek>(
+        file: &mut R,
+        at: u64,
+        len: u64,
+    ) -> std::io::Result<Option<(u64, [u8; 4])>> {
+        if at.checked_add(8).is_none_or(|end| end > len) {
+            return Ok(None);
+        }
+        file.seek(std::io::SeekFrom::Start(at))?;
+        let mut bytes = [0u8; 8];
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let size = u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        // Size 0 (to the end) and 1 (64-bit) are never written by us; a
+        // zero-filled tail reads as size 0.
+        if size < 8 || at.checked_add(size).is_none_or(|end| end > len) {
+            return Ok(None);
+        }
+        Ok(Some((size, [bytes[4], bytes[5], bytes[6], bytes[7]])))
+    }
+    let mut prefix = RecordedPrefix::default();
+    let Some((ftyp, kind)) = header(file, 0, len)? else {
+        return Ok(prefix);
+    };
+    if &kind != b"ftyp" || ftyp > 4096 {
+        return Ok(prefix);
+    }
+    let Some((moov, kind)) = header(file, ftyp, len)? else {
+        return Ok(prefix);
+    };
+    if &kind != b"moov" || moov > MAX_INIT_BOX_BYTES {
+        return Ok(prefix);
+    }
+    let mut at = ftyp + moov;
+    let mut moof = Vec::new();
+    loop {
+        let Some((moof_len, kind)) = header(file, at, len)? else {
+            break;
+        };
+        if &kind != b"moof" || moof_len > MAX_MOOF_BYTES as u64 {
+            break;
+        }
+        let Some((mdat_len, kind)) = header(file, at + moof_len, len)? else {
+            break;
+        };
+        if &kind != b"mdat" || moof_len + mdat_len > MAX_FILE_FRAGMENT_BYTES as u64 {
+            break;
+        }
+        moof.resize(moof_len as usize, 0);
+        file.seek(std::io::SeekFrom::Start(at))?;
+        match file.read_exact(&mut moof) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let Ok(fields) = moof_tracks(&moof, moof.len(), audio_rate) else {
+            break;
+        };
+        let lead = lead_track(&fields);
+        let Some(end) = fields
+            .iter()
+            .filter(|f| f.track == lead)
+            .map(|f| media_end(f.ticks, f.length, f.rate))
+            .next()
+            .and_then(Result::ok)
+        else {
+            break;
+        };
+        at += moof_len + mdat_len;
+        prefix = RecordedPrefix {
+            fragments: prefix.fragments + 1,
+            bytes: at,
+            media_end: prefix.media_end.max(end),
+        };
+    }
+    Ok(prefix)
 }
 
 #[cfg(test)]

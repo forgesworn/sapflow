@@ -2,7 +2,11 @@
 //! restart: every stream ends at once, and sapflow waits, within a deadline,
 //! until each recording is finished and every callback has been sent, so the
 //! app hears `unpublish` and `recordSegmentComplete` as it would for an
-//! encoder that left. A SIGKILL still ends sapflow with neither.
+//! encoder that left. A SIGKILL still ends sapflow with neither, but a
+//! recording's owed `recordSegmentComplete` (one whose file a SIGKILL or the
+//! deadline left unfinished, or whose callback was not delivered) waits in
+//! the recording outbox and is sent at the next start
+//! ([`crate::recording_recovery`]).
 
 use std::time::Duration;
 

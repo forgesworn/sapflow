@@ -152,6 +152,13 @@ nostr-sdk = { path = "../vendor/nostr-sdk" }
 async-wsocket = { path = "../vendor/async-wsocket" }
 
 [[bin]]
+name = "recorded_prefix"
+path = "fuzz_targets/recorded_prefix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "recording_checkpoint"
 path = "fuzz_targets/recording_checkpoint.rs"
 test = false

@@ -280,10 +280,85 @@ With recording off, no `recordSegmentComplete` follows.
 
 sapflow waits up to 7.5 s for its files and callbacks, then exits, inside
 Docker's default 10 s stop timeout. A file still being written or a callback
-still unsent by then (one being retried while v4v is down, say) goes
-unreported, as does everything after a SIGKILL; the file stays on disk. An
-encoder that reconnects after the restart starts a new stream and a new
+still unsent by then (one being retried while v4v is down, say) is reported
+at the next start instead, as is a file a SIGKILL, an OOM kill, a crash or a
+power cut left unreported: see
+[recordings reported after a restart](#recordings-reported-after-a-restart).
+An encoder that reconnects after the restart starts a new stream and a new
 file.
+
+### Recordings reported after a restart
+
+With both `SAPFLOW_RECORDINGS` and `SAPFLOW_CALLBACK_URL` set, every
+recording's owed `recordSegmentComplete` is kept on disk until v4v answers
+it 2xx, in `.sapflow-outbox` in the recordings directory. sapflow creates
+that directory itself (owned by its user, mode 0700), so nothing needs
+setting up; the expiry of recordings never touches it, and it holds no
+callback URL or token. At each start, before it takes any encoder, sapflow
+lists what earlier runs still owed and then sends it from the background,
+while encoders connect:
+
+- A file that was finished, but whose callback was never delivered (v4v was
+  down, the stop deadline passed, the queue was full), gets the callback it
+  had, byte for byte: the same `recordingState`, `recordingReason`,
+  `segmentDuration`, `segmentPath` and, for a scoped recording, identity and
+  `eventSequence`.
+- A file whose writer never finished (SIGKILL, OOM kill, crash, power cut,
+  or a stop whose deadline came first) gets `recordingState: "incomplete"`
+  with `recordingReason: "server-interrupted"` and, as `segmentDuration`,
+  the media of the file's whole fragments. The file is never rewritten,
+  truncated or copied: it plays, and v4v can copy it, as it is; a player
+  stops at its partial last fragment, if it has one, and may show a few more
+  frames from it than `segmentDuration` counts. Its header gives no total
+  duration (the writer writes that only when it finishes). A file with no
+  whole fragment is not reported.
+- A file that has gone, or is older than `SAPFLOW_RECORD_DELETE_AFTER`, is
+  not reported, and what it owed is forgotten.
+
+These callbacks go one at a time, at least a second apart (60 a minute at
+most, half of the 120 v4v takes from one address, leaving the rest to live
+stages), on a sender of their own, so a slow answer never holds up a live
+stage's `publish`: two attempts each, of up to ten minutes, since v4v copies
+and hashes the whole file before it answers (a four-hour show at 4,000
+kbit/s is about 8 GB, some seven minutes at 20 MB/s). One is forgotten only
+when v4v answers it 2xx. A failure is tried again while sapflow runs, 30 s
+later, then at doubling waits up to every 10 minutes. If v4v cannot be
+reached at all (not yet up after a power cut that restarted both), that
+goes on until it is up or the recording expires. If it was reached and
+failed (answered 408, 429 or 5xx, or timed out once connected), the report
+is retried three times in that run and then waits for the next start, so
+a receiver that keeps failing, copying the file each time, is not asked
+without end. After three failures in a row the rest of a round waits too. A 4xx other
+than 408 and 429 (a wrong token after a redeploy, say) is not retried in
+that run, but kept for the next start, so it is sent at each start until
+v4v takes it or it expires. A start sends at most 4,096, oldest first.
+A stop does not wait for a recovered callback in flight: it stays owed.
+
+Every callback, live or recovered, treats 408 and 429 as "try again", not
+as a refusal, and waits as long as a `Retry-After` header (seconds) or a
+`retryAfterMs` in the JSON body asks before its next attempt: up to 10 s
+for a live callback, so one event holds the live queue at most about 50 s,
+and up to a minute for a recovered one. To find `retryAfterMs`, the body of
+a 408, 429 or 503 to a callback is read, up to its `content-length`, at most
+1 KiB and for at most 1.5 s; no other body is read, and never one answering
+a publish authorisation request.
+
+v4v follow-up: since every attempt that times out makes v4v copy the file
+again, its importer should answer before it copies (and copy in the
+background), or first check the path, size and modification time against
+a part it already holds and answer at once.
+
+A live callback that fails while sapflow keeps running (v4v down through all
+four attempts) stays owed too, but is sent only at the next start.
+
+Delivery is at least once: a callback v4v answered just before a crash, its
+record not yet removed, is sent again at the next start, as the same body.
+v4v's legacy importer treats the same file with the same bytes a second
+time as the same part (`kept`, `same-part`); recovery never changes a
+file's bytes. A scoped receiver can dedupe on `recordingId` and
+`eventSequence`, which a resend repeats. A file reported `server-interrupted`
+was normally never reported live, so it normally has no earlier report to
+differ from.
 
 v4v rejects a callback whose path does not match the prepared session.
 
@@ -313,9 +388,11 @@ the exact same state and reason. Reason codes include `ingest-discarded-packets`
 `epoch-unrecorded` (a codec epoch before this file was served but not
 recorded), `epoch-rate` (the encoder changed its codec configuration too
 often: codec epochs after this file, or before it, were served but not
-recorded; see `SAPFLOW_RECORDING_ROLL_*`) and `server-stopped` (sapflow
+recorded; see `SAPFLOW_RECORDING_ROLL_*`), `server-stopped` (sapflow
 was stopped while the encoder was connected; see
-[the callback](#the-callback)). A stream that changes
+[the callback](#the-callback)) and `server-interrupted` (sapflow ended
+before the file was finished, and reported it at its next start; see
+[recordings reported after a restart](#recordings-reported-after-a-restart)). A stream that changes
 configuration often can therefore end a show with a stretch that no file
 holds; the files on either side of it say so. A file keeps only its first
 reason, so the file before such a stretch can read another code (say

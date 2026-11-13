@@ -22,6 +22,12 @@ Since that revision, main changed `Muxer::has_content`, which the ingest
 targets reach, and the server's chunk prefix. The SRT, RTMP and HTTP parsers
 are unchanged.
 
+`recorded_prefix` runs the recording recovery scanner
+(`sapflow_hls::fmp4::recorded_prefix`) over raw bytes and over a real
+generated recording cut short with bytes flipped. It checks the prefix never
+passes the bytes there, and that cutting the file where the prefix ends
+finds the same prefix. It does not touch a filesystem or the outbox.
+
 The Python TV preview allowlist has a separate finite mutation target:
 `python3 -B fuzz/tv_preview_fuzz.py 20000`. It exercises bounded hostile
 manifests and resource/query paths without opening sockets or processing media.

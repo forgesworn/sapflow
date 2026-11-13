@@ -786,7 +786,7 @@ pub(crate) mod loss_tests {
         pub app: Arc<App>,
         pub scope: Arc<CallbackScope>,
         pub callbacks: tokio::sync::mpsc::Receiver<crate::callback::Queued>,
-        pub(super) root: PathBuf,
+        pub(crate) root: PathBuf,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
