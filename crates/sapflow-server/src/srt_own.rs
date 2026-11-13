@@ -388,10 +388,14 @@ fn complete_admission(
                 else {
                     return;
                 };
-                (
-                    caller,
-                    replay.store().map(|store| (store, replay.generation())),
-                )
+                // The replay guard, and its store, are app keys' only.
+                let store = app
+                    .config
+                    .srt_app_keys
+                    .then(|| replay.store())
+                    .flatten()
+                    .map(|store| (store, replay.generation()));
+                (caller, store)
             };
             if let Some((store, generation)) = store {
                 // Its key material is already refused to everyone else; the
@@ -529,7 +533,7 @@ fn refused_key(app: &Arc<App>, peer: SocketAddr) {
     );
 }
 
-/// An admission under `SAPFLOW_SRT_APP_KEYS` with no replay store (tests):
+/// An unscoped admission with no replay store (tests):
 /// [`check_pending`] makes sure the caller will be accepted, then
 /// [`claim_checked`] claims the path and accepts, with no await in between.
 /// The SRT loop does the same, but with a store it writes the store off the
@@ -538,9 +542,10 @@ fn refused_key(app: &Arc<App>, peer: SocketAddr) {
 /// sending none, is refused before the claim, and a live or held stage, its
 /// recording and its callbacks are untouched. With the app's passphrase the
 /// caller must have used it; without one the listener's own settings decide,
-/// as [`Listener::accept`] would. Either way, key material that already
-/// admitted another connection is a replayed handshake, refused before the
-/// claim too ([`crate::srt_replay`]).
+/// as [`Listener::accept`] would, and the same holds without app keys. Under
+/// app keys, either way, key material that already admitted another
+/// connection is a replayed handshake, refused before the claim too
+/// ([`crate::srt_replay`]).
 #[cfg(test)]
 fn accept_pending(
     app: &Arc<App>,
@@ -606,6 +611,16 @@ fn check_pending(
             return None;
         }
     };
+    // Without app keys there is no replay guard: the key check above is all
+    // that comes before the claim, as main admitted after it.
+    if !app.config.srt_app_keys {
+        return Some(Checked {
+            req,
+            admitted,
+            key,
+            encryption,
+        });
+    }
     // The caller owns its key material since it connected (checked then).
     // Once more before the claim, in case a connection with it was admitted
     // meanwhile. A caller whose key passed but cannot be told apart is
@@ -686,8 +701,9 @@ fn seen(listener: &Listener, id: ConnId, peer: SocketAddr) -> Option<Seen> {
         .map(|(bound, socket)| Seen::new(bound, peer, socket, id))
 }
 
-/// Whether [`Listener::accept`] will admit a caller the app admitted without
-/// a passphrase, decided before anything is claimed for it: key material
+/// Whether [`Listener::accept`] will admit a caller admitted without an app
+/// passphrase (by the app, or by the publish user and password), decided
+/// before anything is claimed for it: key material
 /// must unwrap with the global passphrase at its key length, and a caller
 /// with none needs plaintext allowed. `Err(None)` when the caller is gone,
 /// else the code to refuse it with (logged here).

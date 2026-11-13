@@ -39,9 +39,14 @@ both are allowed, and `required` then refuses callers that send no key
 material.
 
 Publish credentials still authorise the stream separately. The own listener
-checks publish admission before key derivation, then accepts key negotiation
-before creating the publisher queue/task. If key negotiation fails, the
-provisional stream claim is immediately released. No media is submitted, so
+checks publish admission before key derivation, then checks the caller's key
+material against the passphrase, and only then claims the stream and accepts
+key negotiation, before creating the publisher queue/task. An SRT claim takes
+over a live stream, so a caller with the wrong passphrase or key length (or
+none, where encryption is required) is refused before anything is claimed,
+and a live or held stream keeps its publisher. Scoped publish sessions, which
+never take over a live stream, still claim first: if key negotiation fails,
+the provisional claim is immediately released. No media is submitted, so
 there is no healthy/publish/unpublish callback or recording-complete event;
 the recorder waits for its first media part before creating a file. Ordinary
 connection/leave log messages may still describe that provisional claim.

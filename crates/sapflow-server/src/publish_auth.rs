@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_app_keys_the_request_and_admission_are_unchanged() {
+    async fn without_app_keys_the_request_is_unchanged_and_the_header_ignored() {
         // The app answers with a passphrase, but app keys are off: the
         // request is mediamtx's, byte for byte, and the header is not read.
         let stub = stub::start(Answer::Passphrase(&[SRT_KEY])).await;
@@ -607,7 +607,13 @@ mod tests {
         let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0)
             .await
             .expect("admitted");
-        assert!(matches!(admission, crate::srt::Admission::Claimed(_)));
+        // Admitted but not claimed: the listener claims once it knows the
+        // caller's key will be accepted. No passphrase was taken.
+        let crate::srt::Admission::Pending(pending) = admission else {
+            panic!("expected an unclaimed admission")
+        };
+        assert!(pending.key.is_none());
+        assert!(fixture.app.streams.get("event-a").is_none());
         let requests = stub.requests.lock().expect("log").clone();
         let (_, sent) = requests.last().expect("request");
         assert_eq!(*sent, mediamtx_body("srt"));

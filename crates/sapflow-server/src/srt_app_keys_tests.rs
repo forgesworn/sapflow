@@ -1137,3 +1137,165 @@ async fn a_caller_is_refused_when_the_store_cannot_be_written() {
     server.abort();
     let _ = server.await;
 }
+
+/// Without app keys, in global-key mode: an app that admits on the 2xx, and
+/// a deployment passphrase with `required` or `optional`.
+fn global_fixture(stub: &Stub, global: &str, required: bool) -> Fixture {
+    let mut fixture = Fixture::new();
+    let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+    app.config.publish_auth = Some(stub.endpoint.clone());
+    app.config.reconnect_grace = Duration::ZERO;
+    app.config.srt_crypto = Some(key(global, KeySize::Aes128));
+    app.config.srt_allow_plaintext = !required;
+    app.config.srt_require_encryption = required;
+    assert!(!app.config.srt_app_keys);
+    fixture
+}
+
+/// With app keys off and a global passphrase, a caller with valid stream-id
+/// credentials whose key the listener would refuse is refused before the
+/// claim: the wrong passphrase or key length used to take a live RTMP or SRT
+/// stage over first, then fail to connect. The right key still takes over.
+#[tokio::test(flavor = "current_thread")]
+async fn without_app_keys_a_wrong_global_key_never_replaces_a_live_stage() {
+    const GLOBAL: &str = "deployment-wide-secret";
+    const WRONG_GLOBAL: &str = "not-the-deployment-secret";
+    let from: std::net::IpAddr = "127.0.0.1".parse().expect("ip");
+    for live_kind in ["rtmp", "srt"] {
+        for required in [true, false] {
+            let captured = crate::log_capture::Capture::start();
+            let stub = stub::start(Answer::Status(200)).await;
+            let mut fixture = global_fixture(&stub, GLOBAL, required);
+            let (addr, server) = origin(&fixture.app);
+            let mut rtmp = None;
+            let mut live = None;
+            if live_kind == "rtmp" {
+                let req = sapflow_core::PublishRequest::parse_rtmp(
+                    "live",
+                    "event-a?user=encoder&pass=pw_live_visible",
+                )
+                .expect("rtmp");
+                rtmp = Some(
+                    Publication::begin_authorised(&fixture.app, &req, SourceKind::Flv, from)
+                        .await
+                        .expect("RTMP live"),
+                );
+            } else {
+                let mut encoder = Encoder::call(addr, Some(key(GLOBAL, KeySize::Aes128))).await;
+                assert!(encoder.connected, "{:?}", encoder.closed);
+                encoder.send_media().await;
+                wait_for(&mut fixture, &mut encoder, "publish").await;
+                live = Some(encoder);
+            }
+            let _ = events(&mut fixture);
+            let before = stage(&fixture.app);
+            assert!(before.owner.1 && before.recording.is_some(), "{live_kind}");
+            let label = format!("{live_kind} required={required}");
+            // (a) the wrong passphrase, (b) the wrong key length: the app is
+            // asked, then the key refuses the caller. Under required the
+            // listener announces its key length, so a caller like ours (and
+            // libsrt) with another one gives up before it is asked about;
+            // under optional it is not announced and the key check refuses.
+            for (crypto, wrong_length) in [
+                (key(WRONG_GLOBAL, KeySize::Aes128), false),
+                (key(GLOBAL, KeySize::Aes256), true),
+            ] {
+                let asked = stub.count();
+                let attacker = Encoder::call(addr, Some(crypto)).await;
+                if wrong_length && required {
+                    assert_eq!(attacker.closed, Some(CallerCloseReason::UnsupportedPeer));
+                    assert_eq!(stub.count(), asked, "{label}");
+                } else {
+                    assert_eq!(
+                        attacker.rejected(),
+                        Some(RejectCode::BADSECRET.0),
+                        "{label}: {:?}",
+                        attacker.closed
+                    );
+                    assert_eq!(stub.count(), asked + 1, "{label}: the app was asked first");
+                }
+                if let Some(live) = &mut live {
+                    live.pump(Duration::from_millis(50)).await;
+                }
+            }
+            // (c) no key material under required: the listener announces
+            // encryption, so our caller gives up at once, and one that sent
+            // its conclusion anyway is refused in the handshake (UNSECURE),
+            // before the app is asked, as on main.
+            if required {
+                let asked = stub.count();
+                let plain = Encoder::call(addr, None).await;
+                assert!(!plain.connected, "{label}");
+                assert!(
+                    matches!(
+                        plain.closed,
+                        Some(
+                            CallerCloseReason::UnsupportedPeer | CallerCloseReason::Rejected(1011)
+                        )
+                    ),
+                    "{label}: {:?}",
+                    plain.closed
+                );
+                assert_eq!(stub.count(), asked, "{label}");
+            }
+            assert_eq!(stage(&fixture.app), before, "{label}");
+            let after = events(&mut fixture);
+            for name in ["unpublish", "recordSegmentComplete", "publish"] {
+                assert!(!after.iter().any(|e| e == name), "{label}: {after:?}");
+            }
+            if let Some(live) = &mut live {
+                assert!(live.connected && live.closed.is_none(), "{:?}", live.closed);
+            }
+            let logs = captured.text();
+            assert!(!logs.contains("publisher replaced"), "{label}: {logs}");
+            assert!(logs.contains("reason=BadSecret"), "{label}: {logs}");
+            assert_eq!(
+                logs.contains("key length differs"),
+                !required,
+                "{label}: {logs}"
+            );
+            // The right key still takes the stage over, as today.
+            let mut successor = Encoder::call(addr, Some(key(GLOBAL, KeySize::Aes128))).await;
+            assert!(successor.connected, "{label}: {:?}", successor.closed);
+            assert_eq!(
+                stage(&fixture.app).owner,
+                (before.owner.0 + 1, true),
+                "{label}"
+            );
+            let logs = captured.text();
+            assert!(logs.contains("publisher replaced"), "{label}");
+            assert!(
+                logs.contains("encryption=\"deployment-key\" key_len=16"),
+                "{label}"
+            );
+            assert!(!logs.contains(GLOBAL) && !logs.contains(WRONG_GLOBAL));
+            successor.stop().await;
+            if let Some(live) = &mut live {
+                live.stop().await;
+            }
+            drop(rtmp);
+            server.abort();
+            let _ = server.await;
+            drop(captured);
+        }
+    }
+}
+
+/// Plaintext under `optional`, without app keys: admitted after the check as
+/// before, and logged as such.
+#[tokio::test(flavor = "current_thread")]
+async fn without_app_keys_optional_still_admits_plaintext() {
+    let captured = crate::log_capture::Capture::start();
+    let stub = stub::start(Answer::Status(200)).await;
+    let mut fixture = global_fixture(&stub, "deployment-wide-secret", false);
+    let (addr, server) = origin(&fixture.app);
+    let mut plain = Encoder::call(addr, None).await;
+    assert!(plain.connected, "{:?}", plain.closed);
+    plain.send_media().await;
+    wait_for(&mut fixture, &mut plain, "publish").await;
+    assert_eq!(stub.last().get("srtKey"), None, "no capability field");
+    assert!(captured.text().contains("encryption=\"none\""));
+    plain.stop().await;
+    server.abort();
+    let _ = server.await;
+}
