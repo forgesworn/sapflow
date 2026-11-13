@@ -46,7 +46,20 @@ pub enum Refusal {
 /// Proof that [`Publication::admit`] admitted a request; spent by
 /// [`Publication::claim_admitted`].
 #[derive(Debug)]
-pub struct Admitted(());
+pub struct Admitted {
+    /// The SRT passphrase the app holds for this stream, from
+    /// [`Publication::admit_srt_key`]. Its `Debug` is redacted.
+    srt_key: Option<sapflow_srt::crypto::CryptoConfig>,
+}
+
+impl Admitted {
+    /// The SRT passphrase the app returned, if any. The caller must check the
+    /// caller's key material against it before
+    /// [`Publication::claim_admitted`], which refuses while it is still here.
+    pub fn take_srt_key(&mut self) -> Option<sapflow_srt::crypto::CryptoConfig> {
+        self.srt_key.take()
+    }
+}
 
 /// A live publisher went over the bitrate cap and is dropped.
 #[derive(Debug)]
@@ -208,17 +221,21 @@ impl Publication {
             throttle().failed(from, Instant::now());
             return Err(Refusal::Request(e));
         }
-        Ok(Admitted(()))
+        Ok(Admitted { srt_key: None })
     }
 
     /// Claims the path for a request [`Publication::admit`] admitted, or
-    /// takes over a stream held for a reconnect.
+    /// takes over a stream held for a reconnect. An admission that still
+    /// holds an SRT passphrase is refused: its caller's key was not checked.
     pub fn claim_admitted(
         app: &Arc<App>,
         req: &PublishRequest,
         kind: SourceKind,
-        _admitted: Admitted,
+        admitted: Admitted,
     ) -> Result<Self, Refusal> {
+        if admitted.srt_key.is_some() {
+            return Err(Refusal::Request(PublishError::Unauthorized));
+        }
         Self::claim(
             app,
             req,
@@ -251,6 +268,28 @@ impl Publication {
         kind: SourceKind,
         from: IpAddr,
     ) -> Result<Admitted, Refusal> {
+        Self::admit_offering(app, req, kind, from, false).await
+    }
+
+    /// [`admit`](Self::admit) for an SRT caller under `SAPFLOW_SRT_APP_KEYS`:
+    /// the request offers to check a passphrase the app holds
+    /// (`publish_auth::SRT_KEY_FIELD`), and the admission carries the one it
+    /// returned, if any ([`Admitted::take_srt_key`]).
+    pub async fn admit_srt_key(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        from: IpAddr,
+    ) -> Result<Admitted, Refusal> {
+        Self::admit_offering(app, req, SourceKind::Ts, from, true).await
+    }
+
+    async fn admit_offering(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        kind: SourceKind,
+        from: IpAddr,
+        offer_srt_key: bool,
+    ) -> Result<Admitted, Refusal> {
         let Some(endpoint) = &app.config.publish_auth else {
             return Self::admit_locally(app, req, from);
         };
@@ -267,7 +306,15 @@ impl Publication {
             SourceKind::Es => crate::publish_auth::Protocol::Webrtc,
         };
         use crate::publish_auth::Verdict;
-        match crate::publish_auth::ask(endpoint, req, protocol, from).await {
+        let (verdict, srt_key) = if offer_srt_key {
+            crate::publish_auth::ask_srt_key(endpoint, req, from).await
+        } else {
+            (
+                crate::publish_auth::ask(endpoint, req, protocol, from).await,
+                None,
+            )
+        };
+        match verdict {
             Verdict::Admitted => {}
             Verdict::Denied => {
                 throttle().failed(from, Instant::now());
@@ -280,7 +327,7 @@ impl Publication {
             Verdict::Throttled => return Err(Refusal::Throttled),
             Verdict::Unavailable => return Err(Refusal::AuthUnavailable),
         }
-        Ok(Admitted(()))
+        Ok(Admitted { srt_key })
     }
 
     pub async fn begin_srt(

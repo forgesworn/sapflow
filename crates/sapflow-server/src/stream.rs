@@ -241,6 +241,12 @@ impl Session {
         self.outgoing.is_some()
     }
 
+    /// The current generation, and whether a publisher is attached to it.
+    #[cfg(test)]
+    pub(crate) fn owner(&self) -> (u64, bool) {
+        (self.generation, self.attached)
+    }
+
     pub fn owns_connection(&self, generation: u64) -> bool {
         self.generation == generation && self.attached
     }

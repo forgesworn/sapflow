@@ -284,18 +284,39 @@ pub(crate) enum Failure {
     Transport,
 }
 
-/// One `POST`, then the answer's status. The connection is plain HTTP/1.1 and
-/// used once (`connection: close`). Only the status line and headers are read,
-/// within `MAX_HEAD`; the body is never read. A redirect is a status like any
-/// other: the `location` is never followed.
-async fn post(endpoint: &Endpoint, body: &[u8]) -> std::io::Result<u16> {
+/// One header of a 2xx answer, as [`attempt_reading`] read it. No `Debug`:
+/// the value may be a secret.
+pub(crate) enum HeaderRead {
+    Absent,
+    /// Exactly one line with that name. Zeroed when dropped.
+    One(zeroize::Zeroizing<Vec<u8>>),
+    /// The header came more than once.
+    Repeated,
+}
+
+/// One `POST`, then the answer's status, and with `want` the value of that
+/// header if the answer is 2xx. The connection is plain HTTP/1.1 and used once
+/// (`connection: close`). Only the status line and headers are read, within
+/// `MAX_HEAD`; the body is never read. A redirect is a status like any other:
+/// the `location` is never followed.
+async fn post(
+    endpoint: &Endpoint,
+    body: &[u8],
+    want: Option<&str>,
+) -> std::io::Result<(u16, HeaderRead)> {
     let mut socket = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
     // A receiver may answer, and close, before it has read the whole body.
     // Keep a write error to report only if no answer arrives.
     let wrote = socket
         .write_all(&endpoint.post("application/json", body))
         .await;
-    let mut buf = Vec::with_capacity(512);
+    // The head may carry the wanted header's secret value: zeroed on drop,
+    // and sized for the whole head up front so no copy is left behind.
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(if want.is_some() {
+        http_lite::MAX_HEAD
+    } else {
+        512
+    }));
     let mut interim = 0;
     loop {
         match http_lite::parse_response(&buf) {
@@ -309,11 +330,25 @@ async fn post(endpoint: &Endpoint, body: &[u8]) -> std::io::Result<u16> {
                 buf.drain(..used);
                 continue;
             }
-            ParsedResponse::Complete { status, .. } => return Ok(status),
+            ParsedResponse::Complete { status, used } => {
+                let header = match want {
+                    Some(name) if (200..300).contains(&status) => {
+                        match http_lite::response_header(&buf[..used], name) {
+                            http_lite::ResponseHeader::Absent => HeaderRead::Absent,
+                            http_lite::ResponseHeader::One(value) => {
+                                HeaderRead::One(zeroize::Zeroizing::new(value.to_vec()))
+                            }
+                            http_lite::ResponseHeader::Unusable => HeaderRead::Repeated,
+                        }
+                    }
+                    _ => HeaderRead::Absent,
+                };
+                return Ok((status, header));
+            }
             ParsedResponse::Malformed => return Err(std::io::ErrorKind::InvalidData.into()),
             ParsedResponse::Partial => {}
         }
-        let mut chunk = [0u8; 2048];
+        let mut chunk = zeroize::Zeroizing::new([0u8; 2048]);
         let room = http_lite::MAX_HEAD
             .saturating_sub(buf.len())
             .min(chunk.len());
@@ -334,8 +369,20 @@ pub(crate) async fn attempt(
     body: &[u8],
     limit: Duration,
 ) -> Result<u16, Failure> {
-    match tokio::time::timeout(limit, post(endpoint, body)).await {
-        Ok(Ok(status)) => Ok(status),
+    attempt_reading(endpoint, body, limit, None)
+        .await
+        .map(|(status, _)| status)
+}
+
+/// [`attempt`], also reading the header `want` of a 2xx answer.
+pub(crate) async fn attempt_reading(
+    endpoint: &Endpoint,
+    body: &[u8],
+    limit: Duration,
+    want: Option<&str>,
+) -> Result<(u16, HeaderRead), Failure> {
+    match tokio::time::timeout(limit, post(endpoint, body, want)).await {
+        Ok(Ok(answer)) => Ok(answer),
         Ok(Err(_)) => Err(Failure::Transport),
         Err(_) => Err(Failure::Timeout),
     }

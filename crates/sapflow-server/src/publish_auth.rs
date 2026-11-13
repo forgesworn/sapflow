@@ -10,14 +10,34 @@
 //!
 //! The URL carries the app's token and the body carries the publisher's
 //! password: neither is logged, and nothing the app answers is kept.
+//!
+//! With `SAPFLOW_SRT_APP_KEYS=1`, an SRT request also carries
+//! `"srtKey":"accepted"` ([`SRT_KEY_FIELD`]): sapflow can check a passphrase
+//! the app holds for this stream. The app may then answer 2xx with that
+//! passphrase in one `sapflow-srt-passphrase` header
+//! ([`SRT_PASSPHRASE_HEADER`]), 10 to 79 bytes; the caller is admitted only if
+//! its SRT key material was made with it. The value goes straight into
+//! zeroising storage and is never logged. A header that is repeated or out of
+//! bounds refuses the publisher as an app that did not answer usably would.
+//! RTMP and WHIP requests never carry the field, and their answers' headers
+//! are not read.
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use sapflow_core::PublishRequest;
 
-use crate::callback::{Failure, attempt};
+use sapflow_srt::crypto::{CryptoConfig, KeySize};
+
+use crate::callback::{Failure, HeaderRead, attempt, attempt_reading};
 use crate::http_lite::Endpoint;
+
+/// The request field, and its value, that says this sapflow checks an SRT
+/// passphrase the app returns. Set by the binary, never by configuration.
+pub(crate) const SRT_KEY_FIELD: (&str, &str) = ("srtKey", "accepted");
+
+/// The 2xx answer's header that carries the stream's SRT passphrase.
+pub(crate) const SRT_PASSPHRASE_HEADER: &str = "sapflow-srt-passphrase";
 
 /// The whole exchange, connect to status. An RTMP encoder gets 10 s for its
 /// handshake and publish request together, so this stays well inside that.
@@ -75,7 +95,20 @@ pub(crate) fn classify(outcome: Result<u16, Failure>) -> Verdict {
 /// does. `query` is sent empty: sapflow does not keep the raw RTMP query or
 /// stream id, and the password already travels in `password`.
 pub(crate) fn body(req: &PublishRequest, protocol: Protocol, from: IpAddr) -> Vec<u8> {
-    let value = serde_json::json!({
+    to_bytes(&value(req, protocol, from))
+}
+
+/// [`body`] for SRT with [`SRT_KEY_FIELD`] added.
+fn body_offering_srt_key(req: &PublishRequest, from: IpAddr) -> Vec<u8> {
+    let mut value = value(req, Protocol::Srt, from);
+    if let Some(map) = value.as_object_mut() {
+        map.insert(SRT_KEY_FIELD.0.into(), SRT_KEY_FIELD.1.into());
+    }
+    to_bytes(&value)
+}
+
+fn value(req: &PublishRequest, protocol: Protocol, from: IpAddr) -> serde_json::Value {
+    serde_json::json!({
         "user": req.user.as_deref().unwrap_or(""),
         "password": req.pass.as_deref().unwrap_or(""),
         "ip": from.to_string(),
@@ -84,10 +117,13 @@ pub(crate) fn body(req: &PublishRequest, protocol: Protocol, from: IpAddr) -> Ve
         "protocol": protocol.name(),
         "id": null,
         "query": "",
-    });
+    })
+}
+
+fn to_bytes(value: &serde_json::Value) -> Vec<u8> {
     // Serialising a JSON value of strings cannot fail; an empty body would
     // only be refused by the app.
-    serde_json::to_vec(&value).unwrap_or_default()
+    serde_json::to_vec(value).unwrap_or_default()
 }
 
 /// Asks the app about this publisher, once.
@@ -108,9 +144,70 @@ async fn ask_within(
     limit: Duration,
 ) -> Verdict {
     let outcome = attempt(endpoint, &body(req, protocol, from), limit).await;
+    log_outcome(protocol, &outcome);
+    classify(outcome)
+}
+
+/// Asks the app about an SRT publisher, once, offering to check a passphrase
+/// it holds ([`SRT_KEY_FIELD`]). Returns the verdict and, on 2xx, the
+/// passphrase from [`SRT_PASSPHRASE_HEADER`] if the app sent one. The key
+/// length in it is a placeholder: the caller's own is used.
+pub(crate) async fn ask_srt_key(
+    endpoint: &Endpoint,
+    req: &PublishRequest,
+    from: IpAddr,
+) -> (Verdict, Option<CryptoConfig>) {
+    ask_srt_key_within(endpoint, req, from, TIMEOUT).await
+}
+
+async fn ask_srt_key_within(
+    endpoint: &Endpoint,
+    req: &PublishRequest,
+    from: IpAddr,
+    limit: Duration,
+) -> (Verdict, Option<CryptoConfig>) {
+    let outcome = attempt_reading(
+        endpoint,
+        &body_offering_srt_key(req, from),
+        limit,
+        Some(SRT_PASSPHRASE_HEADER),
+    )
+    .await;
+    let (outcome, header) = match outcome {
+        Ok((status, header)) => (Ok(status), header),
+        Err(failure) => (Err(failure), HeaderRead::Absent),
+    };
+    log_outcome(Protocol::Srt, &outcome);
+    let verdict = classify(outcome);
+    if verdict != Verdict::Admitted {
+        return (verdict, None);
+    }
+    match header {
+        HeaderRead::Absent => (verdict, None),
+        // `CryptoConfig::new` takes the bytes into its own zeroising storage
+        // and checks the SRT bounds: 10 to 79 bytes, no NUL.
+        HeaderRead::One(mut value) => {
+            match CryptoConfig::new(std::mem::take(&mut *value), KeySize::Aes128) {
+                Ok(key) => (verdict, Some(key)),
+                Err(_) => {
+                    tracing::debug!(
+                        "publish authorisation answered with an unusable SRT passphrase"
+                    );
+                    (Verdict::Unavailable, None)
+                }
+            }
+        }
+        HeaderRead::Repeated => {
+            tracing::debug!("publish authorisation answered with a repeated SRT passphrase header");
+            (Verdict::Unavailable, None)
+        }
+    }
+}
+
+fn log_outcome(protocol: Protocol, outcome: &Result<u16, Failure>) {
     // Refusals are logged, rate-limited, by the caller (`App::log_refusal`).
     // Only the status or the kind of failure is logged here, at debug.
-    match &outcome {
+    match outcome {
         Ok(status) => tracing::debug!(
             protocol = protocol.name(),
             status,
@@ -122,7 +219,6 @@ async fn ask_within(
             "publish authorisation got no answer"
         ),
     }
-    classify(outcome)
 }
 
 /// An in-process stand-in for the app's publish-auth endpoint.
@@ -141,6 +237,9 @@ pub(crate) mod stub {
     #[derive(Clone, Copy)]
     pub(crate) enum Answer {
         Status(u16),
+        /// 200 with these `sapflow-srt-passphrase` header values, one line
+        /// each.
+        Passphrase(&'static [&'static str]),
         /// Read the request, then never answer.
         Silent,
     }
@@ -229,6 +328,14 @@ pub(crate) mod stub {
                             let reply = format!(
                                 "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                             );
+                            let _ = socket.write_all(reply.as_bytes()).await;
+                        }
+                        Answer::Passphrase(values) => {
+                            let mut reply = String::from("HTTP/1.1 200 X\r\ncontent-length: 0\r\n");
+                            for value in values {
+                                reply.push_str(&format!("sapflow-srt-passphrase: {value}\r\n"));
+                            }
+                            reply.push_str("connection: close\r\n\r\n");
                             let _ = socket.write_all(reply.as_bytes()).await;
                         }
                         Answer::Silent => {
@@ -470,6 +577,122 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(stub.count(), 1);
+    }
+
+    const SRT_KEY: &str = "pw_srt_00112233445566778899aabbccddeeff";
+
+    fn mediamtx_body(protocol: &str) -> serde_json::Value {
+        serde_json::json!({
+            "user": "encoder", "password": PASSWORD, "ip": "198.51.100.7",
+            "action": "publish", "path": "live/event-a",
+            "protocol": protocol, "id": null, "query": "",
+        })
+    }
+
+    #[tokio::test]
+    async fn without_app_keys_the_request_and_admission_are_unchanged() {
+        // The app answers with a passphrase, but app keys are off: the
+        // request is mediamtx's, byte for byte, and the header is not read.
+        let stub = stub::start(Answer::Passphrase(&[SRT_KEY])).await;
+        let fixture = fixture(stub.endpoint.clone());
+        assert!(!fixture.app.config.srt_app_keys);
+        let stream_id = format!("publish:live/event-a:encoder:{PASSWORD}");
+        let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0)
+            .await
+            .expect("admitted");
+        assert!(matches!(admission, crate::srt::Admission::Claimed(_)));
+        let requests = stub.requests.lock().expect("log").clone();
+        let (_, sent) = requests.last().expect("request");
+        assert_eq!(*sent, mediamtx_body("srt"));
+        assert_eq!(
+            body(&srt(&stream_id), Protocol::Srt, from()),
+            serde_json::to_vec(&mediamtx_body("srt")).expect("JSON")
+        );
+    }
+
+    #[tokio::test]
+    async fn with_app_keys_srt_offers_the_field_and_rtmp_does_not() {
+        let stub = stub::start(Answer::Passphrase(&[SRT_KEY])).await;
+        let mut fixture = fixture(stub.endpoint.clone());
+        Arc::get_mut(&mut fixture.app)
+            .expect("sole App")
+            .config
+            .srt_app_keys = true;
+        let stream_id = format!("publish:live/event-a:encoder:{PASSWORD}");
+        let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0)
+            .await
+            .expect("admitted");
+        // Keyed: nothing is claimed until the listener checks the key.
+        let crate::srt::Admission::Keyed(keyed) = admission else {
+            panic!("expected a keyed admission")
+        };
+        assert!(fixture.app.streams.get("event-a").is_none());
+        let mut with_field = mediamtx_body("srt");
+        with_field["srtKey"] = "accepted".into();
+        assert_eq!(stub.last(), with_field);
+        // An admission still holding its key cannot be claimed unchecked.
+        let mut admitted = keyed.admitted;
+        let req = keyed.req;
+        let mut again = Publication::admit_srt_key(&fixture.app, &req, from())
+            .await
+            .expect("admitted");
+        assert!(matches!(
+            Publication::claim_admitted(&fixture.app, &req, SourceKind::Ts, again),
+            Err(Refusal::Request(PublishError::Unauthorized))
+        ));
+        assert!(fixture.app.streams.get("event-a").is_none());
+        assert!(admitted.take_srt_key().is_none(), "taken by srt::admit");
+        drop(admitted);
+        // RTMP: no field, and the answer's header is ignored.
+        let rtmp =
+            PublishRequest::parse_rtmp("live", &format!("event-a?user=encoder&pass={PASSWORD}"))
+                .expect("rtmp");
+        let publication =
+            Publication::begin_authorised(&fixture.app, &rtmp, SourceKind::Flv, from())
+                .await
+                .expect("RTMP admitted as before");
+        assert_eq!(stub.last(), mediamtx_body("rtmp"));
+        publication.end();
+        again = Publication::admit(&fixture.app, &rtmp, SourceKind::Es, from())
+            .await
+            .expect("WHIP admitted as before");
+        assert!(again.take_srt_key().is_none());
+        assert_eq!(stub.last(), mediamtx_body("webrtc"));
+    }
+
+    #[tokio::test]
+    async fn an_unusable_passphrase_header_refuses_without_falling_back() {
+        const LONG: &str =
+            "pw_srt_0123456789012345678901234567890123456789012345678901234567890123456789012";
+        assert_eq!(LONG.len(), 80);
+        for values in [&["short"][..], &[LONG], &[SRT_KEY, SRT_KEY], &[""]] {
+            let stub = stub::start(Answer::Passphrase(values)).await;
+            let req = srt(&format!("publish:live/event-a:encoder:{PASSWORD}"));
+            for _ in 0..12 {
+                let (verdict, key) = ask_srt_key(&stub.endpoint, &req, from()).await;
+                assert_eq!(verdict, Verdict::Unavailable, "{}", values.len());
+                assert!(key.is_none());
+            }
+        }
+        // Bounds: 10 and 79 bytes are passphrases.
+        for value in ["pw_srt_abc", &LONG[..79]] {
+            let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+            let values: &'static [&'static str] = Box::leak(vec![leaked].into_boxed_slice());
+            let stub = stub::start(Answer::Passphrase(values)).await;
+            let req = srt("publish:live/event-a");
+            let (verdict, key) = ask_srt_key(&stub.endpoint, &req, from()).await;
+            assert_eq!(
+                (verdict, key.is_some()),
+                (Verdict::Admitted, true),
+                "{}",
+                value.len()
+            );
+        }
+        // A refusal's header is never read: 401 stays 401.
+        let stub = stub::start(Answer::Status(401)).await;
+        let req = srt("publish:live/event-a");
+        let (verdict, key) = ask_srt_key(&stub.endpoint, &req, from()).await;
+        assert_eq!((verdict, key.is_none()), (Verdict::Denied, true));
     }
 
     #[tokio::test(flavor = "current_thread")]
