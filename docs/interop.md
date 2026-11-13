@@ -41,7 +41,18 @@ receiver and an RTMP publisher: stopped while live, only `publish` arrived;
 stopped inside the reconnect grace, `publish` and `unpublish`; only with
 the grace allowed to pass did `recordSegmentComplete` (finalised) follow.
 So a restart during a show, or within `SAPFLOW_RECONNECT_GRACE` of its end,
-leaves the app without that recording. Open.
+left the app without that recording.
+
+Fixed since: a stop now ends every stream at once and waits up to 7.5 s
+for recordings and callbacks (`docs/v4v-contract.md`). The same check,
+repeated with ffmpeg over RTMP and SRT: stopped while live, `publish`,
+`unpublish` once, then `recordSegmentComplete` marked `incomplete` with
+`server-stopped`, and the exit 0.02 s after the SIGTERM; stopped inside
+the grace, the same three with the file `finalised`. With the callback
+receiver accepting but never answering, sapflow exited at the deadline,
+7.56 s after the SIGTERM, and logged the two callbacks still pending. The
+SRT recording cut by the restart in the row above would now be marked
+`server-stopped` rather than `srt-listener-stopped`.
 
 ## Reproducing irregular encoder timing
 

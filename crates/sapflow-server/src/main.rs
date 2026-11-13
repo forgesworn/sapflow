@@ -22,6 +22,7 @@ mod publish_sessions;
 mod recorder;
 mod roll_budget;
 mod rtmp;
+mod shutdown;
 mod srt;
 mod srt_own;
 mod stream;
@@ -103,7 +104,11 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(config)) {
+    let result = runtime.block_on(run(config));
+    // Dropping the runtime would wait without bound for blocking file work
+    // that a stalled recording left behind.
+    runtime.shutdown_timeout(shutdown::RUNTIME);
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sapflow stopped");
@@ -285,8 +290,26 @@ async fn run(config: Config) -> std::io::Result<()> {
         ));
     }
 
+    // Stopped once every stream has ended, so that no claim can come between.
+    let listeners = [
+        srt_task.abort_handle(),
+        rtmp_task.abort_handle(),
+        rtmp_proxy_task.abort_handle(),
+        control_task.abort_handle(),
+        whip_task.abort_handle(),
+        expiry_task.abort_handle(),
+    ];
     tokio::select! {
-        () = stop_signal() => Ok(()),
+        () = stop_signal() => {
+            // A second signal, as a second ctrl-c, exits without waiting.
+            tokio::select! {
+                _ = shutdown::stop(&app, &listeners, shutdown::DEADLINE) => {}
+                () = stop_signal() => {
+                    tracing::warn!("second stop signal; exiting without waiting for recordings or callbacks");
+                }
+            }
+            Ok(())
+        }
         r = srt_task => match r {
             Ok(r) => r,
             Err(e) => Err(std::io::Error::other(e)),

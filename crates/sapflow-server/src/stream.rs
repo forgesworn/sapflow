@@ -1,6 +1,7 @@
 //! Live streams: one per publishing encoder, shared by ingest and HTTP.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,7 @@ use sapflow_hls::{
     EsIngest, FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
 };
 
+use crate::callback::Callbacks;
 use crate::recorder::{IncompleteReason, Recorder, RecorderFactory};
 use crate::roll_budget::{Roll, RollBudget, RollLimit};
 use tokio::sync::watch;
@@ -224,6 +226,12 @@ pub struct Session {
     outage_deadline: Option<Instant>,
     /// The generation whose transport reported an orderly, lossless close.
     clean_close: Option<u64>,
+    /// The `unpublish` owed to the app by the generation that sent `publish`,
+    /// with that publication's callbacks. Whoever ends the publication first
+    /// takes it, its `Publication` or a stop, so it is sent once. After a
+    /// takeover it stays the replaced generation's until the new one
+    /// publishes.
+    unpublish: Option<(u64, Callbacks)>,
 }
 
 impl Session {
@@ -269,6 +277,20 @@ impl Session {
 
     pub fn recovered(&mut self) {
         self.outage_deadline = None;
+    }
+
+    /// `generation` sent `publish`, so it owes the app an `unpublish`.
+    pub fn owe_unpublish(&mut self, generation: u64, callbacks: Callbacks) {
+        self.unpublish = Some((generation, callbacks));
+    }
+
+    /// The `unpublish` `generation` owes, if nothing has sent it yet. A newer
+    /// generation that has published since owns the stage instead.
+    pub fn take_unpublish(&mut self, generation: u64) -> Option<Callbacks> {
+        match &self.unpublish {
+            Some((owner, _)) if *owner == generation => self.unpublish.take().map(|(_, c)| c),
+            _ => None,
+        }
     }
 }
 
@@ -367,6 +389,7 @@ impl LiveStream {
                 recorder_factory: None,
                 outage_deadline: None,
                 clean_close: None,
+                unpublish: None,
             }),
             version: watch::Sender::new(0),
             fragments,
@@ -916,6 +939,8 @@ pub enum ClaimError {
     /// still starting: it would take the room the streams already live need
     /// to fill and slide their windows.
     MemoryLimit,
+    /// sapflow is stopping ([`Registry::stop_all`]).
+    Stopping,
 }
 
 /// The share of the live fragment budget, in percent, that the streams'
@@ -946,6 +971,17 @@ pub struct Registry {
     /// What muxers keep past their windows for RFC 8216bis 6.2.2, charged
     /// apart from `fragments` so that it never refuses live media.
     retained: Arc<sapflow_core::fragment::FragmentQuota>,
+    /// Set by [`Registry::stop_all`] with the map locked: no claim after it.
+    stopping: AtomicBool,
+}
+
+/// What [`Registry::stop_all`] ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stopped {
+    /// Streams with a publisher connected.
+    pub live: usize,
+    /// Streams held for a reconnect, their publisher already gone.
+    pub held: usize,
 }
 
 /// The fragment budget and retention pool every stream shares.
@@ -988,6 +1024,7 @@ impl Registry {
             presentations: Arc::new(PresentationQuota::new(maximum_presentations)),
             fragments: Arc::new(sapflow_core::fragment::FragmentQuota::new(fragment_bytes)),
             retained: Arc::new(sapflow_core::fragment::FragmentQuota::new(retained_bytes)),
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -1109,6 +1146,10 @@ impl Registry {
         configure: impl FnOnce(&mut Session, Claim),
     ) -> Result<(Arc<LiveStream>, u64, Claim), ClaimError> {
         let mut map = self.map();
+        // Read under the map lock that stop_all sets it under.
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ClaimError::Stopping);
+        }
         let mut publication_permit = None;
         if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
@@ -1298,6 +1339,58 @@ impl Registry {
         drop(session);
         Self::end(&mut map, stream);
         true
+    }
+
+    /// sapflow is stopping: refuses every claim from now on and ends every
+    /// stream at once, with no reconnect grace, under one map lock, so no
+    /// publisher can claim a path in between.
+    ///
+    /// - A live publisher's recording is marked [`IncompleteReason::ServerStopped`]
+    ///   (unless it already has a reason).
+    /// - A held stream ends as if its grace had passed.
+    /// - Any `unpublish` still owed is sent, whichever generation owes it: a
+    ///   connection that took the stream over and has not yet published
+    ///   leaves its predecessor's `publish` standing, and the stage is ending.
+    ///
+    /// Each stream's `unpublish` is queued before its recording is released,
+    /// so it goes ahead of `recordSegmentComplete`. A connection still running
+    /// finds its stream closed; its `Publication` then owes nothing.
+    pub fn stop_all(&self) -> Stopped {
+        let mut map = self.map();
+        self.stopping.store(true, Ordering::Release);
+        let streams: Vec<_> = map.values().cloned().collect();
+        let mut stopped = Stopped::default();
+        for stream in streams {
+            {
+                let mut session = stream.session();
+                if stream.lock().closed {
+                    continue;
+                }
+                let generation = session.generation;
+                let live = session.attached;
+                if live {
+                    // Before the terminal drain, whose loss would otherwise
+                    // be the recording's first reason.
+                    session.mark_recording_incomplete(generation, IncompleteReason::ServerStopped);
+                    stopped.live += 1;
+                } else {
+                    stopped.held += 1;
+                }
+                if let Some((_, callbacks)) = session.unpublish.take() {
+                    callbacks.send(&stream.path, sapflow_core::StreamEvent::Unpublish);
+                }
+                if live {
+                    // The terminal drain can start a codec epoch and roll the
+                    // recording to a new, unmarked file: mark that one too (a
+                    // reason it already has is kept). end's drain repeats
+                    // nothing.
+                    stream.finish_connection(&mut session);
+                    session.mark_recording_incomplete(generation, IncompleteReason::ServerStopped);
+                }
+            }
+            Self::end(&mut map, &stream);
+        }
+        stopped
     }
 
     /// Frees the path (if still this stream's), closes the stream, and
@@ -1546,6 +1639,7 @@ mod grace_tests {
             recorder_factory: None,
             outage_deadline: None,
             clean_close: None,
+            unpublish: None,
         };
         let grace = Duration::from_secs(90);
         assert_eq!(session.hold_remaining(grace, now), grace);

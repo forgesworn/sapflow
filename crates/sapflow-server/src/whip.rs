@@ -1823,7 +1823,8 @@ fn admission_refusal(r: Refusal) -> Refused {
         Refusal::PublisherLimit
         | Refusal::PresentationLimit
         | Refusal::MemoryLimit
-        | Refusal::AuthUnavailable => resource::Refusal::Unavailable,
+        | Refusal::AuthUnavailable
+        | Refusal::Stopping => resource::Refusal::Unavailable,
     };
     r.into()
 }
