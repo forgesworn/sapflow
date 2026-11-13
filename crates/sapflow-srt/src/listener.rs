@@ -623,6 +623,17 @@ impl<S: BuildHasher> Listener<S> {
     /// accepted; [`KeyCheckError::reject_code`] gives the code to refuse
     /// with. Costs one key derivation (PBKDF2, 2048 rounds), as accepting
     /// does.
+    ///
+    /// A failed check must end in [`reject`](Self::reject), never in another
+    /// accept: [`accept`](Self::accept) and
+    /// [`accept_with_crypto`](Self::accept_with_crypto) still admit what the
+    /// listener's own `crypto` and `allow_plaintext` allow, including a
+    /// caller with no key material or one keyed to the global secret.
+    ///
+    /// A passing check proves the key material was wrapped under this
+    /// passphrase, not that its sender is the encoder that made it: a
+    /// replayed conclusion passes too. This crate has no replay guard, so
+    /// do not turn on `app_keys` in production until the application has one.
     pub fn check_key(&self, id: ConnId, crypto: &CryptoConfig) -> Result<KeySize, KeyCheckError> {
         let p = self.pending(id).ok_or(KeyCheckError::NotPending)?;
         let km = p.km().ok_or(KeyCheckError::NoKeyMaterial)?;
@@ -638,7 +649,15 @@ impl<S: BuildHasher> Listener<S> {
     /// no key material is refused with [`RejectCode::UNSECURE`] whatever
     /// [`Config::allow_plaintext`] says, and one whose key does not match
     /// with [`RejectCode::BADSECRET`]. Returns whether it was accepted;
-    /// `false` with nothing sent when no caller with this id is waiting.
+    /// `false` with nothing sent when no caller with this id is waiting
+    /// (for example after [`Config::accept_timeout`]).
+    ///
+    /// For a caller the application admits by its own passphrase, this is
+    /// the only accept to use: if it or [`check_key`](Self::check_key)
+    /// fails, refuse the caller, never retry with [`accept`](Self::accept)
+    /// or [`accept_with_crypto`](Self::accept_with_crypto). As with
+    /// `check_key`, a replayed conclusion is accepted until the application
+    /// guards against replay.
     pub fn accept_with_key(&mut self, id: ConnId, now: Instant, crypto: &CryptoConfig) -> bool {
         let config = match self.pending(id) {
             None => return false,
@@ -1728,12 +1747,15 @@ mod tests {
 
     /// Everything a listener sends while plaintext, matching and wrong
     /// callers are answered with accept and accept_with_crypto.
-    fn legacy_answers(config: Config, kms: &[Vec<u8>], secret: &CryptoConfig) -> Vec<Vec<u8>> {
+    fn legacy_answers(
+        config: Config,
+        callers: &[Option<Vec<u8>>],
+        secret: &CryptoConfig,
+    ) -> Vec<Vec<u8>> {
         let t0 = Instant::now();
         let mut l = with_config(t0, config);
         let mut out = Vec::new();
-        let callers = std::iter::once(None).chain(kms.iter().map(Some));
-        for (i, km) in callers.enumerate() {
+        for (i, km) in callers.iter().enumerate() {
             let socket = i as u32 + 1;
             let c = l.cookie(peer(), 0);
             let datagram = match km {
@@ -1761,13 +1783,16 @@ mod tests {
     fn app_keys_leave_accept_and_accept_with_crypto_unchanged() {
         let secret = CryptoConfig::new(b"global lab passphrase".to_vec(), KeySize::Aes128)
             .expect("passphrase");
-        let kms = [
-            key_material(b"global lab passphrase", KeySize::Aes128),
-            key_material(b"global lab passphrase", KeySize::Aes128),
-            key_material(b"another passphrase", KeySize::Aes128),
-            key_material(b"another passphrase", KeySize::Aes128),
-            key_material(b"global lab passphrase", KeySize::Aes256),
+        let keyed = [
+            None,
+            Some(key_material(b"global lab passphrase", KeySize::Aes128)),
+            Some(key_material(b"global lab passphrase", KeySize::Aes128)),
+            Some(key_material(b"another passphrase", KeySize::Aes128)),
+            Some(key_material(b"another passphrase", KeySize::Aes128)),
+            Some(key_material(b"global lab passphrase", KeySize::Aes256)),
         ];
+        // Plaintext only, answered by accept and accept_with_crypto in turn.
+        let plain = [None, None, None, None];
         let optional = Config {
             crypto: Some(secret.clone()),
             allow_plaintext: true,
@@ -1781,19 +1806,71 @@ mod tests {
             require_encryption: true,
             ..Config::default()
         };
-        for base in [optional, required, scoped] {
-            let off = legacy_answers(base.clone(), &kms, &secret);
+        // With no secret and encryption not required, the new condition is
+        // the one that decides for a caller with key material, so such
+        // callers differ there by design (below); plaintext callers must not.
+        let default = Config::default();
+        for (base, callers) in [
+            (optional, &keyed[..]),
+            (required, &keyed[..]),
+            (scoped, &keyed[..]),
+            (default.clone(), &plain[..]),
+        ] {
+            let off = legacy_answers(base.clone(), callers, &secret);
             let on = legacy_answers(
                 Config {
                     app_keys: true,
                     ..base
                 },
-                &kms,
+                callers,
                 &secret,
             );
             assert_eq!(off, on, "byte for byte");
-            assert!(off.len() > kms.len() + 2);
+            assert!(off.len() > callers.len() + 1);
         }
+        // The designed difference: refused in the handshake without the
+        // option, left for the application with it.
+        let km = Some(key_material(APP, KeySize::Aes128));
+        let off = legacy_answers(default.clone(), std::slice::from_ref(&km), &secret);
+        let on = legacy_answers(app_keys(), std::slice::from_ref(&km), &secret);
+        assert_ne!(off, on);
+    }
+
+    #[test]
+    fn optional_global_secret_with_app_keys_admits_only_the_app_key_strictly() {
+        // The reference deployment during the migration: a global secret
+        // with plaintext allowed, and app keys on.
+        let t0 = Instant::now();
+        let global = b"global lab passphrase";
+        let mut l = with_config(
+            t0,
+            Config {
+                crypto: Some(CryptoConfig::new(global.to_vec(), KeySize::Aes128).expect("global")),
+                allow_plaintext: true,
+                ..app_keys()
+            },
+        );
+        let key = app(KeySize::Aes256);
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let id = waiting(
+                &mut l,
+                t0,
+                size.field().into(),
+                Some(&key_material(APP, size)),
+            );
+            assert_eq!(l.check_key(id, &key), Ok(size));
+            assert!(l.accept_with_key(id, t0, &key));
+            assert!(l.connection_stats(id).is_some(), "open");
+            sent_handshakes(&mut l);
+        }
+        let id = waiting(&mut l, t0, 10, None);
+        assert_eq!(l.check_key(id, &key), Err(KeyCheckError::NoKeyMaterial));
+        assert!(!l.accept_with_key(id, t0, &key));
+        assert_eq!(rejection(&mut l), Some(RejectCode::UNSECURE.0));
+        let id = waiting(&mut l, t0, 11, Some(&key_material(global, KeySize::Aes128)));
+        assert_eq!(l.check_key(id, &key), Err(KeyCheckError::BadSecret));
+        assert!(!l.accept_with_key(id, t0, &key));
+        assert_eq!(rejection(&mut l), Some(RejectCode::BADSECRET.0));
     }
 
     #[test]
@@ -1813,9 +1890,19 @@ mod tests {
             .iter()
             .flat_map(|e| [format!("{e}"), format!("{e:?}")])
             .chain([format!("{config:?}"), format!("{:?}", app(KeySize::Aes128))]);
-        let secret = String::from_utf8_lossy(APP);
-        for text in printed {
-            assert!(!text.contains(&*secret), "{text}");
+        let printed: Vec<String> = printed.collect();
+        // The passphrase as text, as Debug prints a byte slice, and as hex.
+        let as_text = String::from_utf8_lossy(APP).into_owned();
+        let as_list = format!("{APP:?}");
+        let as_list = as_list.trim_start_matches('[').trim_end_matches(']');
+        let as_hex: String = APP.iter().map(|b| format!("{b:02x}")).collect();
+        for text in &printed {
+            for form in [as_text.as_str(), as_list, as_hex.as_str()] {
+                assert!(!text.contains(form), "{text}");
+            }
+        }
+        for text in printed.iter().skip(2 * all.len()) {
+            assert!(text.contains("[REDACTED]"), "{text}");
         }
         let mut bad = app(KeySize::Aes128);
         bad.preannounce_packets = 0;

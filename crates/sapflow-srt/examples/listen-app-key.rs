@@ -15,7 +15,12 @@ use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let passphrase = std::env::var("SRT_APP_PASSPHRASE")?.into_bytes();
+    // Errors carry no part of the value.
+    let passphrase = std::env::var_os("SRT_APP_PASSPHRASE")
+        .ok_or("SRT_APP_PASSPHRASE is not set")?
+        .into_string()
+        .map_err(|_| "SRT_APP_PASSPHRASE is not valid UTF-8")?
+        .into_bytes();
     // The caller's key length is used; this one is not consulted.
     let key = CryptoConfig::new(passphrase, KeySize::Aes256)?;
     let socket = UdpSocket::bind("0.0.0.0:9000")?;
@@ -54,7 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     peer,
                     stream_id,
                 } => {
-                    // Check the stream id here as well; it is untrusted.
+                    // Check the stream id here as well; it is untrusted, so
+                    // it is printed escaped. It is not a secret.
                     let check = listener.check_key(id, &key);
                     println!(
                         "{peer} wants {:?}: key check {check:?}",
@@ -65,6 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let accepted = listener.accept_with_key(id, Instant::now(), &key);
                             println!("{id:?} accepted: {accepted}");
                         }
+                        // A failed check ends in a refusal, never in another
+                        // accept.
                         Err(e) => {
                             listener.reject(id, e.reject_code().unwrap_or(RejectCode::BADSECRET));
                         }

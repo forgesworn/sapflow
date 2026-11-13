@@ -374,5 +374,12 @@ Notes for the release after 0.2.0-rc.1.
   `allow_plaintext`, a wrong key with `BADSECRET`. `accept` and
   `accept_with_crypto` are unchanged. `listener::Config` is not
   `#[non_exhaustive]`, so a struct literal needs `..Config::default()`.
-  `examples/listen-app-key.rs` is a complete listener, and the new fuzz
-  target `own_srt_app_keys` drives the check and both accepts.
+  A failed check must end in `reject`: `accept` and `accept_with_crypto`
+  still admit what the listener's own settings allow. A passing check
+  proves the key material was wrapped under the passphrase, not that its
+  sender made it, so a replayed conclusion passes; do not turn on
+  `app_keys` in production before the application guards against replay.
+  `examples/listen-app-key.rs` is a complete listener. The new fuzz target
+  `own_srt_app_keys` drives `check_key`, `accept_with_key`, `accept`,
+  `reject` and `close`, with no global secret or with a global secret and
+  `allow_plaintext`; it does not call `accept_with_crypto` directly.

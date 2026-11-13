@@ -90,6 +90,12 @@ caller's key length (AES-128 or AES-256, whichever the caller chose) or a
 `accept_with_key(id, now, &crypto)` then accepts only a caller whose key
 matches, and never falls back to plaintext: no key material is refused with
 `UNSECURE` whatever `allow_plaintext` says, a wrong key with `BADSECRET`.
+A failed check must end in `reject`, never in `accept` or
+`accept_with_crypto`, which still admit what the listener's own settings
+allow. A passing check proves the key material was wrapped under the
+passphrase, not that its sender made it: a replayed conclusion passes too,
+so do not turn on `app_keys` in production before the application guards
+against replay.
 
 ```rust
 use sapflow_srt::crypto::{CryptoConfig, KeySize};

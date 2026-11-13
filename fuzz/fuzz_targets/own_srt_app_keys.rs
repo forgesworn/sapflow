@@ -14,10 +14,17 @@
 //! with AES-128 as the application's key length; the low two bits pick the
 //! peer. 0x1C closes the peer's connection.
 //!
+//! Mode: the listener has no global secret, or, when the first record's
+//! peer bits are 3 (peer 0 either way, so the seeds keep their meaning), a
+//! global secret with `allow_plaintext`, as the reference deployment runs
+//! while it moves to app keys.
+//!
 //! Checks: `check_key` changes nothing and gives the same answer twice; a
 //! wrong passphrase never passes; `accept_with_key` accepts exactly when the
 //! check passed and otherwise refuses with the check's code; plain `accept`
-//! never admits a caller that sent key material (there is no global secret).
+//! admits exactly what the listener's own settings allow: plaintext, and in
+//! the second mode key material wrapped under the global secret at its key
+//! length, never key material without a global secret.
 #![no_main]
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
@@ -34,6 +41,8 @@ type Fixed = BuildHasherDefault<DefaultHasher>;
 /// The application's passphrase; the seeds' callers use it too.
 const APP: &[u8] = b"own_srt_app_keys fuzz passphrase";
 const WRONG: &[u8] = b"own_srt_app_keys wrong passphrase";
+/// The listener's own secret in the second mode.
+const GLOBAL: &[u8] = b"own_srt_app_keys global passphrase";
 
 /// Rewrites a client datagram the way a real client fills it in.
 fn as_client(datagram: &[u8], cookie: Option<u32>, socket: Option<u32>) -> Vec<u8> {
@@ -88,10 +97,14 @@ fuzz_target!(|data: &[u8]| {
         "192.0.2.2:5000".parse().expect("addr"),
         "[2001:db8::1]:5000".parse().expect("addr"),
     ];
+    let global = CryptoConfig::new(GLOBAL.to_vec(), KeySize::Aes128).expect("passphrase");
+    let optional = data.first().is_some_and(|c| c & 3 == 3);
     let config = Config {
         max_connections: 4,
         buffer_packets: 256,
         app_keys: true,
+        crypto: optional.then(|| global.clone()),
+        allow_plaintext: optional,
         ..Config::default()
     };
     let app256 = CryptoConfig::new(APP.to_vec(), KeySize::Aes256).expect("passphrase");
@@ -145,14 +158,27 @@ fuzz_target!(|data: &[u8]| {
                     if ctl & 0x20 != 0 {
                         listener.reject(id, RejectCode::http(401));
                     } else if ctl & 0x08 != 0 {
-                        // No global secret: key material is never downgraded.
+                        // What the listener's own settings admit: plaintext,
+                        // and key material only under the global secret at
+                        // its own key length; never a downgrade.
+                        let by_global = optional
+                            && listener.check_key(id, &global) == Ok(global.key_size);
                         let accepted = listener.accept(id, now);
+                        assert_eq!(
+                            accepted,
+                            check == Err(KeyCheckError::NoKeyMaterial) || by_global,
+                            "{check:?}"
+                        );
                         if accepted {
-                            assert_eq!(check, Err(KeyCheckError::NoKeyMaterial));
                             sockets.insert(peer, id.0);
                         } else {
+                            let code = if optional {
+                                RejectCode::BADSECRET
+                            } else {
+                                RejectCode::UNSECURE
+                            };
                             let codes = drain(&mut listener, &mut cookies);
-                            assert_eq!(codes, [RejectCode::UNSECURE.0]);
+                            assert_eq!(codes, [code.0]);
                         }
                     } else {
                         let accepted = listener.accept_with_key(id, now, app);

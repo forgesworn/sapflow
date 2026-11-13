@@ -14,6 +14,8 @@ use sapflow_srt::{Caller, CallerConfig, Config, Event, KeyCheckError, Listener};
 
 /// The passphrase the `own_srt_app_keys` fuzz target checks callers with.
 const FUZZ_APP: &[u8] = b"own_srt_app_keys fuzz passphrase";
+/// That target's global secret in its second mode.
+const FUZZ_GLOBAL: &[u8] = b"own_srt_app_keys global passphrase";
 
 fn listener_addr() -> SocketAddr {
     "127.0.0.1:9000".parse().expect("addr")
@@ -181,20 +183,28 @@ fn write_fuzz_seeds() {
         );
         assert!(s.connected);
         std::fs::write(seeds().join(name), &s.records).expect("write seed");
+        // The same session in the target's second mode (a global secret
+        // with plaintext allowed): the first record's peer bits set to 3.
+        let mut optional = s.records;
+        optional[0] |= 3;
+        std::fs::write(seeds().join(format!("{name}-optional")), optional).expect("write seed");
     }
 }
 
 /// The `own_srt_app_keys` harness, cut down to its default path (peer 0,
-/// cookie and socket id rewritten, strict accept): what each seed's
-/// checks returned and how many payloads were delivered.
+/// cookie and socket id rewritten, strict accept) in either mode: what each
+/// seed's checks returned and how many payloads were delivered.
 fn replay(data: &[u8]) -> (Vec<Result<KeySize, KeyCheckError>>, usize) {
     let start = Instant::now();
     let app = secret(FUZZ_APP, KeySize::Aes256);
+    let optional = data.first().is_some_and(|c| c & 3 == 3);
     let mut l = Listener::new(
         Config {
             max_connections: 4,
             buffer_packets: 256,
             app_keys: true,
+            crypto: optional.then(|| secret(FUZZ_GLOBAL, KeySize::Aes128)),
+            allow_plaintext: optional,
             ..Config::default()
         },
         start,
@@ -269,8 +279,14 @@ fn fuzz_seeds_reach_a_successful_check_and_encrypted_media() {
         .map(|e| e.expect("entry").path())
         .collect();
     files.sort();
-    assert_eq!(files.len(), 2, "{files:?}");
-    for (file, size) in files.iter().zip([KeySize::Aes128, KeySize::Aes256]) {
+    assert_eq!(files.len(), 4, "{files:?}");
+    let sizes = [
+        KeySize::Aes128,
+        KeySize::Aes128,
+        KeySize::Aes256,
+        KeySize::Aes256,
+    ];
+    for (file, size) in files.iter().zip(sizes) {
         let (checks, delivered) = replay(&std::fs::read(file).expect("seed"));
         assert_eq!(checks, vec![Ok(size)], "{file:?}");
         assert!(delivered > 0, "{file:?}");
