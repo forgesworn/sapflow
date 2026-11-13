@@ -1284,7 +1284,7 @@ async fn without_app_keys_a_wrong_global_key_never_replaces_a_live_stage() {
 /// Plaintext under `optional`, without app keys: admitted after the check as
 /// before, and logged as such.
 #[tokio::test(flavor = "current_thread")]
-async fn without_app_keys_optional_still_admits_plaintext_and_the_global_key() {
+async fn without_app_keys_optional_still_admits_plaintext() {
     let captured = crate::log_capture::Capture::start();
     let stub = stub::start(Answer::Status(200)).await;
     let mut fixture = global_fixture(&stub, "deployment-wide-secret", false);
