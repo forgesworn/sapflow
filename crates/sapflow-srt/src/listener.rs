@@ -632,8 +632,12 @@ impl<S: BuildHasher> Listener<S> {
     ///
     /// A passing check proves the key material was wrapped under this
     /// passphrase, not that its sender is the encoder that made it: a
-    /// replayed conclusion passes too. This crate has no replay guard, so
-    /// do not turn on `app_keys` in production until the application has one.
+    /// replayed conclusion passes too. This crate keeps no record of key
+    /// material it has seen; an application that admits callers by key
+    /// guards against replay itself, with
+    /// [`pending_key_material`](Self::pending_key_material),
+    /// [`crate::crypto::bound_key_material`] and
+    /// [`caller_socket`](Self::caller_socket).
     pub fn check_key(&self, id: ConnId, crypto: &CryptoConfig) -> Result<KeySize, KeyCheckError> {
         let p = self.pending(id).ok_or(KeyCheckError::NotPending)?;
         let km = p.km().ok_or(KeyCheckError::NoKeyMaterial)?;
@@ -656,8 +660,8 @@ impl<S: BuildHasher> Listener<S> {
     /// the only accept to use: if it or [`check_key`](Self::check_key)
     /// fails, refuse the caller, never retry with [`accept`](Self::accept)
     /// or [`accept_with_crypto`](Self::accept_with_crypto). As with
-    /// `check_key`, a replayed conclusion is accepted until the application
-    /// guards against replay.
+    /// `check_key`, a replayed conclusion is accepted unless the application
+    /// refuses it first.
     pub fn accept_with_key(&mut self, id: ConnId, now: Instant, crypto: &CryptoConfig) -> bool {
         let config = match self.pending(id) {
             None => return false,
@@ -684,6 +688,24 @@ impl<S: BuildHasher> Listener<S> {
     /// waiting. Reads the handshake only: no key derivation.
     pub fn sent_key_material(&self, id: ConnId) -> Option<bool> {
         self.pending(id).map(|p| p.km().is_some())
+    }
+
+    /// The key material (`KMREQ`) a caller waiting for an answer sent, as
+    /// it sent it; `None` when no caller with this id is waiting or it sent
+    /// none. Wrapped under the passphrase and sent in clear, so it is no
+    /// secret, but it is what a replayed handshake repeats:
+    /// [`crate::crypto::bound_key_material`] gives the part to compare.
+    pub fn pending_key_material(&self, id: ConnId) -> Option<&[u8]> {
+        self.pending(id)?.km().map(Vec::as_slice)
+    }
+
+    /// The caller's own SRT socket id for a connection, waiting or open;
+    /// `None` once it has ended or been refused. With the peer address it
+    /// names the caller: a repeated conclusion from the same address and
+    /// socket id goes to the same connection and never makes a second
+    /// [`Event::Connect`].
+    pub fn caller_socket(&self, id: ConnId) -> Option<u32> {
+        self.conns.get(&id.0).map(|c| c.caller_socket)
     }
 
     fn pending(&self, id: ConnId) -> Option<&Pending> {
@@ -1637,6 +1659,135 @@ mod tests {
             assert_eq!(l.sent_key_material(ConnId(id.0 ^ 1)), None, "unknown id");
             assert!(l.reject(id, RejectCode::UNSECURE));
             assert_eq!(l.sent_key_material(id), None, "answered");
+        }
+    }
+
+    #[test]
+    fn pending_key_material_is_what_a_waiting_caller_sent() {
+        let t0 = Instant::now();
+        let km = key_material(APP, KeySize::Aes128);
+        let mut l = with_config(t0, app_keys());
+        let id = waiting(&mut l, t0, 1, Some(&km));
+        assert_eq!(l.pending_key_material(id), Some(km.as_slice()));
+        assert_eq!(l.pending_key_material(ConnId(id.0 ^ 1)), None, "unknown id");
+        let plain = waiting(&mut l, t0, 2, None);
+        assert_eq!(l.pending_key_material(plain), None, "sent none");
+        assert!(l.accept_with_key(id, t0, &app(KeySize::Aes128)));
+        assert_eq!(l.pending_key_material(id), None, "answered");
+    }
+
+    #[test]
+    fn caller_socket_names_the_caller_while_waiting_or_open() {
+        let t0 = Instant::now();
+        let mut l = listener(t0);
+        let id = connect(&mut l, t0, 7);
+        assert_eq!(l.caller_socket(id), Some(7), "waiting");
+        assert!(l.accept(id, t0));
+        assert_eq!(l.caller_socket(id), Some(7), "open");
+        l.close(id, t0);
+        assert_eq!(l.caller_socket(id), None, "ended");
+        while l.poll_transmit().is_some() {}
+        let refused = connect(&mut l, t0, 8);
+        assert!(l.reject(refused, RejectCode::BADSECRET));
+        assert_eq!(l.caller_socket(refused), None, "refused");
+    }
+
+    /// A caller whose response was lost resends the same conclusion, key
+    /// material included. While its connection waits or is open, that goes
+    /// to the same connection: no second [`Event::Connect`] reaches the
+    /// application, so a replay guard there never sees a lost-response resend.
+    #[test]
+    fn a_resent_conclusion_with_key_material_never_makes_a_second_connect() {
+        let t0 = Instant::now();
+        let km = key_material(APP, KeySize::Aes256);
+        let mut l = with_config(t0, app_keys());
+        let id = waiting(&mut l, t0, 3, Some(&km));
+        let resend = conclusion_km(3, l.cookie(peer(), 0), &km);
+        l.handle_datagram(t0, peer(), &resend);
+        assert_eq!(l.poll_event(), None, "while waiting");
+        assert!(sent_handshakes(&mut l).is_empty());
+        assert!(l.accept_with_key(id, t0, &app(KeySize::Aes256)));
+        let response = sent_handshakes(&mut l);
+        l.handle_datagram(t0, peer(), &resend);
+        assert_eq!(l.poll_event(), None, "while open");
+        assert_eq!(sent_handshakes(&mut l), response, "the same answer again");
+        assert_eq!((l.connections(), l.stats().rejected), (1, 0));
+    }
+
+    /// Our own `Caller` makes fresh key material (salt and keys) for every
+    /// connection, so a server that refuses key material it has seen never
+    /// refuses it on a reconnect.
+    #[test]
+    fn our_caller_sends_fresh_key_material_on_every_connection() {
+        let t0 = Instant::now();
+        let at: SocketAddr = "127.0.0.1:9000".parse().expect("addr");
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..8 {
+            let mut l = with_config(t0, app_keys());
+            let mut c = crate::caller::Caller::new(
+                crate::caller::CallerConfig {
+                    stream_id: "publish:live/event-a".into(),
+                    crypto: Some(app(KeySize::Aes128)),
+                    ..crate::caller::CallerConfig::default()
+                },
+                at,
+                t0,
+            )
+            .expect("caller");
+            let mut km = None;
+            for _ in 0..8 {
+                while let Some((_, b)) = c.poll_transmit(t0) {
+                    l.handle_datagram(t0, peer(), &b);
+                }
+                while let Some((_, b)) = l.poll_transmit() {
+                    c.handle_datagram(t0, at, &b);
+                }
+                if let Some(Event::Connect { id, .. }) = l.poll_event() {
+                    km = l.pending_key_material(id).map(<[u8]>::to_vec);
+                    break;
+                }
+            }
+            let km = km.expect("a caller with key material");
+            let bound = crate::crypto::bound_key_material(&km).expect("bound part");
+            assert!(
+                seen.iter()
+                    .all(|s| crate::crypto::bound_key_material(s) != Some(bound)),
+                "key material repeated"
+            );
+            seen.push(km);
+        }
+    }
+
+    /// The part of key material a replay guard compares is all that the
+    /// passphrase check binds: flipping any single bit of a valid KMREQ
+    /// either fails the check or leaves that part as it was, so a replayer
+    /// cannot dodge the guard by editing the message.
+    #[test]
+    fn every_bit_a_key_check_ignores_lies_outside_the_bound_part() {
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let km = key_material(APP, size);
+            let bound = crate::crypto::bound_key_material(&km)
+                .expect("bound part")
+                .to_vec();
+            let mut ignored = 0;
+            for bit in 0..km.len() * 8 {
+                let mut flipped = km.clone();
+                flipped[bit / 8] ^= 1 << (bit % 8);
+                let passes = for_km(&app(size), &flipped)
+                    .and_then(|c| Decryptor::new(&c, &flipped).map_err(KeyCheckError::from))
+                    .is_ok();
+                if passes {
+                    ignored += 1;
+                    assert_eq!(
+                        crate::crypto::bound_key_material(&flipped),
+                        Some(bound.as_slice()),
+                        "{size:?} bit {bit}"
+                    );
+                }
+            }
+            // The first half of the salt, and the key flags (even and odd
+            // at one key's length), are not bound: some flips pass.
+            assert!(ignored >= 64, "{size:?}: {ignored}");
         }
     }
 

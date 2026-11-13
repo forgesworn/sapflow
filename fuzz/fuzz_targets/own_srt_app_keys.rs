@@ -24,7 +24,9 @@
 //! check passed and otherwise refuses with the check's code; plain `accept`
 //! admits exactly what the listener's own settings allow: plaintext, and in
 //! the second mode key material wrapped under the global secret at its key
-//! length, never key material without a global secret.
+//! length, never key material without a global secret. The accessors a
+//! replay guard reads (`pending_key_material`, `bound_key_material`,
+//! `caller_socket`) agree with the check and with the caller's state.
 #![no_main]
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
@@ -32,7 +34,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
-use sapflow_srt::crypto::{CryptoConfig, KeySize};
+use sapflow_srt::crypto::{CryptoConfig, KeySize, bound_key_material};
 use sapflow_srt::packet::{Control, ControlPacket, Extension, HandshakeKind, Packet};
 use sapflow_srt::{Config, ConnId, Event, KeyCheckError, Listener, RejectCode};
 
@@ -145,6 +147,14 @@ fuzz_target!(|data: &[u8]| {
                     let check = listener.check_key(id, app);
                     assert_ne!(check, Err(KeyCheckError::NotPending));
                     assert_eq!(listener.check_key(id, app), check, "idempotent");
+                    // What a replay guard reads agrees with the check.
+                    let km = listener.pending_key_material(id);
+                    assert_eq!(km.is_some(), check != Err(KeyCheckError::NoKeyMaterial));
+                    assert_eq!(listener.sent_key_material(id), Some(km.is_some()));
+                    if check.is_ok() {
+                        assert!(km.and_then(bound_key_material).is_some(), "bound part");
+                    }
+                    assert!(listener.caller_socket(id).is_some(), "waiting");
                     if ctl & 0x10 != 0 {
                         let w = listener.check_key(id, &wrong);
                         assert!(w.is_err(), "a wrong passphrase passed");
@@ -157,6 +167,7 @@ fuzz_target!(|data: &[u8]| {
                     assert!(drain(&mut listener, &mut cookies).is_empty(), "nothing answered");
                     if ctl & 0x20 != 0 {
                         listener.reject(id, RejectCode::http(401));
+                        assert_eq!(listener.caller_socket(id), None, "refused");
                     } else if ctl & 0x08 != 0 {
                         // What the listener's own settings admit: plaintext,
                         // and key material only under the global secret at
@@ -183,6 +194,7 @@ fuzz_target!(|data: &[u8]| {
                     } else {
                         let accepted = listener.accept_with_key(id, now, app);
                         assert_eq!(accepted, check.is_ok(), "{check:?}");
+                        assert_eq!(listener.caller_socket(id).is_some(), accepted);
                         if accepted {
                             sockets.insert(peer, id.0);
                             assert_eq!(listener.check_key(id, app), Err(KeyCheckError::NotPending));

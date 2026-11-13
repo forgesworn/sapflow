@@ -294,6 +294,17 @@ impl<'a> Km<'a> {
 pub(crate) fn km_key_size(bytes: &[u8]) -> Result<KeySize, CryptoError> {
     Km::parse(bytes).map(|km| km.size)
 }
+/// The part of a well-formed KM message (a `KMREQ`) that a passphrase check
+/// binds: the last 8 bytes of the salt, the only ones the key derivation
+/// reads, and the wrapped keys. Two messages that differ only outside it
+/// (the header's key flags or the first half of the salt) unwrap under the
+/// same passphrase alike, so an application that recognises key material it
+/// has seen before, to refuse a replayed handshake, compares this part and
+/// not the whole message. `None` for a malformed or unsupported message.
+pub fn bound_key_material(bytes: &[u8]) -> Option<&[u8]> {
+    Km::parse(bytes).ok()?;
+    bytes.get(24..)
+}
 pub(crate) fn valid_km(bytes: &[u8], field: u16) -> bool {
     Km::parse(bytes).is_ok_and(|km| field == 0 || km.size.field() == field)
 }
