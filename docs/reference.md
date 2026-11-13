@@ -357,8 +357,10 @@ follows the observed behaviour.
   loss list is full or has to drop it. Only for a caller that sets
   `REXMITFLG`: without it a retransmission that fills a gap looks like an
   original a round trip late, and real loss would push the wait to its cap.
-  libsrt has a comparable option, `SRTO_LOSSMAXTTL` (reorder tolerance in
-  packets, off by default); this one is in time, adapts and is on by
+  libsrt has a comparable option, `SRTO_LOSSMAXTTL`: a tolerance counted
+  in packets, raised the same way by a late packet without the
+  retransmission flag, and off by default (libsrt's
+  `docs/API/API-socket-options.md`). This one counts time and is on by
   default. The close log's `nak_held` and `max_reorder_wait_us` show it at
   work.
 - **Observed:** ffmpeg (libsrt 1.5.3) sets the order flag on every data

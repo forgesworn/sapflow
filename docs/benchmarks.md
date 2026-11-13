@@ -1901,12 +1901,16 @@ where one trial held more packets than that (100.8% on average) read 100%.
   (`crates/sapflow-srt/tests/fixtures`) through both builds' listeners,
   with extra deterministic loss, stretched timing and injected drop
   requests over 52 variants, sent byte-identical datagrams from each.
-- **At 200 ms the hold does not engage.** The round trip is 60 ms plus up
-  to 20 ms of jitter each way, so three round trips take about as long as
-  the latency and a new gap has no room before the last three: the wait
-  rose to its 25 ms cap (an eighth of the latency), but none of the 5,600 to
-  5,900 reordered packets a trial came while its NAK was held, and overhead
-  is as before.
+- **At 200 ms the hold all but never engages here.** The round trip is
+  60 ms plus up to 20 ms of jitter each way, so three round trips take
+  about as long as the latency and a new gap seldom has room before the
+  last three: the wait rose to its 25 ms cap (an eighth of the latency), but
+  none of the 5,600 to 5,900 reordered packets a trial came while its NAK
+  was held, and overhead is as before. On a shorter round trip the hold
+  does engage at 200 ms: the same replay with every third or sixth pair of
+  originals swapped, at the trace's 200 ms latency, sent 20 of about 12,800
+  datagrams differently, each a NAK for the same loss held 1.1 to 25 ms,
+  and delivered exactly the same packets.
 - **Packets dropped at 200 ms under bursty loss vary from run to run more
   than between the builds.** With no jitter, main dropped none in the run
   above while the branch dropped 3, 11 and 14, so that cell was run again
@@ -1915,9 +1919,9 @@ where one trial held more packets than that (100.8% on average) read 100%.
   eight more seeds gave 10.1 ± 8.9 for main and 14.4 ± 8.2 for the branch
   (t 1.0), video 96.0% and 95.2%; with order kept main dropped 14.0 ± 4.4
   and the branch 13.0 ± 9.9. With the wait at none the builds send the same
-  datagrams for the same packets (the replay above), so this is loss
-  falling on different datagrams in each run (`none200aa` and `reorder200`
-  in the evidence).
+  datagrams for the same packets (the replay above), so in the no-jitter
+  cells this is loss falling on different datagrams in each run
+  (`none200aa` and `reorder200` in the evidence).
 - **Jitter beyond the cap still gains.** At 100 ms the wait sat at its 50
   ms cap and caught the reordered packets that came within it, about 62% of
   them, so overhead fell to about a third of before rather than back to it.
@@ -1925,10 +1929,15 @@ where one trial held more packets than that (100.8% on average) read 100%.
   packets short with no SRT packet given up, and main had one such trial
   in the burst row. At 200 ms that jitter is half the latency and both
   builds lost over half the video.
-- **The wait reached 41 to 43 ms under 20 ms of jitter with loss**, against
-  28 ms with no loss. The proxy's jitter is bounded at 20 ms, so something
-  else delayed some originals by up to about 40 ms; it was not looked into.
-  The cap bounds it either way.
+- **The wait reached 28 to 50 ms under 20 ms of jitter with loss** (41 to
+  43 ms on average), against 28 ms with no loss. It only halves after a
+  second with no reordering, so under steady reordering the single latest
+  original of a trial sets this maximum. The proxy's jitter is bounded at
+  20 ms, so something else delayed a few originals by up to about 40 ms; it
+  was not looked into. It is not retransmissions counted as originals:
+  `lost` less `reordered`, the real losses, was 162 to 176 a trial at 2%
+  random loss with reordering against 159 to 171 without, and 310 to 550
+  against 336 to 535 under bursts. The cap bounds it either way.
 - **libsrt's delivery is again not comparable**: its clean runs failed on
   one decode message where its output starts, as in the section above.
 

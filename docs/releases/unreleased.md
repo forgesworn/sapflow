@@ -337,8 +337,9 @@ Notes for the release after 0.2.0-rc.1.
   retransmissions fell from 66.5% of originals to 3.1% at 2% random loss
   and from 65.1% to 6.4% at 5% bursty loss, delivering everything as
   before. Without reordering nothing changed, and at 200 ms latency, where
-  no gap had room to be held, overhead and delivery were as before within
-  the run-to-run spread (`docs/benchmarks.md`).
+  on that 60 ms path a gap almost never had room to be held, overhead and
+  delivery were as before within the run-to-run spread
+  (`docs/benchmarks.md`).
 - `receiver::Settings` gains `retransmit_flag` and `reorder_wait_max`, and
   `listener::Config` gains `reorder_wait_max`; neither struct is
   `#[non_exhaustive]`, so a struct literal needs the new fields (or, for
