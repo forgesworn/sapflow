@@ -149,11 +149,17 @@ handshake carries in clear in the stream id, no longer admits on its own.
   file, synced, renamed over the old one) before its stage is claimed; if
   it cannot be written the caller is refused (`PREDEFINED:503`) and the
   stage is left as it was. It is at most about 680 KB, usually far less,
-  and is written once per admission. At start, a store that is unreadable
+  and is written once per admission, off the SRT loop so other publishers
+  are not held up; the admitted caller waits for it (a full-size write took
+  34 ms, at most 93 ms, on a development Mac; a busy production disk may be
+  slower), while copies of its key material are refused from the start. At start, a store that is unreadable
   or malformed, or one removed while its `.lock` remains, stops sapflow
   with a message: moving the file and its `.lock` aside starts it empty,
   and then key material captured before that can be replayed until the
-  app rotates those streams' passphrases.
+  app rotates those streams' passphrases. When sapflow finds neither file
+  nor `.lock` it writes an empty store and logs a warning: right on a
+  first start, but after that it means the path is not persistent and
+  every restart forgets admissions.
 - Why the store matters: replaying an admitted connection's handshake
   restores that connection's keys, so anyone who recorded the connection,
   handshake and media, could send the recorded media again and it would
@@ -182,8 +188,13 @@ handshake carries in clear in the stream id, no longer admits on its own.
     connections can be replayed, recorded media included, until the app
     rotates those streams' passphrases (a capture under an old passphrase
     fails the key check).
-  - Eviction takes a flood of new key material from connections that have
-    ended: owners take minutes of every handshake the listener will answer.
+  - Eviction of an admitted entry reopens what the store closes, recorded
+    media included, for that connection: it takes 128 later admissions on
+    the same stream, or 4,096 in all, under a passphrase the app has not
+    rotated since. Each admission needs the stream's own passphrase.
+  - Eviction of an owner takes a flood of new key material from connections
+    that have ended (minutes of every handshake the listener will answer),
+    with the same displacement and no media.
   - A caller the listener refuses before the application hears of it
     (connections full, `BACKLOG`; the handshake rate limit; a refused
     handshake) owns nothing, so its key material can be replayed later.

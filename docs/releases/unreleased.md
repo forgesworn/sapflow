@@ -312,19 +312,23 @@ Notes for the release after 0.2.0-rc.1.
   directory, which v4v reads; recording expiry would leave it alone, but
   the directory must not be shared). It holds stage paths and digests of
   bytes sent in clear, nothing secret. Each admission writes it (a synced
-  temporary file renamed over the old one, at most about 680 KB) before
-  the stage is claimed; a caller whose digest cannot be written is refused
+  temporary file renamed over the old one, at most about 680 KB) off the
+  SRT loop, and the stage is claimed only once it is written; a caller whose digest cannot be written is refused
   with `503` and nothing is claimed. An unreadable or malformed store, or
   one removed while its `.lock` remains, stops sapflow at start with a
   message; moving both aside starts it empty, after which earlier captures
   can be replayed until the app rotates those streams' passphrases.
+  Finding neither file nor `.lock`, sapflow writes an empty store and logs
+  a warning, which after a first start means the path does not persist.
 - Replay residuals: a copy that reaches sapflow before the original needs
   an attacker who can delay or drop the encoder's packets, a passive
   listener with a faster route, or one who times a copy while the shared
   handshake allowance (100 a second) is used up, and it only displaces the
   encoder, with no media; a restart forgets owners, so an attempt refused
-  before it can be replayed after it, again with no media; eviction needs
-  a long flood of ended connections; callers the listener refuses before
+  before it can be replayed after it, again with no media; an admitted
+  entry evicted after 128 later admissions on its stream (4,096 in all)
+  under an unrotated passphrase can be replayed, recorded media included;
+  evicting an owner needs a long flood of ended connections; callers the listener refuses before
   the application hears of them (`BACKLOG`, the handshake rate limit) own
   nothing. With the switch off nothing changes: the path is claimed before
   any key is checked there, so the guard could not help.
