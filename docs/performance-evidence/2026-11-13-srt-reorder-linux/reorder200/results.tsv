@@ -1,0 +1,19 @@
+receiver	loss	latency_ms	seed	video	audio	decode_msgs	data_orig	data_retx	naks	handshake_flags	status	reordered	orig_distinct	in_time	encryption	trial_index	attempted	failure	trial_exit	encoder_exit	sender_exit	video_probe_exit	audio_probe_exit	decoder_exit	receiver_exit	proxy_exit	sender_stop	receiver_stop	proxy_stop	encoder_timeout
+own-old	none	200	0	878	1399	0	8393	5463	1594	0x3f	ok	5954	8393	8393	aes256, no key refresh	1	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	none	200	0	878	1399	0	8393	5493	1564	0x3f	ok	6036	8393	8393	aes256, no key refresh	2	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	1	851	1383	0	8393	5812	1753	0x3f	ok	5642	8393	8387	aes256, no key refresh	3	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	1	836	1399	0	8393	5959	1789	0x3f	ok	5664	8393	8377	aes256, no key refresh	4	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	2	829	1399	0	8393	5929	1772	0x3f	ok	5615	8393	8385	aes256, no key refresh	5	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	2	852	1399	0	8393	5939	1783	0x3f	ok	5664	8393	8388	aes256, no key refresh	6	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	3	831	1399	0	8393	5720	1709	0x3f	ok	5793	8393	8387	aes256, no key refresh	7	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	3	838	1391	0	8390	5753	1724	0x3f	ok	5712	8390	8378	aes256, no key refresh	8	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	4	854	1391	0	8390	6072	1810	0x3f	ok	5626	8390	8386	aes256, no key refresh	9	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	4	853	1399	0	8393	6018	1745	0x3f	ok	5606	8393	8387	aes256, no key refresh	10	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	5	863	1399	0	8393	5871	1732	0x3f	ok	5680	8393	8388	aes256, no key refresh	11	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	5	787	1383	0	8393	5887	1769	0x3f	ok	5673	8393	8388	aes256, no key refresh	12	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	6	835	1399	0	8393	5979	1708	0x3f	ok	5741	8393	8359	aes256, no key refresh	13	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	6	840	1399	0	8393	5963	1754	0x3f	ok	5643	8393	8362	aes256, no key refresh	14	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	7	840	1391	0	8393	5984	1771	0x3f	ok	5626	8393	8384	aes256, no key refresh	15	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	7	830	1399	0	8393	6060	1747	0x3f	ok	5739	8393	8385	aes256, no key refresh	16	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	8	843	1383	0	8390	5866	1734	0x3f	ok	5651	8390	8383	aes256, no key refresh	17	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	8	850	1399	0	8393	5910	1771	0x3f	ok	5686	8393	8371	aes256, no key refresh	18	1		0	0	0	0	0	0	0	0	1	1	1	0

@@ -1,0 +1,43 @@
+receiver	loss	latency_ms	seed	video	audio	decode_msgs	data_orig	data_retx	naks	handshake_flags	status	reordered	orig_distinct	in_time	encryption	trial_index	attempted	failure	trial_exit	encoder_exit	sender_exit	video_probe_exit	audio_probe_exit	decoder_exit	receiver_exit	proxy_exit	sender_stop	receiver_stop	proxy_stop	encoder_timeout
+own-old	none	2000	0	878	1399	0	8393	6181	1326	0x3f	ok	6724	8393	8393	aes256, no key refresh	1	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	none	2000	0	878	1399	0	8393	1517	897	0x3f	ok	6683	8393	8393	aes256, no key refresh	2	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	none	2000	0	895	1400	1	8393	7175	1521	0xbf	FAIL	6751	8393	8393	aes256, no key refresh	3	1	trial exit 1; decode_msgs=1	1	0	0	0	0	0	0	0	1	1	1	0
+own-old	none	200	0	878	1399	0	8393	7497	2169	0x3f	ok	6707	8393	8393	aes256, no key refresh	4	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	none	200	0	878	1399	0	8393	7646	2254	0x3f	ok	6724	8393	8393	aes256, no key refresh	5	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	none	200	0	895	1400	1	8393	7238	1569	0xbf	FAIL	6705	8393	8393	aes256, no key refresh	6	1	trial exit 1; decode_msgs=1	1	0	0	0	0	0	0	0	1	1	1	0
+own-old	random:2	2000	1	878	1391	0	8390	6375	1327	0x3f	ok	6591	8390	8390	aes256, no key refresh	7	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	random:2	2000	1	873	1384	0	8393	2296	931	0x3f	ok	6580	8393	8393	aes256, no key refresh	8	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	2000	1	895	1400	1	8393	7386	1528	0xbf	ok	6573	8393	8393	aes256, no key refresh	9	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	random:2	2000	2	878	1399	0	8393	6265	1338	0x3f	ok	6537	8393	8393	aes256, no key refresh	10	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	random:2	2000	2	878	1399	0	8393	2217	936	0x3f	ok	6535	8393	8393	aes256, no key refresh	11	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	2000	2	895	1400	1	8393	7295	1518	0xbf	ok	6610	8393	8393	aes256, no key refresh	12	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	random:2	2000	3	878	1399	0	8393	6354	1324	0x3f	ok	6591	8393	8393	aes256, no key refresh	13	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	random:2	2000	3	878	1399	0	8393	2079	900	0x3f	ok	6579	8393	8393	aes256, no key refresh	14	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	2000	3	895	1400	1	8393	7330	1539	0xbf	ok	6580	8393	8393	aes256, no key refresh	15	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	2000	1	878	1399	0	8393	6189	1312	0x3f	ok	6225	8393	8393	aes256, no key refresh	16	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	2000	1	878	1399	0	8393	2413	920	0x3f	ok	6346	8393	8393	aes256, no key refresh	17	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	2000	1	895	1394	1	8393	7423	1496	0xbf	ok	6271	8393	8391	aes256, no key refresh	18	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	2000	2	877	1393	0	8393	6228	1271	0x3f	ok	6211	8393	8382	aes256, no key refresh	19	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	2000	2	878	1399	0	8393	2279	895	0x3f	ok	6298	8393	8393	aes256, no key refresh	20	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	2000	2	895	1392	1	8390	7644	1462	0xbf	ok	6280	8390	8390	aes256, no key refresh	21	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	2000	3	878	1399	0	8393	6170	1334	0x3f	ok	6464	8393	8393	aes256, no key refresh	22	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	2000	3	878	1399	0	8393	2048	869	0x3f	ok	6475	8393	8393	aes256, no key refresh	23	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	2000	3	895	1400	1	8393	7297	1528	0xbf	ok	6475	8393	8393	aes256, no key refresh	24	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	random:2	200	1	425	1366	0	8393	7939	2019	0x3f	ok	6614	8393	8389	aes256, no key refresh	25	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	random:2	200	1	345	1165	0	8393	7696	1900	0x3f	ok	6582	8393	8382	aes256, no key refresh	26	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	200	1	895	1400	32	8393	7440	1528	0xbf	ok	6564	8393	8386	aes256, no key refresh	27	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	random:2	200	2	374	1359	0	8393	7705	1969	0x3f	ok	6578	8393	8386	aes256, no key refresh	28	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	random:2	200	2	399	1366	0	8393	7783	1962	0x3f	ok	6566	8393	8386	aes256, no key refresh	29	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	200	2	895	1373	34	8393	7238	1564	0xbf	ok	6554	8393	8379	aes256, no key refresh	30	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	random:2	200	3	349	1125	0	8393	7823	2067	0x3f	ok	6589	8393	8381	aes256, no key refresh	31	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	random:2	200	3	392	1244	0	8393	7639	1945	0x3f	ok	6616	8393	8381	aes256, no key refresh	32	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	200	3	895	1394	48	8393	7364	1554	0xbf	ok	6558	8393	8388	aes256, no key refresh	33	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	1	341	1225	0	8393	7445	1981	0x3f	ok	6220	8393	8314	aes256, no key refresh	34	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	1	374	1307	0	8393	7612	2047	0x3f	ok	6330	8393	8334	aes256, no key refresh	35	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	200	1	894	1329	74	8393	7390	1486	0xbf	ok	6336	8393	8285	aes256, no key refresh	36	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	2	337	1172	0	8393	7383	1866	0x3f	ok	6270	8393	8293	aes256, no key refresh	37	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	2	352	1006	0	8393	7096	1788	0x3f	ok	6244	8393	8306	aes256, no key refresh	38	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	200	2	890	1346	104	8393	7650	1472	0xbf	ok	6245	8393	8294	aes256, no key refresh	39	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-old	burst:5,8	200	3	463	1231	0	8393	7490	2044	0x3f	ok	6408	8393	8354	aes256, no key refresh	40	1		0	0	0	0	0	0	0	0	1	1	1	0
+own-new	burst:5,8	200	3	469	1210	0	8447	7518	1985	0x3f	ok	6491	8447	8361	aes256, no key refresh	41	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	200	3	893	1392	49	8393	7379	1527	0xbf	ok	6414	8393	8365	aes256, no key refresh	42	1		0	0	0	0	0	0	0	0	1	1	1	0

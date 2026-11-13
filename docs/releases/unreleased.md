@@ -332,7 +332,13 @@ Notes for the release after 0.2.0-rc.1.
   back to none. A held gap is reported from the timer when the wait ends,
   or at once if the loss list cannot keep it. The wait adapts only for a
   caller that set `REXMITFLG` in its handshake, since otherwise a
-  retransmission that fills a gap looks like a late original.
+  retransmission that fills a gap looks like a late original. In the Linux
+  lab with 0 to 20 ms of reordering jitter at 2000 ms latency,
+  retransmissions fell from 66.5% of originals to 3.1% at 2% random loss
+  and from 65.1% to 6.4% at 5% bursty loss, delivering everything as
+  before. Without reordering nothing changed, and at 200 ms latency, where
+  no gap had room to be held, overhead and delivery were as before within
+  the run-to-run spread (`docs/benchmarks.md`).
 - `receiver::Settings` gains `retransmit_flag` and `reorder_wait_max`, and
   `listener::Config` gains `reorder_wait_max`; neither struct is
   `#[non_exhaustive]`, so a struct literal needs the new fields (or, for
