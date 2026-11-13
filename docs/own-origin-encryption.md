@@ -34,8 +34,9 @@ set, but with `SAPFLOW_SRT_PBKEYLEN=32` callers must set `pbkeylen=32` too.
 `required` (the default) keeps the behaviour above. Without a passphrase,
 `optional` and an explicit `required`, and any value in scoped control mode,
 fail at startup; with `SAPFLOW_SRT_APP_KEYS=1` (the app gives each stream its
-passphrase, `docs/v4v-contract.md`) both are allowed, and `required` then
-refuses callers that send no key material.
+passphrase, `docs/v4v-contract.md`; it needs `SAPFLOW_SRT_REPLAY_STORE`)
+both are allowed, and `required` then refuses callers that send no key
+material.
 
 Publish credentials still authorise the stream separately. The own listener
 checks publish admission before key derivation, then accepts key negotiation

@@ -4,12 +4,15 @@
 //! refused before the path is claimed, so a live or held stage, its
 //! recording and its callbacks stay as they were.
 //!
-//! Known gap, for the replay guard (S3): a captured conclusion handshake
-//! replayed by another peer still passes the key check. Not tested here.
+//! A captured conclusion handshake replayed from another address or caller
+//! socket passes the key check too: the replay guard (`crate::srt_replay`)
+//! refuses it before the claim, under the app's passphrase and under the
+//! deployment's alike.
 
 use std::time::Duration;
 
 use sapflow_srt::crypto::CryptoConfig;
+use sapflow_srt::packet::{Control, ControlPacket, Extension, Handshake, HandshakeKind, Packet};
 use sapflow_srt::{Caller, CallerCloseReason, CallerConfig, CallerEvent};
 use tokio::net::UdpSocket as TokioUdp;
 
@@ -56,11 +59,36 @@ struct Encoder {
     socket: TokioUdp,
     connected: bool,
     closed: Option<CallerCloseReason>,
+    /// The last conclusion handshake with key material it sent, as an
+    /// eavesdropper captures it.
+    conclusion: Option<Vec<u8>>,
+    /// Conclusion responses still to drop, as if lost on the way.
+    drop_responses: u32,
+}
+
+/// Whether `d` is a conclusion handshake (caller's or listener's).
+fn is_conclusion(d: &[u8]) -> bool {
+    d.len() >= 48 && d.get(..2) == Some(&[0x80, 0x00]) && d.get(36..40) == Some(&[0xFF; 4])
 }
 
 impl Encoder {
     /// Calls `origin` and runs the handshake to its end: connected, or why not.
     async fn call(origin: SocketAddr, crypto: Option<CryptoConfig>) -> Self {
+        Self::call_dropping(origin, crypto, 0).await
+    }
+
+    /// [`call`](Self::call), losing the first `drops` conclusion responses:
+    /// the caller resends its conclusion.
+    async fn call_dropping(origin: SocketAddr, crypto: Option<CryptoConfig>, drops: u32) -> Self {
+        let mut encoder = Self::start(origin, crypto, drops).await;
+        encoder
+            .run_until(|e| e.connected || e.closed.is_some())
+            .await;
+        encoder
+    }
+
+    /// An encoder for `origin` that has sent nothing yet.
+    async fn start(origin: SocketAddr, crypto: Option<CryptoConfig>, drops: u32) -> Self {
         let socket = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
         let caller = Caller::new(
             CallerConfig {
@@ -72,17 +100,22 @@ impl Encoder {
             Instant::now(),
         )
         .expect("caller");
-        let mut encoder = Self {
+        Self {
             caller,
             socket,
             connected: false,
             closed: None,
-        };
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while !encoder.connected && encoder.closed.is_none() && Instant::now() < deadline {
-            encoder.pump(Duration::from_millis(20)).await;
+            conclusion: None,
+            drop_responses: drops,
         }
-        encoder
+    }
+
+    /// Runs the caller's I/O until `done`, for 8 s at most.
+    async fn run_until(&mut self, done: impl Fn(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !done(self) && Instant::now() < deadline {
+            self.pump(Duration::from_millis(20)).await;
+        }
     }
 
     /// Runs the caller's I/O for `period`.
@@ -93,6 +126,9 @@ impl Encoder {
             let now = Instant::now();
             self.caller.handle_timeout(now);
             while let Some((to, bytes)) = self.caller.poll_transmit(now) {
+                if is_conclusion(&bytes) {
+                    self.conclusion = Some(bytes.clone());
+                }
                 let _ = self.socket.send_to(&bytes, to).await;
             }
             while let Some(event) = self.caller.poll_event() {
@@ -115,6 +151,10 @@ impl Encoder {
             if let Ok(Ok((n, from))) =
                 tokio::time::timeout(wait, self.socket.recv_from(&mut buf)).await
             {
+                if self.drop_responses > 0 && is_conclusion(&buf[..n]) {
+                    self.drop_responses -= 1;
+                    continue;
+                }
                 self.caller.handle_datagram(Instant::now(), from, &buf[..n]);
             }
         }
@@ -465,7 +505,17 @@ async fn a_caller_gone_before_the_app_answered_claims_nothing_and_is_not_counted
         else {
             panic!("expected a keyed admission")
         };
-        assert!(accept_pending(&fixture.app, &mut listener, ConnId(7), peer, keyed).is_none());
+        assert!(
+            accept_pending(
+                &fixture.app,
+                &mut listener,
+                &mut ReplayGuard::default(),
+                ConnId(7),
+                peer,
+                keyed
+            )
+            .is_none()
+        );
     }
     assert!(fixture.app.streams.get("event-a").is_none());
     assert_eq!(stub.count(), 12);
@@ -580,4 +630,510 @@ async fn without_the_header_a_caller_refused_at_accept_never_replaces_a_live_sta
     );
     assert!(logs.contains("key length differs"), "{logs}");
     assert!(!logs.contains(GLOBAL) && !logs.contains(JUNK));
+}
+
+/// How the origin answered a replayed conclusion.
+#[derive(Debug, PartialEq)]
+enum Answered {
+    Rejected(u32),
+    Accepted,
+    Nothing,
+}
+
+/// The next handshake the origin sends `socket` for caller socket `id`,
+/// within a second; anything else arriving there is dropped.
+async fn handshake_for(socket: &TokioUdp, id: u32) -> Option<Handshake> {
+    let mut buf = vec![0u8; 2048];
+    let until = Instant::now() + Duration::from_secs(1);
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        let Ok(Ok(n)) = tokio::time::timeout(left, socket.recv(&mut buf)).await else {
+            return None;
+        };
+        if let Ok(Packet::Control(ControlPacket {
+            dest,
+            body: Control::Handshake(h),
+            ..
+        })) = Packet::parse(&buf[..n])
+            && dest == id
+        {
+            return Some(h);
+        }
+    }
+    None
+}
+
+/// Replays `captured` from `socket`, as a replayer does: with `caller_socket`
+/// as its caller socket id (the captured one if `None`) and, when `induct`,
+/// a cookie for its own address from an induction first (the captured
+/// cookie stays valid only from the address it was issued to).
+async fn replay(
+    socket: &TokioUdp,
+    origin: SocketAddr,
+    captured: &[u8],
+    caller_socket: Option<u32>,
+    induct: bool,
+) -> Answered {
+    let mut d = captured.to_vec();
+    let id = caller_socket
+        .unwrap_or_else(|| u32::from_be_bytes(d[40..44].try_into().expect("socket id field")));
+    d[40..44].copy_from_slice(&id.to_be_bytes());
+    if induct {
+        let mut out = Vec::new();
+        ControlPacket::new(
+            0,
+            0,
+            Control::Handshake(Handshake {
+                version: 4,
+                encryption: 0,
+                extension: 2,
+                initial_seq: 1000,
+                mtu: 1500,
+                flow_window: 8192,
+                kind: HandshakeKind::Induction,
+                socket_id: id,
+                cookie: 0,
+                peer_ip: [0; 16],
+                extensions: vec![],
+            }),
+        )
+        .encode(&mut out);
+        socket.send_to(&out, origin).await.expect("send");
+        let h = handshake_for(socket, id).await.expect("induction answer");
+        d[44..48].copy_from_slice(&h.cookie.to_be_bytes());
+    }
+    socket.send_to(&d, origin).await.expect("send");
+    match handshake_for(socket, id).await.map(|h| h.kind) {
+        Some(HandshakeKind::Rejection(code)) => Answered::Rejected(code),
+        Some(HandshakeKind::Conclusion) => Answered::Accepted,
+        _ => Answered::Nothing,
+    }
+}
+
+/// The two ways a stage is keyed: the app's passphrase for the stream, and,
+/// with no passphrase in the answer, the deployment's own.
+fn keyed_fixtures() -> [(&'static str, Answer, CryptoConfig, Option<CryptoConfig>); 2] {
+    const GLOBAL: &str = "deployment-wide-secret";
+    [
+        (
+            "app key",
+            Answer::Passphrase(&[KEY]),
+            key(KEY, KeySize::Aes256),
+            None,
+        ),
+        (
+            "deployment key",
+            Answer::Status(200),
+            key(GLOBAL, KeySize::Aes128),
+            Some(key(GLOBAL, KeySize::Aes128)),
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_conclusion_never_takes_a_live_stage() {
+    for (mode, answer, encoder_key, global) in keyed_fixtures() {
+        let captured = crate::log_capture::Capture::start();
+        let stub = stub::start(answer).await;
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.srt_crypto = global;
+        let (addr, server) = origin(&fixture.app);
+
+        let mut live = Encoder::call(addr, Some(encoder_key)).await;
+        assert!(live.connected, "{mode}: {:?}", live.closed);
+        live.send_media().await;
+        wait_for(&mut fixture, &mut live, "publish").await;
+        let before = stage(&fixture.app);
+        assert!(before.owner.1, "attached");
+        let conclusion = live.conclusion.clone().expect("captured");
+
+        let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+        for (same_address, caller_socket, what) in [
+            (false, None, "another address, same caller socket"),
+            (false, Some(0x1234_5678), "another address and socket"),
+            (true, Some(0x0765_4321), "same address, another socket"),
+        ] {
+            // From another address a replayer needs a cookie of its own.
+            let (from, induct) = if same_address {
+                (&live.socket, false)
+            } else {
+                (&elsewhere, true)
+            };
+            let asked = stub.count();
+            let answered = replay(from, addr, &conclusion, caller_socket, induct).await;
+            assert_eq!(
+                answered,
+                Answered::Rejected(RejectCode::BADSECRET.0),
+                "{mode}: {what}"
+            );
+            assert_eq!(
+                stub.count(),
+                asked,
+                "{mode}: refused before the app is asked"
+            );
+            live.pump(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(stage(&fixture.app), before, "{mode}");
+        assert!(live.connected && live.closed.is_none(), "{:?}", live.closed);
+        let after = events(&mut fixture);
+        for name in ["unpublish", "recordSegmentComplete", "publish"] {
+            assert!(!after.iter().any(|e| e == name), "{mode}: {after:?}");
+        }
+        let logs = captured.text();
+        assert!(
+            logs.contains("key material belongs to another caller"),
+            "{logs}"
+        );
+        assert!(!logs.contains("publisher replaced"), "{logs}");
+        // Neither the key material nor its digest is logged.
+        let Ok(Packet::Control(ControlPacket {
+            body: Control::Handshake(h),
+            ..
+        })) = Packet::parse(&conclusion)
+        else {
+            panic!("a conclusion");
+        };
+        let km = h
+            .extensions
+            .iter()
+            .find_map(|e| match e {
+                Extension::KmReq(km) => Some(km.clone()),
+                _ => None,
+            })
+            .expect("key material");
+        let bound = sapflow_srt::crypto::bound_key_material(&km).expect("bound part");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(bound);
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        for secret in [hex(&km[16..24]), hex(&bound[..8]), hex(&digest[..8])] {
+            assert!(!logs.contains(&secret), "{logs}");
+        }
+        live.stop().await;
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_never_takes_a_held_stage_and_a_real_reconnect_resumes_it() {
+    for (mode, answer, encoder_key, global) in keyed_fixtures() {
+        let captured = crate::log_capture::Capture::start();
+        let stub = stub::start(answer).await;
+        let mut fixture = fixture(&stub, Duration::from_secs(30));
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.srt_crypto = global;
+        let (addr, server) = origin(&fixture.app);
+
+        let mut live = Encoder::call(addr, Some(encoder_key.clone())).await;
+        assert!(live.connected, "{mode}: {:?}", live.closed);
+        live.send_media().await;
+        wait_for(&mut fixture, &mut live, "publish").await;
+        live.stop().await;
+        wait_for(&mut fixture, &mut live, "unpublish").await;
+        let held = stage(&fixture.app);
+        assert!(!held.owner.1, "held for a reconnect");
+        let conclusion = live.conclusion.clone().expect("captured");
+
+        // The encoder's own address and caller socket, after its connection
+        // ended, and another address: both refused.
+        let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+        for (from, induct, what) in [
+            (
+                &live.socket,
+                false,
+                "same address and socket, connection ended",
+            ),
+            (&elsewhere, true, "another address"),
+        ] {
+            let answered = replay(from, addr, &conclusion, None, induct).await;
+            assert_eq!(
+                answered,
+                Answered::Rejected(RejectCode::BADSECRET.0),
+                "{mode}: {what}"
+            );
+        }
+        assert_eq!(stage(&fixture.app), held, "{mode}");
+        let after = events(&mut fixture);
+        for name in ["unpublish", "recordSegmentComplete", "publish"] {
+            assert!(!after.iter().any(|e| e == name), "{mode}: {after:?}");
+        }
+
+        // The encoder reconnects: fresh key material, the hold resumes.
+        let mut back = Encoder::call(addr, Some(encoder_key)).await;
+        assert!(back.connected, "{mode}: {:?}", back.closed);
+        let resumed = stage(&fixture.app);
+        assert_eq!(resumed.owner, (held.owner.0 + 1, true), "{mode}");
+        assert!(captured.text().contains("resumed=true"));
+        back.stop().await;
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_response_resend_is_answered_not_refused() {
+    let captured = crate::log_capture::Capture::start();
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = fixture(&stub, Duration::ZERO);
+    let (addr, server) = origin(&fixture.app);
+    let mut encoder = Encoder::call_dropping(addr, Some(key(KEY, KeySize::Aes256)), 2).await;
+    assert!(encoder.connected, "{:?}", encoder.closed);
+    assert_eq!(encoder.drop_responses, 0, "two responses were lost");
+    assert_eq!(stub.count(), 1, "one admission");
+    encoder.send_media().await;
+    wait_for(&mut fixture, &mut encoder, "publish").await;
+    assert!(!captured.text().contains("publish refused"));
+    let ip = "127.0.0.1".parse().expect("ip");
+    {
+        let mut throttle = fixture.app.auth_throttle.lock().expect("throttle");
+        // The fixture allows ten failures a minute: had a resend counted as
+        // one, nine more would reach the limit.
+        for _ in 0..9 {
+            throttle.failed(ip, Instant::now());
+        }
+        assert!(throttle.allowed(ip, Instant::now()));
+    }
+    encoder.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+/// Whether `ip` has no failed attempts on the fixture's throttle (ten a
+/// minute): with none, nine more still leave it allowed. Uses up nine, so
+/// call it last.
+fn uncharged(app: &Arc<App>, ip: &str) -> bool {
+    let ip = ip.parse().expect("ip");
+    let mut throttle = app.auth_throttle.lock().expect("throttle");
+    for _ in 0..9 {
+        throttle.failed(ip, Instant::now());
+    }
+    throttle.allowed(ip, Instant::now())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replays_are_refused_without_asking_the_app_or_charging_the_throttle() {
+    // A replayer behind the encoder's own address (one NAT at a venue) must
+    // not be able to lock the encoder out by replaying.
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = fixture(&stub, Duration::ZERO);
+    let (addr, server) = origin(&fixture.app);
+    let mut live = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert!(live.connected, "{:?}", live.closed);
+    let conclusion = live.conclusion.clone().expect("captured");
+    let replayer = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    for attempt in 0..20u32 {
+        let answered = replay(&replayer, addr, &conclusion, Some(0x100 + attempt), true).await;
+        assert_eq!(
+            answered,
+            Answered::Rejected(RejectCode::BADSECRET.0),
+            "{attempt}"
+        );
+        live.pump(Duration::from_millis(10)).await;
+    }
+    assert_eq!(stub.count(), 1, "only the live encoder's admission");
+    assert!(uncharged(&fixture.app, "127.0.0.1"));
+    let _ = events(&mut fixture);
+    live.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+/// The captured conclusion with its key material edited where the key
+/// check does not look: the first half of the salt, and the key flags
+/// (even key to odd).
+fn edited(conclusion: &[u8]) -> Vec<u8> {
+    let Ok(Packet::Control(ControlPacket {
+        timestamp,
+        dest,
+        body: Control::Handshake(mut h),
+    })) = Packet::parse(conclusion)
+    else {
+        panic!("a conclusion");
+    };
+    for e in &mut h.extensions {
+        if let Extension::KmReq(km) = e {
+            km[16] ^= 0x01;
+            km[23] ^= 0x80;
+            assert!(matches!(km[3], 1 | 2), "one key");
+            km[3] = 3 - km[3];
+        }
+    }
+    let mut out = Vec::new();
+    ControlPacket::new(timestamp, dest, Control::Handshake(h)).encode(&mut out);
+    out
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_edited_copy_of_the_key_material_is_still_a_replay() {
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = fixture(&stub, Duration::ZERO);
+    let (addr, server) = origin(&fixture.app);
+    let mut live = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert!(live.connected, "{:?}", live.closed);
+    live.send_media().await;
+    wait_for(&mut fixture, &mut live, "publish").await;
+    let before = stage(&fixture.app);
+    let copy = edited(&live.conclusion.clone().expect("captured"));
+    let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    let answered = replay(&elsewhere, addr, &copy, Some(0x4242), true).await;
+    assert_eq!(answered, Answered::Rejected(RejectCode::BADSECRET.0));
+    assert_eq!(stub.count(), 1, "refused before the app is asked");
+    assert_eq!(stage(&fixture.app), before);
+    live.pump(Duration::from_millis(50)).await;
+    assert!(live.connected && live.closed.is_none());
+    live.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_while_the_original_waits_for_the_app_is_refused_and_the_original_admitted() {
+    // The app takes its time, so the original's admission is still in
+    // flight while copies of its conclusion arrive from elsewhere.
+    let stub = stub::start(Answer::SlowPassphrase(600, &[KEY])).await;
+    let mut fixture = fixture(&stub, Duration::ZERO);
+    let (addr, server) = origin(&fixture.app);
+    let mut original = Encoder::start(addr, Some(key(KEY, KeySize::Aes256)), 0).await;
+    original.run_until(|e| e.conclusion.is_some()).await;
+    let conclusion = original.conclusion.clone().expect("captured");
+    let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    for socket in [None, Some(0x0bad_cafe), Some(0x0bad_cafd)] {
+        let answered = replay(&elsewhere, addr, &conclusion, socket, true).await;
+        assert_eq!(
+            answered,
+            Answered::Rejected(RejectCode::BADSECRET.0),
+            "{socket:?}"
+        );
+    }
+    assert!(!original.connected, "still waiting for the app");
+    original
+        .run_until(|e| e.connected || e.closed.is_some())
+        .await;
+    assert!(original.connected, "{:?}", original.closed);
+    assert_eq!(stub.count(), 1, "only the original asked the app");
+    original.send_media().await;
+    wait_for(&mut fixture, &mut original, "publish").await;
+    assert!(uncharged(&fixture.app, "127.0.0.1"));
+    original.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn key_material_from_a_refused_attempt_stays_its_owners() {
+    // The encoder's attempt is refused before its key is checked: throttled
+    // (someone behind its address used up the allowance) or by the app
+    // (the stage is not armed yet). Its key material was never admitted,
+    // but a copy of it from elsewhere is still refused, before the app.
+    for answer in [Answer::Passphrase(&[KEY]), Answer::Status(401)] {
+        let stub = stub::start(answer).await;
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        let throttled = matches!(answer, Answer::Passphrase(_));
+        if throttled {
+            let mut throttle = fixture.app.auth_throttle.lock().expect("throttle");
+            for _ in 0..10 {
+                throttle.failed("127.0.0.1".parse().expect("ip"), Instant::now());
+            }
+        }
+        let (addr, server) = origin(&fixture.app);
+        let refused = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+        let code = if throttled { 402 } else { 401 };
+        assert_eq!(refused.rejected(), Some(RejectCode::http(code).0));
+        let asked = stub.count();
+        assert_eq!(asked, usize::from(!throttled));
+        let conclusion = refused.conclusion.clone().expect("captured");
+        // The window passes, or the stage is armed: the throttle is clear.
+        *fixture.app.auth_throttle.lock().expect("throttle") =
+            sapflow_core::limits::AuthThrottle::new(10, Duration::from_secs(60));
+        let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+        let answered = replay(&elsewhere, addr, &conclusion, None, true).await;
+        assert_eq!(
+            answered,
+            Answered::Rejected(RejectCode::BADSECRET.0),
+            "{code}"
+        );
+        assert_eq!(
+            stub.count(),
+            asked,
+            "{code}: refused before the app is asked"
+        );
+        assert!(fixture.app.streams.get("event-a").is_none(), "{code}");
+        if throttled {
+            // The encoder's next attempt, with fresh key material, publishes.
+            let mut back = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+            assert!(back.connected, "{:?}", back.closed);
+            back.send_media().await;
+            wait_for(&mut fixture, &mut back, "publish").await;
+            back.stop().await;
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+/// An app whose replay guard keeps its admitted tier in the store at `path`.
+fn with_store(fixture: &Fixture, path: &std::path::Path) {
+    let (store, records) = crate::srt_replay_store::ReplayStore::open(path).expect("store");
+    *fixture.app.srt_replay.lock().expect("guard") =
+        crate::srt_replay::ReplayGuard::with_store(store, records);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_recorded_connection_replayed_after_a_restart_is_refused() {
+    // Without the store a restart would forget the admission, and a replay
+    // of the recorded handshake would restore its keys: its recorded media
+    // would decrypt onto the stage again.
+    let scratch = crate::srt_replay_store::tests::Scratch::new();
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let conclusion = {
+        let mut fixture = fixture(&stub, Duration::ZERO);
+        with_store(&fixture, &scratch.path());
+        let (addr, server) = origin(&fixture.app);
+        let mut live = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+        assert!(live.connected, "{:?}", live.closed);
+        live.send_media().await;
+        wait_for(&mut fixture, &mut live, "publish").await;
+        live.stop().await;
+        server.abort();
+        let _ = server.await;
+        // The process ends: its guard, and the store's lock, go with it.
+        *fixture.app.srt_replay.lock().expect("guard") = Default::default();
+        live.conclusion.clone().expect("captured")
+    };
+    let asked = stub.count();
+    let fixture = fixture(&stub, Duration::ZERO);
+    with_store(&fixture, &scratch.path());
+    let (addr, server) = origin(&fixture.app);
+    let elsewhere = TokioUdp::bind("127.0.0.1:0").await.expect("bind");
+    let answered = replay(&elsewhere, addr, &conclusion, None, true).await;
+    assert_eq!(answered, Answered::Rejected(RejectCode::BADSECRET.0));
+    assert_eq!(stub.count(), asked, "refused before the app is asked");
+    assert!(fixture.app.streams.get("event-a").is_none(), "no stage");
+    // A real encoder, with fresh key material, publishes as before.
+    let mut back = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert!(back.connected, "{:?}", back.closed);
+    back.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_caller_is_refused_when_the_store_cannot_be_written() {
+    let scratch = crate::srt_replay_store::tests::Scratch::new();
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let fixture = fixture(&stub, Duration::ZERO);
+    let (mut store, records) =
+        crate::srt_replay_store::ReplayStore::open(&scratch.path()).expect("store");
+    store.fail_before_rename = true;
+    *fixture.app.srt_replay.lock().expect("guard") =
+        crate::srt_replay::ReplayGuard::with_store(store, records);
+    let (addr, server) = origin(&fixture.app);
+    let refused = Encoder::call(addr, Some(key(KEY, KeySize::Aes256))).await;
+    assert_eq!(refused.rejected(), Some(RejectCode::http(503).0));
+    assert!(
+        fixture.app.streams.get("event-a").is_none(),
+        "nothing claimed"
+    );
+    server.abort();
+    let _ = server.await;
 }

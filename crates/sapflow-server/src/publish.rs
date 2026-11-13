@@ -734,6 +734,7 @@ pub(crate) mod loss_tests {
             config.reconnect_grace = Duration::ZERO;
             Self {
                 app: Arc::new(App {
+                    srt_replay: Default::default(),
                     recording_limits: Arc::new(crate::recorder::RecordingLimits::new(
                         config.max_publishers,
                     )),

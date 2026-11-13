@@ -115,10 +115,102 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - With app keys and no global passphrase, `SAPFLOW_SRT_ENCRYPTION=required`
   refuses every caller that sends no key material, in the handshake, before
   the app is asked. Left unset, plaintext callers still connect.
-- Not for production yet: a passing check proves the key material was made
-  with the passphrase, not that the caller made it. Someone who captured an
-  encoder's handshake can replay it to the same stream until sapflow guards
-  against replay.
+- A replayed handshake is refused too. A passing check proves only that
+  the key material was made with the passphrase, and it crosses the
+  network in clear, so a captured conclusion would pass from anywhere.
+  When a caller that sends key material first connects, before the
+  throttle, the app or any limit, it owns that key material (by its
+  address and caller socket id). The same key material from anyone else
+  is refused there and then with `SRT_REJ_BADSECRET` (1010): the app is not
+  asked and nothing is counted against the throttle, so a replayer behind
+  the encoder's own address cannot lock the encoder out. This holds
+  however the owner's attempt ends: still waiting for the app, refused as
+  throttled, refused by the app, or admitted. The owner may send it again
+  (a resend after a lost refusal). Once a caller is admitted, its key
+  material is refused to everyone, the owner included. It covers keys
+  checked against the app's passphrase and the global
+  `SAPFLOW_SRT_PASSPHRASE` alike, and spans streams.
+- What sapflow keeps: a SHA-256 digest of the part of the key material the
+  check binds, never the key material. Owners, in memory: 16,384, the
+  oldest whose connection has ended dropped first. Admitted, in memory and
+  in `SAPFLOW_SRT_REPLAY_STORE`: the last 128 per stream, its oldest ended
+  entry dropped first; past 4,096 in all, the oldest ended entry of the
+  stream holding the most is dropped, so admissions on other streams,
+  however many, never push out another stage's. An entry whose connection
+  is waiting or open is never dropped. No time limit.
+- `SAPFLOW_SRT_REPLAY_STORE` is required with app keys: an absolute file
+  path in a directory that exists, is owned by sapflow's user and is
+  private (0700), on a volume that survives redeploys (a container needs a
+  writable mount for it). Use a directory of its own: not the recordings
+  directory, which v4v reads too. sapflow's recording expiry removes only
+  recording files under `live/<eventId>/`, so it would not delete the
+  store, but the directory must not be shared. The file holds stage paths
+  and digests of key material that crossed the network in clear: nothing
+  secret, and no key material. A caller's digest is written there (a new
+  file, synced, renamed over the old one) before its stage is claimed; if
+  it cannot be written the caller is refused (`PREDEFINED:503`) and the
+  stage is left as it was. It is at most about 680 KB, usually far less,
+  and is written once per admission, off the SRT loop so other publishers
+  are not held up; the admitted caller waits for it (a full-size write took
+  34 ms, at most 93 ms, on a development Mac; a busy production disk may be
+  slower), while copies of its key material are refused from the start.
+  A queued write that a later one already covered is skipped.
+- At start, a store that is unreadable or malformed, or one removed once a
+  store was written beside its `.lock`, stops sapflow with a message:
+  moving the file and its `.lock` aside starts it empty, and then key
+  material captured before that can be replayed until the app rotates
+  those streams' passphrases. A store from a newer sapflow stops it with
+  its own message: upgrade sapflow, and do not move the store aside. With
+  no file, sapflow writes an empty store and logs a warning (right on a
+  first start, but after that it means the path is not persistent and
+  every restart forgets admissions); a start that stopped before its first
+  store landed starts again the same way. Temporary files a crash left in
+  the directory are removed at start.
+- Deploying with app keys: create the store's directory first, owned by
+  sapflow's user with mode 0700, on a persistent mount of its own. A full
+  disk there stops every keyed SRT reconnect (sapflow fails closed rather
+  than admit a caller it could forget), so monitor its free space.
+- Why the store matters: replaying an admitted connection's handshake
+  restores that connection's keys, so anyone who recorded the connection,
+  handshake and media, could send the recorded media again and it would
+  decrypt onto the stage (and AES-CTR, unauthenticated, lets bytes they
+  can predict be flipped). The store keeps that closed across restarts.
+- Encoders make fresh key material for every connection, reconnects
+  included, so they are never refused for it: checked with libsrt 1.5.1
+  (`srt-live-transmit`, a reconnect and a new run), OBS 32.0.4 (a
+  reconnect after a dropped link, and one after sapflow restarted, with an
+  app key, 2026-11-13, via `scripts/obs-ingest.js --app-key`, #101) and
+  sapflow's own caller. An encoder that reused key material on a new
+  connection would be refused, so check Larix and any hardware encoder
+  before turning app keys on; Larix has not been checked.
+- What remains:
+  - A copy that reaches sapflow before the original owns its key material.
+    That takes an attacker who can delay or drop the encoder's packets, a
+    passive listener with a faster route to sapflow than the encoder's, or
+    one who times a copy while someone else uses up the listener's
+    handshake allowance (100 a second for everyone) so the original waits.
+    The effect is a displacement, repeatable while the attacker can win the
+    race: no media was ever sent under that key, so none can be replayed.
+  - A restart forgets owners (not admissions): key material from an
+    attempt that was refused before the restart can be replayed after it,
+    with the same displacement and no media.
+  - Discarding the store reopens what it closes: earlier admitted
+    connections can be replayed, recorded media included, until the app
+    rotates those streams' passphrases (a capture under an old passphrase
+    fails the key check).
+  - Eviction of an admitted entry reopens what the store closes, recorded
+    media included, for that connection. It takes 128 later admissions on
+    the same stream, each needing that stream's own passphrase, under a
+    passphrase the app has not rotated since; admissions on other streams
+    evict only their own entries.
+  - Eviction of an owner takes a flood of new key material from connections
+    that have ended (minutes of every handshake the listener will answer),
+    with the same displacement and no media.
+  - A caller the listener refuses before the application hears of it
+    (connections full, `BACKLOG`; the handshake rate limit; a refused
+    handshake) owns nothing, so its key material can be replayed later.
+  - The passphrase in the 2xx crosses the hook link in clear, like the
+    request: keep that link on the private network.
 
 ## Ingest addresses v4v hands to encoders
 

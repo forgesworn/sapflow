@@ -242,6 +242,8 @@ pub(crate) mod stub {
         /// 200 with these `sapflow-srt-passphrase` header values, one line
         /// each.
         Passphrase(&'static [&'static str]),
+        /// As `Passphrase`, after this many milliseconds.
+        SlowPassphrase(u64, &'static [&'static str]),
         /// Read the request, then never answer.
         Silent,
     }
@@ -332,7 +334,10 @@ pub(crate) mod stub {
                             );
                             let _ = socket.write_all(reply.as_bytes()).await;
                         }
-                        Answer::Passphrase(values) => {
+                        Answer::Passphrase(values) | Answer::SlowPassphrase(_, values) => {
+                            if let Answer::SlowPassphrase(ms, _) = answer {
+                                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                            }
                             let mut reply = String::from("HTTP/1.1 200 X\r\ncontent-length: 0\r\n");
                             for value in values {
                                 reply.push_str(&format!("sapflow-srt-passphrase: {value}\r\n"));

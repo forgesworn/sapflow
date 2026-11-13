@@ -6,17 +6,20 @@ use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
 
-use sapflow_srt::crypto::KeySize;
+use sapflow_core::PublishRequest;
+use sapflow_srt::crypto::{CryptoConfig, KeySize};
 use sapflow_srt::{CloseReason, Config, ConnId, Event, KeyCheckError, Listener, RejectCode};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::App;
-use crate::publish::{Publication, PublicationLoss};
+use crate::publish::{Admitted, Publication, PublicationLoss};
 use crate::publish_sessions::ScopedLease;
 use crate::recorder::IncompleteReason;
-use crate::srt::{Admission, IDLE, Pending, Refused, admit, feed_payload};
+use crate::srt::{Admission, IDLE, Refused, admit, feed_payload};
+use crate::srt_replay::{ReplayGuard, Seen};
+use crate::srt_replay_store::ReplayStoreError;
 use crate::stream::SourceKind;
 
 const QUEUE: usize = 16_384;
@@ -200,6 +203,10 @@ async fn run(
         publishers: HashMap::new(),
     };
     let mut admissions = JoinSet::new();
+    // Callers whose key passed, waiting for the replay store to be written
+    // before their path is claimed, and the writes.
+    let mut checked = HashMap::new();
+    let mut persisting = JoinSet::new();
     let (ended_tx, mut ended_rx) = mpsc::channel::<ConnId>(app.config.max_publishers.max(1));
     let mut buf = vec![0u8; 65_536];
     let timer = tokio::time::sleep(std::time::Duration::ZERO);
@@ -227,7 +234,15 @@ async fn run(
                 if let Some(publisher)=publishers.remove(&id) && let Some(scope)=publisher.scope {scope.protocol_stopped();}
             }
             Some(result)=admissions.join_next(),if !admissions.is_empty()=>{
-                if let Ok((id,peer,result))=result {complete_admission(&app,listener,publishers,&ended_tx,id,peer,result);}
+                if let Ok(admission)=result {
+                    let mut pending=Persisting{checked:&mut checked,writes:&mut persisting};
+                    complete_admission(&app,listener,publishers,&mut pending,&ended_tx,admission);
+                }
+            }
+            Some(result)=persisting.join_next(),if !persisting.is_empty()=>{
+                if let Ok((id,written))=result && let Some((peer,caller))=checked.remove(&id) {
+                    complete_persisted(&app,listener,publishers,&ended_tx,(id,peer,caller,written));
+                }
             }
         }
         let now = Instant::now();
@@ -245,7 +260,25 @@ async fn run(
                     peer,
                     stream_id,
                 } => {
-                    let active = publishers.len() + admissions.len();
+                    // Before the throttle, the app or any limit: the first
+                    // caller to send key material owns it, so a copy is
+                    // refused here however the original's attempt ends.
+                    // Not charged to the throttle: nothing costly was done,
+                    // and a replayer behind the encoder's address could
+                    // otherwise lock the encoder out.
+                    if app.config.srt_app_keys
+                        && let Some(seen) = seen(listener, id, peer)
+                        && app
+                            .srt_replay
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .connect(seen, |c| listener.caller_socket(c))
+                    {
+                        listener.reject(id, RejectCode::BADSECRET);
+                        app.log_refusal("srt", &"key material belongs to another caller");
+                        continue;
+                    }
+                    let active = publishers.len() + admissions.len() + checked.len();
                     if active >= app.config.max_publishers {
                         listener.reject(id, RejectCode::http(402));
                         continue;
@@ -329,14 +362,19 @@ async fn run(
     }
 }
 
+/// Callers whose key passed, waiting for the replay store, and its writes.
+struct Persisting<'a> {
+    checked: &'a mut HashMap<ConnId, (SocketAddr, Checked)>,
+    writes: &'a mut JoinSet<(ConnId, Result<(), ReplayStoreError>)>,
+}
+
 fn complete_admission(
     app: &Arc<App>,
     listener: &mut Listener,
     publishers: &mut HashMap<ConnId, Publisher>,
+    waiting: &mut Persisting<'_>,
     ended: &mpsc::Sender<ConnId>,
-    id: ConnId,
-    peer: SocketAddr,
-    result: Result<Admission, Refused>,
+    (id, peer, result): (ConnId, SocketAddr, Result<Admission, Refused>),
 ) {
     let (publication, scope, capacity, encryption) = match result {
         Err(error) => {
@@ -344,7 +382,32 @@ fn complete_admission(
             return;
         }
         Ok(Admission::Pending(pending)) => {
-            let Some((publication, encryption)) = accept_pending(app, listener, id, peer, pending)
+            let (caller, store) = {
+                let mut replay = app.srt_replay.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(caller) = check_pending(app, listener, &mut replay, id, peer, pending)
+                else {
+                    return;
+                };
+                (
+                    caller,
+                    replay.store().map(|store| (store, replay.generation())),
+                )
+            };
+            if let Some((store, generation)) = store {
+                // Its key material is already refused to everyone else; the
+                // file work runs off this loop, and the path is claimed only
+                // once it is written (complete_persisted).
+                waiting.checked.insert(id, (peer, caller));
+                let app = app.clone();
+                waiting.writes.spawn_blocking(move || {
+                    (
+                        id,
+                        crate::srt_replay::persist(&app.srt_replay, &store, generation),
+                    )
+                });
+                return;
+            }
+            let Some((publication, encryption)) = claim_checked(app, listener, id, peer, caller)
             else {
                 return;
             };
@@ -390,6 +453,56 @@ fn complete_admission(
             (publication, scope, capacity, encryption)
         }
     };
+    start(
+        listener,
+        publishers,
+        ended,
+        id,
+        (publication, scope, capacity, encryption),
+    );
+}
+
+/// A checked caller's replay store write has finished: claims its path and
+/// accepts it, or refuses it if the write failed.
+fn complete_persisted(
+    app: &Arc<App>,
+    listener: &mut Listener,
+    publishers: &mut HashMap<ConnId, Publisher>,
+    ended: &mpsc::Sender<ConnId>,
+    (id, peer, caller, written): (ConnId, SocketAddr, Checked, Result<(), ReplayStoreError>),
+) {
+    if let Err(error) = written {
+        // A restart would forget this caller's key material, so a recorded
+        // copy of its connection could be replayed then: refused, nothing
+        // claimed.
+        tracing::error!(%error, "SRT replay store not written; caller refused");
+        listener.reject(id, RejectCode::http(503));
+        return;
+    }
+    if let Some((publication, encryption)) = claim_checked(app, listener, id, peer, caller) {
+        start(
+            listener,
+            publishers,
+            ended,
+            id,
+            (publication, None, QUEUE, encryption),
+        );
+    }
+}
+
+/// Starts an accepted publisher's media task.
+fn start(
+    listener: &Listener,
+    publishers: &mut HashMap<ConnId, Publisher>,
+    ended: &mpsc::Sender<ConnId>,
+    id: ConnId,
+    (publication, scope, capacity, encryption): (
+        Publication,
+        Option<ScopedLease>,
+        usize,
+        Encryption,
+    ),
+) {
     let (tx, rx) = mpsc::channel(capacity.clamp(1, QUEUE));
     let loss = publication.loss_notice();
     publishers.insert(id, Publisher { tx, scope, loss });
@@ -416,21 +529,53 @@ fn refused_key(app: &Arc<App>, peer: SocketAddr) {
     );
 }
 
-/// An admission under `SAPFLOW_SRT_APP_KEYS`: makes sure the caller will be
-/// accepted, then claims the path, then accepts, with no await in between.
+/// An admission under `SAPFLOW_SRT_APP_KEYS` with no replay store (tests):
+/// [`check_pending`] makes sure the caller will be accepted, then
+/// [`claim_checked`] claims the path and accepts, with no await in between.
+/// The SRT loop does the same, but with a store it writes the store off the
+/// loop between the two.
 /// SRT claims take over a live path, so a caller refused for its key, or for
 /// sending none, is refused before the claim, and a live or held stage, its
 /// recording and its callbacks are untouched. With the app's passphrase the
 /// caller must have used it; without one the listener's own settings decide,
-/// as [`Listener::accept`] would.
+/// as [`Listener::accept`] would. Either way, key material that already
+/// admitted another connection is a replayed handshake, refused before the
+/// claim too ([`crate::srt_replay`]).
+#[cfg(test)]
 fn accept_pending(
     app: &Arc<App>,
     listener: &mut Listener,
+    replay: &mut ReplayGuard,
     id: ConnId,
     peer: SocketAddr,
-    pending: Pending,
+    pending: crate::srt::Pending,
 ) -> Option<(Publication, Encryption)> {
-    let Pending { req, admitted, key } = pending;
+    let caller = check_pending(app, listener, replay, id, peer, pending)?;
+    claim_checked(app, listener, id, peer, caller)
+}
+
+/// A caller whose key passed and whose key material is remembered, not yet
+/// claimed for.
+struct Checked {
+    req: PublishRequest,
+    admitted: Admitted,
+    key: Option<CryptoConfig>,
+    encryption: Encryption,
+}
+
+/// [`accept_pending`]'s first part: the key check and the replay guard, up
+/// to remembering the caller's key material; `None` when it was refused or
+/// is gone. With a store, write it ([`crate::srt_replay::persist`]) before
+/// [`claim_checked`].
+fn check_pending(
+    app: &Arc<App>,
+    listener: &mut Listener,
+    replay: &mut ReplayGuard,
+    id: ConnId,
+    peer: SocketAddr,
+    pending: crate::srt::Pending,
+) -> Option<Checked> {
+    let crate::srt::Pending { req, admitted, key } = pending;
     let checked = match &key {
         Some(key) => match listener.check_key(id, key) {
             Ok(size) => Ok(Encryption::AppKey(size)),
@@ -461,6 +606,54 @@ fn accept_pending(
             return None;
         }
     };
+    // The caller owns its key material since it connected (checked then).
+    // Once more before the claim, in case a connection with it was admitted
+    // meanwhile. A caller whose key passed but cannot be told apart is
+    // refused, never admitted unguarded (unreachable: the check has already
+    // parsed its key material).
+    let seen = seen(listener, id, peer);
+    let keyed = !matches!(encryption, Encryption::None);
+    if (keyed && seen.is_none()) || seen.as_ref().is_some_and(|seen| replay.admitted(seen)) {
+        // As a wrong passphrase: the replayer learns nothing new.
+        listener.reject(id, RejectCode::BADSECRET);
+        app.log_refusal("srt", &"key material already admitted another connection");
+        return None;
+    }
+    // Remembered before the claim, so a copy is refused from now on; with a
+    // store, the claim waits until it is written too, since once this
+    // caller's media can reach the stage a restart must not forget its key
+    // material.
+    if let Some(seen) = seen {
+        replay.remember(&req.path.as_path(), seen, |c| listener.caller_socket(c));
+    }
+    Some(Checked {
+        req,
+        admitted,
+        key,
+        encryption,
+    })
+}
+
+/// [`accept_pending`]'s second part: claims the path and accepts the caller,
+/// with no await in between, if it is still waiting.
+fn claim_checked(
+    app: &Arc<App>,
+    listener: &mut Listener,
+    id: ConnId,
+    peer: SocketAddr,
+    caller: Checked,
+) -> Option<(Publication, Encryption)> {
+    let Checked {
+        req,
+        admitted,
+        key,
+        encryption,
+    } = caller;
+    if listener.sent_key_material(id).is_none() {
+        // Gone while its key material was written: nothing to claim for.
+        app.log_refusal("srt", &"caller gave up before it could be admitted");
+        return None;
+    }
     let publication = match Publication::claim_admitted(app, &req, SourceKind::Ts, admitted) {
         Ok(publication) => publication,
         Err(refusal) => {
@@ -481,6 +674,16 @@ fn accept_pending(
         return None;
     }
     Some((publication, encryption))
+}
+
+/// A waiting caller's key material as the replay guard compares it; `None`
+/// when it sent none (or is no longer waiting).
+fn seen(listener: &Listener, id: ConnId, peer: SocketAddr) -> Option<Seen> {
+    listener
+        .pending_key_material(id)
+        .and_then(sapflow_srt::crypto::bound_key_material)
+        .zip(listener.caller_socket(id))
+        .map(|(bound, socket)| Seen::new(bound, peer, socket, id))
 }
 
 /// Whether [`Listener::accept`] will admit a caller the app admitted without

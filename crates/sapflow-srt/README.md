@@ -93,9 +93,14 @@ matches, and never falls back to plaintext: no key material is refused with
 A failed check must end in `reject`, never in `accept` or
 `accept_with_crypto`, which still admit what the listener's own settings
 allow. A passing check proves the key material was wrapped under the
-passphrase, not that its sender made it: a replayed conclusion passes too,
-so do not turn on `app_keys` in production before the application guards
-against replay.
+passphrase, not that its sender made it: a replayed conclusion passes too.
+The listener keeps no record of key material, so an application that admits
+by key guards against replay itself: `pending_key_material(id)` gives a
+waiting caller's `KMREQ`, `crypto::bound_key_material` the part of it the
+check binds (compare that, not the whole message: edits elsewhere still
+pass), and `caller_socket(id)` the caller's own socket id. sapflow's server
+records the first caller to send each key material and refuses it from
+anyone else.
 
 ```rust
 use sapflow_srt::crypto::{CryptoConfig, KeySize};

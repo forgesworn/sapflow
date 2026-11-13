@@ -38,8 +38,17 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            scoped mode): requests offer \"srtKey\":\"accepted\",
                            and a 2xx carrying sapflow-srt-passphrase admits
                            only a caller keyed with it, checked before the
-                           path is claimed. No replay guard yet: a captured
-                           handshake still passes, so not for production
+                           path is claimed. A caller's key material belongs
+                           to the first to connect with it; anyone else
+                           sending it (a replayed handshake) is refused.
+                           Needs SAPFLOW_SRT_REPLAY_STORE
+  SAPFLOW_SRT_REPLAY_STORE absolute file in an existing private (0700)
+                           directory on a persistent volume, required with
+                           SAPFLOW_SRT_APP_KEYS=1: digests of admitted
+                           callers' key material, kept across restarts so a
+                           recorded handshake and its media cannot be
+                           replayed after one. Unreadable or malformed at
+                           start refuses to start
   SAPFLOW_SRT_REORDER_WAIT_MAX_MS  once a caller's path reorders packets, hold
                            a new gap's first NAK up to this long, so a packet
                            that is only late is not resent (default 50, 0 to
@@ -195,6 +204,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_ENCRYPTION",
     "SAPFLOW_SRT_REORDER_WAIT_MAX_MS",
     "SAPFLOW_SRT_APP_KEYS",
+    "SAPFLOW_SRT_REPLAY_STORE",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
     "SAPFLOW_WHIP_ADDR",
@@ -435,6 +445,9 @@ pub struct Config {
     /// The app may give each SRT stream its own passphrase in its publish
     /// authorisation answer (`SAPFLOW_SRT_APP_KEYS`).
     pub srt_app_keys: bool,
+    /// Where the SRT replay guard keeps admitted key material digests
+    /// across restarts (`SAPFLOW_SRT_REPLAY_STORE`); required with app keys.
+    pub srt_replay_store: Option<PathBuf>,
     /// The longest an SRT connection holds a new gap's first NAK while its
     /// path reorders packets; zero reports every gap at once.
     pub srt_reorder_wait_max: Duration,
@@ -605,9 +618,26 @@ impl Config {
                 ConfigError::Invalid("SAPFLOW_PUBLISH_AUTH_URL: not a usable http:// URL".into())
             })?),
         };
+        let srt_replay_store = match vals.get("SAPFLOW_SRT_REPLAY_STORE") {
+            None => None,
+            Some(path) => {
+                let path = PathBuf::from(path);
+                if !path.is_absolute() || path.file_name().is_none() {
+                    return Err(ConfigError::Invalid(
+                        "SAPFLOW_SRT_REPLAY_STORE: absolute file path required".into(),
+                    ));
+                }
+                Some(path)
+            }
+        };
         if srt_app_keys && publish_auth.is_none() {
             return Err(ConfigError::Invalid(
                 "SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_PUBLISH_AUTH_URL: the app returns each stream's passphrase".into(),
+            ));
+        }
+        if srt_app_keys && srt_replay_store.is_none() {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_SRT_REPLAY_STORE: an absolute file path in a private (0700) directory on a persistent volume, where admitted callers' key material digests survive restarts".into(),
             ));
         }
         if publish_auth.is_some()
@@ -958,6 +988,7 @@ impl Config {
             srt_allow_plaintext,
             srt_require_encryption,
             srt_app_keys,
+            srt_replay_store,
             srt_reorder_wait_max,
             record_min_free,
             recording_roll,
@@ -2061,6 +2092,7 @@ mod tests {
     fn srt_app_keys_need_the_app_and_refuse_scoped_mode() {
         let url = ("SAPFLOW_PUBLISH_AUTH_URL", "http://app/auth?token=t");
         let on = ("SAPFLOW_SRT_APP_KEYS", "1");
+        let store = ("SAPFLOW_SRT_REPLAY_STORE", "/var/lib/sapflow-srt/replay");
         let off = load(&[url], &[]).expect("default");
         assert!(!off.srt_app_keys && !off.srt_require_encryption);
         assert!(
@@ -2068,11 +2100,11 @@ mod tests {
                 .expect("off")
                 .srt_app_keys
         );
-        let c = load(&[url, on], &[]).expect("app keys");
+        let c = load(&[url, on, store], &[]).expect("app keys");
         // On, with nothing else: plaintext callers are still admitted.
         assert!(c.srt_app_keys && c.srt_crypto.is_none() && !c.srt_require_encryption);
         assert!(
-            load(&[url], &["--srt-app-keys=1"])
+            load(&[url, store], &["--srt-app-keys=1"])
                 .expect("flag")
                 .srt_app_keys
         );
@@ -2114,11 +2146,46 @@ mod tests {
     }
 
     #[test]
+    fn srt_app_keys_need_an_absolute_replay_store() {
+        let url = ("SAPFLOW_PUBLISH_AUTH_URL", "http://app/auth?token=t");
+        let on = ("SAPFLOW_SRT_APP_KEYS", "1");
+        let Err(ConfigError::Invalid(error)) = load(&[url, on], &[]) else {
+            panic!("app keys without a replay store accepted")
+        };
+        assert!(
+            error.starts_with("SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_SRT_REPLAY_STORE"),
+            "{error}"
+        );
+        for relative in ["replay", "srt/replay", "/"] {
+            let Err(ConfigError::Invalid(error)) =
+                load(&[url, on, ("SAPFLOW_SRT_REPLAY_STORE", relative)], &[])
+            else {
+                panic!("{relative} accepted")
+            };
+            assert_eq!(
+                error,
+                "SAPFLOW_SRT_REPLAY_STORE: absolute file path required"
+            );
+        }
+        let c = load(
+            &[url, on, ("SAPFLOW_SRT_REPLAY_STORE", "/var/lib/s/replay")],
+            &[],
+        )
+        .expect("with a store");
+        assert_eq!(
+            c.srt_replay_store.as_deref(),
+            Some(std::path::Path::new("/var/lib/s/replay"))
+        );
+        assert!(HELP.contains("SAPFLOW_SRT_REPLAY_STORE"));
+    }
+
+    #[test]
     fn required_encryption_without_a_passphrase_needs_app_keys() {
         let url = ("SAPFLOW_PUBLISH_AUTH_URL", "http://app/auth?token=t");
         let on = ("SAPFLOW_SRT_APP_KEYS", "1");
+        let store = ("SAPFLOW_SRT_REPLAY_STORE", "/var/lib/sapflow-srt/replay");
         let required = ("SAPFLOW_SRT_ENCRYPTION", "required");
-        let c = load(&[url, on, required], &[]).expect("app keys, required");
+        let c = load(&[url, on, store, required], &[]).expect("app keys, required");
         assert!(c.srt_require_encryption && c.srt_crypto.is_none() && !c.srt_allow_plaintext);
         let listener = crate::srt_own::listener_config_for_test(&c);
         assert!(listener.require_encryption && listener.app_keys && listener.crypto.is_none());
@@ -2139,22 +2206,26 @@ mod tests {
         assert!(load(&[url], &["--srt-encryption=required"]).is_err());
         // Unset still means plaintext without a passphrase, app keys or not.
         let listener =
-            crate::srt_own::listener_config_for_test(&load(&[url, on], &[]).expect("on"));
+            crate::srt_own::listener_config_for_test(&load(&[url, on, store], &[]).expect("on"));
         assert!(!listener.require_encryption && listener.app_keys);
         let listener = crate::srt_own::listener_config_for_test(&load(&[url], &[]).expect("off"));
         assert!(!listener.require_encryption && !listener.app_keys);
         // Optional, with app keys and no passphrase, says the same.
-        let c = load(&[url, on, ("SAPFLOW_SRT_ENCRYPTION", "optional")], &[]).expect("optional");
+        let c = load(
+            &[url, on, store, ("SAPFLOW_SRT_ENCRYPTION", "optional")],
+            &[],
+        )
+        .expect("optional");
         assert!(!c.srt_require_encryption && !c.srt_allow_plaintext);
         // A global passphrase alongside app keys keeps its meaning.
         let pass = ("SAPFLOW_SRT_PASSPHRASE", "deployment secret");
         let c = load(
-            &[url, on, pass, ("SAPFLOW_SRT_ENCRYPTION", "optional")],
+            &[url, on, store, pass, ("SAPFLOW_SRT_ENCRYPTION", "optional")],
             &[],
         )
         .expect("both");
         assert!(c.srt_allow_plaintext && !c.srt_require_encryption && c.srt_app_keys);
-        let c = load(&[url, on, pass], &[]).expect("both, required");
+        let c = load(&[url, on, store, pass], &[]).expect("both, required");
         assert!(c.srt_require_encryption);
     }
 

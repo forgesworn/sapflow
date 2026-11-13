@@ -56,6 +56,7 @@ fn app() -> Arc<App> {
     )
     .expect("a WHIP test configuration");
     Arc::new(App {
+        srt_replay: Default::default(),
         recording_limits: Arc::new(crate::recorder::RecordingLimits::new(config.max_publishers)),
         publish_sessions: None,
         config,

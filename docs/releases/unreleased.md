@@ -285,9 +285,63 @@ Notes for the release after 0.2.0-rc.1.
   no longer replaces a live publisher first; a repeated or out-of-bounds
   header refuses as an unusable answer does. RTMP and WHIP
   are unchanged, and with the switch off so is every request. The
-  passphrase is never logged. See `docs/v4v-contract.md`. There is no
-  replay guard yet: a captured handshake replayed to the same stream still
-  passes, so do not turn this on in production before it lands.
+  passphrase is never logged. See `docs/v4v-contract.md`.
+- With `SAPFLOW_SRT_APP_KEYS`, a replayed SRT handshake is refused. A
+  passing key check proves only that the key material was made with the
+  passphrase, and it travels in clear. The first caller to connect with
+  key material owns it, recorded before the throttle, the app or any
+  limit; the same key material from any other address or caller socket is
+  refused at once with `BADSECRET`, without asking the app or counting
+  against the throttle, however the owner's attempt ends, and once a
+  caller is admitted its key material is refused to everyone. sapflow keeps
+  a SHA-256 digest of the part of the key material the check binds:
+  16,384 owners in memory, oldest ended first; and 128 admitted per stream
+  path in memory and on disk, the path's oldest ended first, with past
+  4,096 in all the oldest ended entry of the path holding the most, so
+  admissions on other streams never evict another stage's; never one whose
+  connection is waiting or open; no time limit. It covers the app's passphrase and the
+  global one, and spans stream paths. Real encoders make fresh key
+  material per connection (sapflow's caller, libsrt 1.5.1 and OBS 32.0.4
+  checked, reconnects included); one that reused it would be refused, so
+  check Larix and hardware encoders before turning app keys on.
+- `SAPFLOW_SRT_REPLAY_STORE` (new) is required with
+  `SAPFLOW_SRT_APP_KEYS=1`; sapflow refuses to start without it. Replaying
+  an admitted connection's handshake restores its keys, so its recorded
+  media would decrypt onto the stage again; the store keeps admitted key
+  material digests across restarts, and every deploy is one. It is an
+  absolute file in an existing private (0700) directory owned by sapflow's
+  user, on a persistent writable volume of its own (not the recordings
+  directory, which v4v reads; recording expiry would leave it alone, but
+  the directory must not be shared). It holds stage paths and digests of
+  bytes sent in clear, nothing secret. Each admission writes it (a synced
+  temporary file renamed over the old one, at most about 680 KB) off the
+  SRT loop, and the stage is claimed only once it is written (a queued
+  write a later one covered is skipped); a caller whose digest cannot be
+  written is refused with `503` and nothing is claimed, so a full disk
+  there stops every keyed SRT reconnect: monitor its free space. An
+  unreadable or malformed store, or one removed once a store was written
+  beside its `.lock`, stops sapflow at start with a message; moving both
+  aside starts it empty, after which earlier captures can be replayed
+  until the app rotates those streams' passphrases. A store from a newer
+  sapflow stops it with its own message (upgrade, do not move it aside).
+  With no file, sapflow writes an empty store and logs a warning, which
+  after a first start means the path does not persist; a start that
+  stopped before its first store landed starts again. Temporary files a
+  crash left are removed at start. Create the directory before deploying,
+  owned by sapflow's user with mode 0700, on a persistent mount of its own.
+- Replay residuals: a copy that reaches sapflow before the original needs
+  an attacker who can delay or drop the encoder's packets, a passive
+  listener with a faster route, or one who times a copy while the shared
+  handshake allowance (100 a second) is used up, and it only displaces the
+  encoder, with no media; a restart forgets owners, so an attempt refused
+  before it can be replayed after it, again with no media; an admitted
+  entry evicted after 128 later admissions on its own stream, each needing
+  that stream's passphrase, under an unrotated passphrase can be replayed,
+  recorded media included; evicting an owner needs a long flood of ended
+  connections; callers the listener refuses before the application hears
+  of them (`BACKLOG`, the handshake rate limit) own
+  nothing. With the switch off nothing changes: the path is claimed before
+  any key is checked there, so the guard could not help.
 - The "SRT publisher accepted" log line gives `encryption` (`none`,
   `deployment-key`, `app-key` or `session-key`) and `key_len`, so the
   logs show which publishers still connect without a passphrase, or with
@@ -407,8 +461,14 @@ Notes for the release after 0.2.0-rc.1.
   A failed check must end in `reject`: `accept` and `accept_with_crypto`
   still admit what the listener's own settings allow. A passing check
   proves the key material was wrapped under the passphrase, not that its
-  sender made it, so a replayed conclusion passes; do not turn on
-  `app_keys` in production before the application guards against replay.
+  sender made it, so a replayed conclusion passes: the listener keeps no
+  record of key material, and an application that admits by key guards
+  against replay itself. For that, `Listener::pending_key_material` (new)
+  returns a waiting caller's `KMREQ`, `Listener::caller_socket` (new) its
+  own socket id while waiting or open, and `crypto::bound_key_material`
+  (new) the part of a `KMREQ` the passphrase check binds (the last 8 salt
+  bytes and the wrapped keys): edits anywhere else still pass the check,
+  so compare that part, not the whole message.
   `examples/listen-app-key.rs` is a complete listener. The new fuzz target
   `own_srt_app_keys` drives `check_key`, `accept_with_key`, `accept`,
   `reject` and `close`, with no global secret or with a global secret and
