@@ -295,9 +295,11 @@ Notes for the release after 0.2.0-rc.1.
   against the throttle, however the owner's attempt ends, and once a
   caller is admitted its key material is refused to everyone. sapflow keeps
   a SHA-256 digest of the part of the key material the check binds:
-  16,384 owners in memory, and 128 admitted per stream path (4,096 in all)
-  in memory and on disk, oldest ended first, never one whose connection is
-  waiting or open, no time limit. It covers the app's passphrase and the
+  16,384 owners in memory, oldest ended first; and 128 admitted per stream
+  path in memory and on disk, the path's oldest ended first, with past
+  4,096 in all the oldest ended entry of the path holding the most, so
+  admissions on other streams never evict another stage's; never one whose
+  connection is waiting or open; no time limit. It covers the app's passphrase and the
   global one, and spans stream paths. Real encoders make fresh key
   material per connection (sapflow's caller, libsrt 1.5.1 and OBS 32.0.4
   checked, reconnects included); one that reused it would be refused, so
@@ -313,23 +315,31 @@ Notes for the release after 0.2.0-rc.1.
   the directory must not be shared). It holds stage paths and digests of
   bytes sent in clear, nothing secret. Each admission writes it (a synced
   temporary file renamed over the old one, at most about 680 KB) off the
-  SRT loop, and the stage is claimed only once it is written; a caller whose digest cannot be written is refused
-  with `503` and nothing is claimed. An unreadable or malformed store, or
-  one removed while its `.lock` remains, stops sapflow at start with a
-  message; moving both aside starts it empty, after which earlier captures
-  can be replayed until the app rotates those streams' passphrases.
-  Finding neither file nor `.lock`, sapflow writes an empty store and logs
-  a warning, which after a first start means the path does not persist.
+  SRT loop, and the stage is claimed only once it is written (a queued
+  write a later one covered is skipped); a caller whose digest cannot be
+  written is refused with `503` and nothing is claimed, so a full disk
+  there stops every keyed SRT reconnect: monitor its free space. An
+  unreadable or malformed store, or one removed once a store was written
+  beside its `.lock`, stops sapflow at start with a message; moving both
+  aside starts it empty, after which earlier captures can be replayed
+  until the app rotates those streams' passphrases. A store from a newer
+  sapflow stops it with its own message (upgrade, do not move it aside).
+  With no file, sapflow writes an empty store and logs a warning, which
+  after a first start means the path does not persist; a start that
+  stopped before its first store landed starts again. Temporary files a
+  crash left are removed at start. Create the directory before deploying,
+  owned by sapflow's user with mode 0700, on a persistent mount of its own.
 - Replay residuals: a copy that reaches sapflow before the original needs
   an attacker who can delay or drop the encoder's packets, a passive
   listener with a faster route, or one who times a copy while the shared
   handshake allowance (100 a second) is used up, and it only displaces the
   encoder, with no media; a restart forgets owners, so an attempt refused
   before it can be replayed after it, again with no media; an admitted
-  entry evicted after 128 later admissions on its stream (4,096 in all)
-  under an unrotated passphrase can be replayed, recorded media included;
-  evicting an owner needs a long flood of ended connections; callers the listener refuses before
-  the application hears of them (`BACKLOG`, the handshake rate limit) own
+  entry evicted after 128 later admissions on its own stream, each needing
+  that stream's passphrase, under an unrotated passphrase can be replayed,
+  recorded media included; evicting an owner needs a long flood of ended
+  connections; callers the listener refuses before the application hears
+  of them (`BACKLOG`, the handshake rate limit) own
   nothing. With the switch off nothing changes: the path is claimed before
   any key is checked there, so the guard could not help.
 - The "SRT publisher accepted" log line gives `encryption` (`none`,

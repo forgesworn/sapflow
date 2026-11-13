@@ -132,11 +132,12 @@ handshake carries in clear in the stream id, no longer admits on its own.
   `SAPFLOW_SRT_PASSPHRASE` alike, and spans streams.
 - What sapflow keeps: a SHA-256 digest of the part of the key material the
   check binds, never the key material. Owners, in memory: 16,384, the
-  oldest whose connection has ended dropped first. Admitted: the last 128
-  per stream and 4,096 in all, the same way, so admissions elsewhere cannot
-  push out a live stage's, in memory and in `SAPFLOW_SRT_REPLAY_STORE`. An
-  entry whose connection is waiting or open is never dropped. No time
-  limit.
+  oldest whose connection has ended dropped first. Admitted, in memory and
+  in `SAPFLOW_SRT_REPLAY_STORE`: the last 128 per stream, its oldest ended
+  entry dropped first; past 4,096 in all, the oldest ended entry of the
+  stream holding the most is dropped, so admissions on other streams,
+  however many, never push out another stage's. An entry whose connection
+  is waiting or open is never dropped. No time limit.
 - `SAPFLOW_SRT_REPLAY_STORE` is required with app keys: an absolute file
   path in a directory that exists, is owned by sapflow's user and is
   private (0700), on a volume that survives redeploys (a container needs a
@@ -152,14 +153,23 @@ handshake carries in clear in the stream id, no longer admits on its own.
   and is written once per admission, off the SRT loop so other publishers
   are not held up; the admitted caller waits for it (a full-size write took
   34 ms, at most 93 ms, on a development Mac; a busy production disk may be
-  slower), while copies of its key material are refused from the start. At start, a store that is unreadable
-  or malformed, or one removed while its `.lock` remains, stops sapflow
-  with a message: moving the file and its `.lock` aside starts it empty,
-  and then key material captured before that can be replayed until the
-  app rotates those streams' passphrases. When sapflow finds neither file
-  nor `.lock` it writes an empty store and logs a warning: right on a
+  slower), while copies of its key material are refused from the start.
+  A queued write that a later one already covered is skipped.
+- At start, a store that is unreadable or malformed, or one removed once a
+  store was written beside its `.lock`, stops sapflow with a message:
+  moving the file and its `.lock` aside starts it empty, and then key
+  material captured before that can be replayed until the app rotates
+  those streams' passphrases. A store from a newer sapflow stops it with
+  its own message: upgrade sapflow, and do not move the store aside. With
+  no file, sapflow writes an empty store and logs a warning (right on a
   first start, but after that it means the path is not persistent and
-  every restart forgets admissions.
+  every restart forgets admissions); a start that stopped before its first
+  store landed starts again the same way. Temporary files a crash left in
+  the directory are removed at start.
+- Deploying with app keys: create the store's directory first, owned by
+  sapflow's user with mode 0700, on a persistent mount of its own. A full
+  disk there stops every keyed SRT reconnect (sapflow fails closed rather
+  than admit a caller it could forget), so monitor its free space.
 - Why the store matters: replaying an admitted connection's handshake
   restores that connection's keys, so anyone who recorded the connection,
   handshake and media, could send the recorded media again and it would
@@ -189,9 +199,10 @@ handshake carries in clear in the stream id, no longer admits on its own.
     rotates those streams' passphrases (a capture under an old passphrase
     fails the key check).
   - Eviction of an admitted entry reopens what the store closes, recorded
-    media included, for that connection: it takes 128 later admissions on
-    the same stream, or 4,096 in all, under a passphrase the app has not
-    rotated since. Each admission needs the stream's own passphrase.
+    media included, for that connection. It takes 128 later admissions on
+    the same stream, each needing that stream's own passphrase, under a
+    passphrase the app has not rotated since; admissions on other streams
+    evict only their own entries.
   - Eviction of an owner takes a flood of new key material from connections
     that have ended (minutes of every handshake the listener will answer),
     with the same displacement and no media.

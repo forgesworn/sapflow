@@ -203,6 +203,12 @@ production layout differs, adapt, and keep the callback private.
 The HLS port (8888 inside the image) need not be published: Caddy reaches it
 by service name. The existing container's loopback HLS port can stay.
 
+With `SAPFLOW_SRT_APP_KEYS=1`, also mount `SAPFLOW_SRT_REPLAY_STORE`'s
+directory: create it first, owned by sapflow's user with mode 0700, on a
+persistent mount of its own (not `<recordings-dir>`). A full disk there
+stops every keyed SRT reconnect, so monitor its free space
+(`docs/v4v-contract.md`).
+
 Port 1935 moves between the two servers by recreating both containers, since
 Docker fixes a container's ports when it is created. Prepare two copies of
 the compose file in `<compose-dir>`, differing only in who publishes 1935:

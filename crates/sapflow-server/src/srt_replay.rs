@@ -31,9 +31,10 @@
 //!   material of a caller about to be accepted, refused to anyone from then
 //!   on, its owner included (while its connection is open the listener
 //!   answers the owner's resends on it, so a new connection with it is a
-//!   copy), and across restarts. [`PER_PATH`] entries a path and [`TOTAL`] in
-//!   all, oldest ended first, so a flood of admissions elsewhere cannot push
-//!   out a live stage's entry.
+//!   copy), and across restarts. [`PER_PATH`] entries a path, the path's
+//!   oldest ended first; past [`TOTAL`] in all, the oldest ended entry of the
+//!   path holding the most, so admissions on other streams, however many,
+//!   evict only their own entries and never another stage's.
 //!
 //! An entry whose connection is still waiting or open is never evicted, so
 //! either tier may exceed its bound by the connections the listener holds.
