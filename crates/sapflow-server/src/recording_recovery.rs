@@ -5,14 +5,19 @@
 //! The entries are listed before any listener starts, so none that this
 //! run's own recordings write is among them, and then sent from a background
 //! task: publishers connect while it runs. Each goes through the callback
-//! queue with its usual four attempts, one at a time and at least
+//! sender's recovered lane, apart from live events so that a slow import
+//! never holds up a live `publish`, with two attempts of up to ten minutes
+//! (the importer copies the whole file before it answers), one at a time and
+//! at least
 //! [`INTERVAL`] apart (60 a minute at most, half of the 120 a minute v4v
 //! takes from one address, leaving the rest to live stages), and its entry is
 //! removed only once the app has answered 2xx. A refusal (4xx) leaves the
 //! entry for the next start. A failure (the app down or answering 5xx, as
-//! after a power cut that restarts it with sapflow) is tried again in later
-//! rounds, the first [`RETRY_FIRST`] after, doubling to [`RETRY_MAX`], until
-//! it is delivered, refused or expired, or sapflow stops; after
+//! after a power cut that restarts it with sapflow, or answering 408, 429
+//! or 5xx) is tried again in later rounds, the first [`RETRY_FIRST`] after,
+//! doubling to [`RETRY_MAX`], at most [`RETRY_ROUNDS`] times in one run, so
+//! a receiver that keeps failing (copying the file each time) is not asked
+//! without end; then it waits for the next start. After
 //! [`STOP_AFTER_FAILURES`] failures in a row a round ends, and the entries
 //! not yet tried in it wait for the next round too.
 //!
@@ -54,6 +59,9 @@ pub const STOP_AFTER_FAILURES: usize = 3;
 pub const RETRY_FIRST: Duration = Duration::from_secs(30);
 /// The longest wait between retry rounds.
 pub const RETRY_MAX: Duration = Duration::from_secs(600);
+/// Retry rounds in one run; what is still undelivered then waits for the
+/// next start. An entry is sent at most this many times plus one per run.
+pub const RETRY_ROUNDS: usize = 3;
 
 /// How fast recovery goes.
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +132,8 @@ pub struct Summary {
     pub left: usize,
     /// Rounds that retried failed entries.
     pub retry_rounds: usize,
+    /// Entries still failing after the last round, kept for the next start.
+    pub deferred: usize,
     /// Whether a round ended after [`STOP_AFTER_FAILURES`] failures.
     pub stopped: bool,
 }
@@ -190,6 +200,15 @@ pub async fn run(
         if failed.is_empty() {
             break;
         }
+        if summary.retry_rounds >= RETRY_ROUNDS {
+            summary.deferred = failed.len();
+            tracing::warn!(
+                entries = failed.len(),
+                rounds = summary.retry_rounds,
+                "recovered recordings still not delivered; they wait for the next start"
+            );
+            break;
+        }
         tracing::warn!(
             entries = failed.len(),
             retry_in_secs = backoff.as_secs_f64(),
@@ -208,6 +227,7 @@ pub async fn run(
             removed = summary.dropped,
             left = summary.left,
             retry_rounds = summary.retry_rounds,
+            deferred = summary.deferred,
             "recording recovery done"
         );
     }

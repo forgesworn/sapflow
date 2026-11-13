@@ -371,8 +371,9 @@ async fn run(config: Config) -> std::io::Result<()> {
         control_task.abort_handle(),
         whip_task.abort_handle(),
         expiry_task.abort_handle(),
-        // A stop sends no more recovered recordings; the one in the queue,
-        // if any, is waited for like any other callback.
+        // A stop sends no more recovered recordings, and does not wait for
+        // the one in flight on its own lane: what it has not delivered
+        // stays owed for the next start.
         recovery_task.abort_handle(),
     ];
     tokio::select! {

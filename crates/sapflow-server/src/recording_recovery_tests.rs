@@ -33,7 +33,7 @@ fn pacing(interval: Duration) -> Pacing {
 }
 
 /// A stand-in for v4v: each request's arrival and JSON body, answered with
-/// the status `answer` gives its index, or never when it gives None.
+/// the status `answer` gives its index and body, or never when it gives None.
 struct Receiver {
     addr: std::net::SocketAddr,
     seen: Arc<Mutex<Vec<(Instant, serde_json::Value)>>>,
@@ -41,7 +41,9 @@ struct Receiver {
 }
 
 impl Receiver {
-    async fn start(answer: impl Fn(usize) -> Option<u16> + Send + Sync + 'static) -> Self {
+    async fn start(
+        answer: impl Fn(usize, &serde_json::Value) -> Option<u16> + Send + Sync + 'static,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("listener");
@@ -58,10 +60,10 @@ impl Receiver {
                     };
                     let index = {
                         let mut log = log.lock().expect("log");
-                        log.push((Instant::now(), body));
+                        log.push((Instant::now(), body.clone()));
                         log.len() - 1
                     };
-                    match answer(index) {
+                    match answer(index, &body) {
                         Some(status) => {
                             let response = crate::http_lite::response(status, &[], b"");
                             let _ = socket.write_all(&response).await;
@@ -313,7 +315,7 @@ fn a_killed_writer_is_reported_once_incomplete_with_its_decodable_duration() {
             assert!(stored[0].finished.is_none(), "the writer never finished");
             let before = digest(&interrupted.file);
             block_on(async {
-                let receiver = Receiver::start(|_| Some(204)).await;
+                let receiver = Receiver::start(|_, _| Some(204)).await;
                 let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
                 assert_eq!(summary.delivered, 1, "{summary:?}");
                 let bodies = receiver.bodies();
@@ -389,7 +391,7 @@ fn recovered_duration_matches_ffprobe() {
         let interrupted = interrupted(false, 6, cut);
         let dir = interrupted.scratch.0.clone();
         let reported = block_on(async {
-            let receiver = Receiver::start(|_| Some(204)).await;
+            let receiver = Receiver::start(|_, _| Some(204)).await;
             restart(&dir, &receiver, Duration::from_millis(10)).await;
             receiver.bodies()[0]["segmentDuration"]
                 .as_str()
@@ -503,23 +505,21 @@ fn a_finished_recording_whose_callback_was_lost_is_reported_once_as_it_was() {
             })
         );
         block_on(async {
-            let receiver = Receiver::start(|_| Some(204)).await;
+            let receiver = Receiver::start(|_, _| Some(204)).await;
             let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
             assert_eq!(summary.delivered, 1);
             let bodies = receiver.bodies();
             assert_eq!(bodies.len(), 1);
-            let mut recovered = bodies[0].clone();
-            if scoped {
-                // The only difference: the sequence the recording reserved
-                // at its start, below the one its live callback took.
-                let reserved = recovered["eventSequence"].as_u64().expect("sequence");
-                assert!(reserved < live["eventSequence"].as_u64().expect("sequence"));
-                recovered["eventSequence"] = live["eventSequence"].clone();
-            }
+            // Identical, sequence and all: the live callback used the
+            // sequence the recording reserved, so a receiver that dedupes on
+            // it sees the same event.
             assert_eq!(
-                recovered, live,
+                bodies[0], live,
                 "the same state, reason, duration and identity"
             );
+            if scoped {
+                assert_eq!(live["eventSequence"], 1, "reserved at the file's start");
+            }
             assert_eq!(
                 restart(&dir, &receiver, Duration::from_millis(10)).await,
                 Summary::default()
@@ -535,7 +535,7 @@ fn a_delivered_callback_leaves_nothing_to_send_again() {
     let scratch = Scratch::new("delivered");
     let dir = scratch.0.clone();
     block_on(async {
-        let receiver = Receiver::start(|_| Some(204)).await;
+        let receiver = Receiver::start(|_, _| Some(204)).await;
         let outbox = Arc::new(Outbox::open(&dir).expect("outbox"));
         let callbacks = Callbacks::start(Some(receiver.url()), None).with_outbox(outbox.clone());
         let (tracks, parts) = fixture_parts();
@@ -611,7 +611,7 @@ fn a_crash_during_recovery_neither_loses_nor_repeats_an_acknowledged_report() {
         .build()
         .expect("runtime");
     let receiver = first.block_on(async {
-        let receiver = Receiver::start(|index| (index == 0).then_some(204)).await;
+        let receiver = Receiver::start(|index, _| (index == 0).then_some(204)).await;
         let outbox = Arc::new(Outbox::open(&dir).expect("outbox"));
         let pending = Pending::list(&outbox, MAX_PER_START);
         let callbacks = Callbacks::start(Some(receiver.url()), None);
@@ -641,7 +641,7 @@ fn a_crash_during_recovery_neither_loses_nor_repeats_an_acknowledged_report() {
         "only the acknowledged entry is gone"
     );
     block_on(async {
-        let receiver = Receiver::start(|_| Some(204)).await;
+        let receiver = Receiver::start(|_, _| Some(204)).await;
         let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
         assert_eq!(summary.delivered, 2);
         // The unanswered report is sent again; the acknowledged one is not.
@@ -669,7 +669,7 @@ fn expired_or_missing_recordings_are_not_reported_and_their_entries_go() {
     drop(old);
     std::fs::remove_file(dir.join(&files[1])).expect("expired by an earlier run");
     block_on(async {
-        let receiver = Receiver::start(|_| Some(204)).await;
+        let receiver = Receiver::start(|_, _| Some(204)).await;
         let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
         assert_eq!((summary.delivered, summary.dropped), (1, 2), "{summary:?}");
         assert_eq!(reported_files(&receiver), ["1002.mp4"]);
@@ -691,7 +691,7 @@ fn many_recordings_are_reported_one_at_a_time_and_live_events_still_go() {
     let dir = scratch.0.clone();
     pending_files(&dir, 12);
     block_on(async {
-        let receiver = Receiver::start(|_| Some(204)).await;
+        let receiver = Receiver::start(|_, _| Some(204)).await;
         let interval = Duration::from_millis(100);
         let outbox = Arc::new(Outbox::open(&dir).expect("outbox"));
         let pending = Pending::list(&outbox, MAX_PER_START);
@@ -746,9 +746,9 @@ fn an_app_that_is_down_at_start_gets_every_report_once_it_is_back() {
     let dir = scratch.0.clone();
     pending_files(&dir, 5);
     block_on(async {
-        // Down for three reports' four attempts each (a power cut that
+        // Down for three reports' two attempts each (a power cut that
         // restarted it with sapflow), then back, with no restart of sapflow.
-        let receiver = Receiver::start(|index| Some(if index < 12 { 503 } else { 204 })).await;
+        let receiver = Receiver::start(|index, _| Some(if index < 6 { 503 } else { 204 })).await;
         let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
         assert_eq!(summary.failed, recording_recovery::STOP_AFTER_FAILURES);
         assert!(summary.stopped, "the round ended after three failures");
@@ -757,8 +757,8 @@ fn an_app_that_is_down_at_start_gets_every_report_once_it_is_back() {
             (1, 5),
             "{summary:?}"
         );
-        assert_eq!(receiver.bodies().len(), 4 * 3 + 5);
-        let mut files = reported_files(&receiver)[12..].to_vec();
+        assert_eq!(receiver.bodies().len(), 2 * 3 + 5);
+        let mut files = reported_files(&receiver)[6..].to_vec();
         files.sort();
         assert_eq!(
             files,
@@ -769,6 +769,77 @@ fn an_app_that_is_down_at_start_gets_every_report_once_it_is_back() {
 }
 
 #[test]
+fn a_receiver_that_keeps_failing_is_asked_a_bounded_number_of_times_a_run() {
+    let scratch = Scratch::new("bounded");
+    let dir = scratch.0.clone();
+    pending_files(&dir, 2);
+    block_on(async {
+        // A slow importer, say, timing out every time: each attempt makes
+        // it copy the file again.
+        let receiver = Receiver::start(|_, _| Some(503)).await;
+        let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
+        assert_eq!(
+            (summary.retry_rounds, summary.deferred, summary.delivered),
+            (recording_recovery::RETRY_ROUNDS, 2, 0),
+            "{summary:?}"
+        );
+        // Each entry sent once and in each retry round, two attempts a send.
+        assert_eq!(
+            receiver.bodies().len(),
+            2 * 2 * (1 + recording_recovery::RETRY_ROUNDS)
+        );
+    });
+    assert_eq!(entries(&dir).len(), 2, "kept for the next start");
+}
+
+#[test]
+fn a_slow_recovered_report_never_holds_up_live_events_or_a_stop() {
+    let scratch = Scratch::new("lanes");
+    let dir = scratch.0.clone();
+    pending_files(&dir, 1);
+    block_on(async {
+        // The importer never answers a recovered report; live events are
+        // answered at once.
+        let receiver =
+            Receiver::start(|_, body| (body["event"] != "recordSegmentComplete").then_some(204))
+                .await;
+        let outbox = Arc::new(Outbox::open(&dir).expect("outbox"));
+        let pending = Pending::list(&outbox, MAX_PER_START);
+        let callbacks = Callbacks::start(Some(receiver.url()), None).with_outbox(outbox.clone());
+        let recovery = tokio::spawn(recording_recovery::run(
+            outbox.clone(),
+            pending,
+            callbacks.clone(),
+            WEEK,
+            pacing(Duration::from_millis(10)),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while receiver.completions().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the recovered report is in flight");
+        let sent = Instant::now();
+        callbacks.send(&path(), sapflow_core::StreamEvent::Publish);
+        tokio::time::timeout(Duration::from_secs(2), callbacks.drained())
+            .await
+            .expect("a live event, and a stop's wait, do not wait for the recovered lane");
+        assert!(sent.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            receiver
+                .bodies()
+                .iter()
+                .filter(|body| body["event"] == "publish")
+                .count(),
+            1
+        );
+        recovery.abort();
+    });
+    assert_eq!(entries(&dir).len(), 1, "the unanswered report stays owed");
+}
+
+#[test]
 fn a_refusal_keeps_every_entry_for_the_next_start() {
     let scratch = Scratch::new("refused");
     let dir = scratch.0.clone();
@@ -776,7 +847,7 @@ fn a_refusal_keeps_every_entry_for_the_next_start() {
     block_on(async {
         // A wrong token after a redeploy, say: not retried in this run,
         // not erased either.
-        let refusing = Receiver::start(|_| Some(401)).await;
+        let refusing = Receiver::start(|_, _| Some(401)).await;
         let summary = restart(&dir, &refusing, Duration::from_millis(10)).await;
         assert_eq!(
             (summary.refused, summary.retry_rounds, summary.stopped),
@@ -853,7 +924,7 @@ fn stopping_fixture(url: String) -> (crate::publish::loss_tests::Fixture, Arc<Ou
 #[test]
 fn a_stop_delivers_as_before_and_leaves_nothing_behind() {
     block_on(async {
-        let receiver = Receiver::start(|_| Some(204)).await;
+        let receiver = Receiver::start(|_, _| Some(204)).await;
         let (fixture, outbox) = stopping_fixture(receiver.url());
         let mut live = begin_live(&fixture.app);
         crate::publish::loss_tests::Fixture::feed(&mut live);
@@ -889,7 +960,7 @@ fn a_report_undelivered_at_the_stop_deadline_is_sent_at_the_next_start_as_it_was
     // The app takes `publish` and `unpublish`, then is down for the rest
     // of the stop.
     let (fixture, outbox, down) = first.block_on(async {
-        let down = Receiver::start(|index| Some(if index < 2 { 204 } else { 503 })).await;
+        let down = Receiver::start(|index, _| Some(if index < 2 { 204 } else { 503 })).await;
         let (fixture, outbox) = stopping_fixture(down.url());
         let mut live = begin_live(&fixture.app);
         crate::publish::loss_tests::Fixture::feed(&mut live);
@@ -924,7 +995,7 @@ fn a_report_undelivered_at_the_stop_deadline_is_sent_at_the_next_start_as_it_was
         Some(Some("server-stopped"))
     );
     block_on(async {
-        let receiver = Receiver::start(|_| Some(204)).await;
+        let receiver = Receiver::start(|_, _| Some(204)).await;
         let pending = Pending::list(&outbox, MAX_PER_START);
         let callbacks = Callbacks::start(Some(receiver.url()), None);
         let summary = recording_recovery::run(

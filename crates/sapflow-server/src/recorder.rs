@@ -810,8 +810,13 @@ impl Drop for WriteReceipt {
     }
 }
 
+/// Publishes a synced file's completion. With an outbox entry, the body is
+/// decided first, with the sequence the recording reserved: a refused body
+/// owes nothing later, so the entry is removed before anything else; only a
+/// body that will be sent has its outcome written into the entry, before it
+/// is queued.
 #[allow(clippy::too_many_arguments)]
-fn publish_recording(
+async fn publish_recording(
     receipt: &mut WriteReceipt,
     complete: bool,
     reason: Option<IncompleteReason>,
@@ -838,17 +843,43 @@ fn publish_recording(
         "recording finished"
     );
     // Both integrations must distinguish a finalised file from a synced prefix.
-    callbacks.send_recording(
-        path,
-        StreamEvent::RecordSegmentComplete {
-            segment_path: file_path.display().to_string(),
-            duration_secs: duration_ms(duration) as f64 / 1000.0,
-            recording_tracks,
-        },
-        complete,
-        reason.map(IncompleteReason::as_str),
-        entry,
-    );
+    let event = StreamEvent::RecordSegmentComplete {
+        segment_path: file_path.display().to_string(),
+        duration_secs: duration_ms(duration) as f64 / 1000.0,
+        recording_tracks,
+    };
+    let reason = reason.map(IncompleteReason::as_str);
+    let Some(mut entry) = entry else {
+        callbacks.send_recording(path, event, complete, reason);
+        return;
+    };
+    let Some(body) =
+        callbacks.recording_body(path, &event, complete, reason, entry.reserved_sequence())
+    else {
+        entry.remove().await;
+        return;
+    };
+    entry
+        .finish(Finished {
+            complete,
+            reason: if complete {
+                None
+            } else {
+                reason.map(str::to_owned)
+            },
+            duration_ms: duration_ms(duration),
+        })
+        .await;
+    callbacks.enqueue_recording(path, body, entry);
+}
+
+/// What the writer decided to publish: a synced file.
+struct Written {
+    receipt: WriteReceipt,
+    complete: bool,
+    reason: Option<IncompleteReason>,
+    duration: Duration,
+    tracks: RecordingTracks,
 }
 
 /// A callback's duration, in whole milliseconds as `segmentDuration` gives
@@ -999,7 +1030,7 @@ impl RecordingWriter {
             tracks.audio_rate(),
             scoped,
         );
-        OutboxEntry::open(outbox, entry).await
+        Some(OutboxEntry::open(outbox, entry).await)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1013,8 +1044,30 @@ impl RecordingWriter {
         receipt: WriteReceipt,
         entry: Option<OutboxEntry>,
     ) {
-        self.write_open_file(&mut file, &file_path, rx, tracks, init, receipt, entry)
+        let written = self
+            .write_open_file(&mut file, &file_path, rx, tracks, init, receipt)
             .await;
+        match written {
+            // A decided failure owes the app nothing: the one place an
+            // entry is discarded. Any other end of this future (the runtime
+            // dropping it at the stop deadline, say) leaves the entry for
+            // the next start.
+            None => discard(entry).await,
+            Some(mut written) => {
+                publish_recording(
+                    &mut written.receipt,
+                    written.complete,
+                    written.reason,
+                    &self.callbacks,
+                    &self.path,
+                    &file_path,
+                    written.duration,
+                    written.tracks,
+                    entry,
+                )
+                .await
+            }
+        }
         // Tokio can return from write_all after copying into an owned buffer,
         // while blocking I/O still holds that buffer and the underlying file.
         // Every post-open exit, including fatal input and rebase/header errors,
@@ -1025,26 +1078,19 @@ impl RecordingWriter {
         }
     }
 
-    /// Only the decided failures below, which owe the app nothing, remove
-    /// the outbox entry. Any other end of this future (the runtime dropping
-    /// it at the stop deadline, say) leaves the entry for the next start.
-    #[allow(clippy::too_many_arguments)]
+    /// Writes and syncs the file. None for a decided failure, which owes the
+    /// app nothing.
     async fn write_open_file(
-        self,
+        &self,
         file: &mut impl RecordingFile,
         file_path: &Path,
         mut rx: mpsc::Receiver<Msg>,
         tracks: Tracks,
         init: bytes::Bytes,
-        mut receipt: WriteReceipt,
-        mut entry: Option<OutboxEntry>,
-    ) {
-        let Some(recording_tracks) =
-            RecordingTracks::new(tracks.video().is_some(), tracks.audio_config().is_some())
-        else {
-            discard(entry).await;
-            return;
-        };
+        receipt: WriteReceipt,
+    ) -> Option<Written> {
+        let recording_tracks =
+            RecordingTracks::new(tracks.video().is_some(), tracks.audio_config().is_some())?;
         if let Some(observation) = &self.observation {
             observation.active();
         }
@@ -1088,44 +1134,23 @@ impl RecordingWriter {
         // Now the length is known: rewrite the init in place (same size).
         let Some(final_init) = tracks.recording_init(duration) else {
             tracing::error!(file = %file_path.display(), "recording header is invalid");
-            discard(entry).await;
-            return;
+            return None;
         };
         if failed || finalise_file(file, init.len(), &final_init).await.is_err() {
             tracing::error!(file = %file_path.display(), "recording write failed");
-            discard(entry).await;
-            return;
+            return None;
         }
         let Some(complete) = self.status.try_commit() else {
             tracing::error!(file = %file_path.display(), "recording input failed");
-            discard(entry).await;
-            return;
+            return None;
         };
-        let reason = self.status.reason();
-        if let Some(entry) = &mut entry {
-            entry
-                .finish(Finished {
-                    complete,
-                    reason: if complete {
-                        None
-                    } else {
-                        reason.map(|r| r.as_str().to_owned())
-                    },
-                    duration_ms: duration_ms(duration),
-                })
-                .await;
-        }
-        publish_recording(
-            &mut receipt,
+        Some(Written {
+            receipt,
             complete,
-            self.status.reason(),
-            &self.callbacks,
-            &self.path,
-            file_path,
+            reason: self.status.reason(),
             duration,
-            recording_tracks,
-            entry,
-        );
+            tracks: recording_tracks,
+        })
     }
 }
 
@@ -3270,7 +3295,8 @@ mod tests {
                         first.span,
                         RecordingTracks::AudioVideo,
                         None,
-                    );
+                    )
+                    .await;
                 }
                 drop(receipt);
                 if fatal_first {
@@ -3425,5 +3451,152 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// A real writer with an outbox, ended by a decided failure: a part
+    /// that does not rebase, or input marked fatal. Its entry, written
+    /// `open` before the file, must go: such a file owes the app nothing,
+    /// and a next start must not report it `server-interrupted`.
+    #[tokio::test]
+    async fn a_decided_writer_failure_removes_its_outbox_entry() {
+        for fatal in [false, true] {
+            let scratch = crate::recording_outbox::tests::Scratch::new("discard");
+            let outbox = Arc::new(Outbox::open(&scratch.0).expect("outbox"));
+            let (callbacks, mut queue) = crate::callback::legacy_test_queue(4);
+            let callbacks = callbacks.with_outbox(outbox.clone());
+            let (sender, input) = mpsc::channel(4);
+            let (tracks, mut parts) = fixture_parts();
+            let part = parts.remove(0);
+            let part = if fatal {
+                part
+            } else {
+                Arc::new(Part {
+                    initialization: part.initialization.clone(),
+                    id: part.id,
+                    duration: part.duration,
+                    span: part.span,
+                    independent: part.independent,
+                    data: bytes::Bytes::from_static(b"invalid-moof"),
+                })
+            };
+            assert!(sender.try_send(Msg::Init(tracks)).is_ok());
+            assert!(sender.try_send(part_message(part)).is_ok());
+            drop(sender);
+            let status = recording_status(false);
+            if fatal {
+                assert!(status.mark_fatal());
+            }
+            let path = StreamPath::parse("live/event-a").expect("path");
+            write(scratch.0.clone(), path, input, callbacks, 0, None, status).await;
+            assert!(queue.try_recv().is_err(), "no completion");
+            let file = std::fs::read_dir(scratch.0.join("live/event-a"))
+                .expect("the file was created")
+                .count();
+            assert_eq!(file, 1, "the file stays; fatal={fatal}");
+            assert!(
+                outbox.list(10).expect("list").0.is_empty(),
+                "the entry is removed; fatal={fatal}"
+            );
+        }
+    }
+
+    /// A scoped completion whose body is refused (here its path is not the
+    /// scope's) removes its entry before the writer returns, and never
+    /// writes it `finished`: nothing is owed for it later.
+    #[tokio::test]
+    async fn a_refused_completion_removes_its_entry_before_returning() {
+        let scratch = crate::recording_outbox::tests::Scratch::new("refused-body");
+        let outbox = Arc::new(Outbox::open(&scratch.0).expect("outbox"));
+        let scope = crate::publish_observer::fixture_scope("a", 1, 11, 3);
+        let (callbacks, mut queue) = crate::callback::test_queue(scope.clone(), 4);
+        let callbacks = callbacks.with_outbox(outbox.clone());
+        let (callbacks, observation) = callbacks.for_recording().expect("recording");
+        let observation = observation.expect("scoped");
+        observation.active();
+        let scoped = callbacks
+            .recovery_identity(observation.id())
+            .expect("a sequence to reserve");
+        let file = format!("live/event-a/100-{}.mp4", observation.id());
+        let entry = OutboxEntry::open(
+            outbox.clone(),
+            Entry::new(file, true, true, Some(48_000), scoped),
+        )
+        .await;
+        assert_eq!(outbox.list(10).expect("list").0.len(), 1);
+        let mut receipt = WriteReceipt {
+            observation: Some(observation),
+            completed: false,
+        };
+        publish_recording(
+            &mut receipt,
+            true,
+            None,
+            &callbacks,
+            &StreamPath::parse("live/event-b").expect("another path"),
+            Path::new("recording.mp4"),
+            Duration::from_secs(1),
+            RecordingTracks::AudioVideo,
+            Some(entry),
+        )
+        .await;
+        assert!(queue.try_recv().is_err(), "nothing queued");
+        assert!(
+            outbox.list(10).expect("list").0.is_empty(),
+            "removed, and awaited, before the writer returns"
+        );
+        assert_eq!(scope.observations.callback_state(), "failed");
+    }
+
+    /// With an entry, the live completion carries the sequence reserved at
+    /// the file's start, so a recovered resend is the same body.
+    #[tokio::test]
+    async fn a_live_completion_with_an_entry_uses_its_reserved_sequence() {
+        let scratch = crate::recording_outbox::tests::Scratch::new("reserved");
+        let outbox = Arc::new(Outbox::open(&scratch.0).expect("outbox"));
+        let scope = crate::publish_observer::fixture_scope("a", 1, 11, 3);
+        let (callbacks, mut queue) = crate::callback::test_queue(scope.clone(), 8);
+        let callbacks = callbacks.with_outbox(outbox.clone());
+        let (tracks, parts) = fixture_parts();
+        let mut recorder = Recorder::start(&scratch.0, &scope.key().path, callbacks.clone(), 0);
+        recorder.feed(tracks, parts);
+        // Telemetry after the file's start takes later sequences.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while outbox.list(10).expect("list").0.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("entry written");
+        callbacks.send(&scope.key().path, StreamEvent::Unpublish);
+        drop(recorder);
+        let mut completion = None;
+        let mut unpublish = None;
+        for _ in 0..2 {
+            let queued = tokio::time::timeout(Duration::from_secs(3), queue.recv())
+                .await
+                .expect("deadline")
+                .expect("event");
+            let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
+            if body["event"] == "recordSegmentComplete" {
+                completion = Some(body);
+            } else {
+                unpublish = Some(body);
+            }
+        }
+        let (completion, unpublish) = (
+            completion.expect("completion"),
+            unpublish.expect("unpublish"),
+        );
+        assert_eq!(
+            completion["eventSequence"], 1,
+            "reserved at the file's start"
+        );
+        assert_eq!(
+            unpublish["eventSequence"], 2,
+            "no gap: live sequences go on"
+        );
+        let (names, _) = outbox.list(10).expect("list");
+        let stored = outbox.read(&names[0]).expect("entry").0;
+        assert_eq!(stored.scoped.expect("scoped").event_sequence, 1);
     }
 }

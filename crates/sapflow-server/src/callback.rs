@@ -26,6 +26,37 @@ const QUEUE: usize = 512;
 const MAX_BODY: usize = 16 * 1024;
 /// Connect, send and read the answer's head, per attempt.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A recovered `recordSegmentComplete`'s attempt. v4v copies and hashes the
+/// whole file before it answers: a four-hour show at its top recommended
+/// bitrate (4,000 kbit/s, about 2 GB an hour) is 8 GB, which storage copying
+/// at 20 MB/s takes about seven minutes over. Ten minutes covers that with a
+/// margin. It holds only the recovered lane, never live callbacks.
+pub(crate) const RECOVERED_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Queued recovered completions: recovery sends one at a time.
+const RECOVERED_QUEUE: usize = 4;
+/// The longest wait a `Retry-After` or `retryAfterMs` hint can ask for.
+const MAX_RETRY_HINT: Duration = Duration::from_secs(60);
+/// How much of a 408, 429 or 503 body is read, for its `retryAfterMs`.
+const MAX_HINT_BODY: usize = 1024;
+
+/// How one sender sends: its attempts per event and each attempt's limit.
+#[derive(Debug, Clone, Copy)]
+struct Lane {
+    attempts: u32,
+    attempt_timeout: Duration,
+}
+
+/// Live events: four attempts of five seconds.
+const LIVE: Lane = Lane {
+    attempts: 4,
+    attempt_timeout: ATTEMPT_TIMEOUT,
+};
+/// Recovered completions: their own sender, so a slow import never holds up
+/// a live `publish`, and two long attempts; recovery's rounds retry beyond.
+const RECOVERED: Lane = Lane {
+    attempts: 2,
+    attempt_timeout: RECOVERED_ATTEMPT_TIMEOUT,
+};
 /// Interim `1xx` answers skipped before a final one; more is a broken peer.
 const MAX_INTERIM: usize = 4;
 
@@ -73,6 +104,10 @@ impl Drop for Pending {
 #[derive(Clone)]
 pub struct Callbacks {
     tx: Option<mpsc::Sender<Queued>>,
+    /// The recovered lane ([`RECOVERED`]); its events are not waited for at
+    /// a stop, since what it has not delivered stays owed.
+    recovered_tx: Option<mpsc::Sender<Queued>>,
+    recovered_pending: Arc<watch::Sender<usize>>,
     scope: Option<Arc<CallbackScope>>,
     recording: Option<RecordingObservation>,
     /// Events queued and not yet done with, shared by every clone.
@@ -88,13 +123,19 @@ impl Callbacks {
             return Self::with_queue(None);
         };
         let (tx, rx) = mpsc::channel(QUEUE);
-        tokio::spawn(run(url, secret, rx));
-        Self::with_queue(Some(tx))
+        let (recovered_tx, recovered_rx) = mpsc::channel(RECOVERED_QUEUE);
+        tokio::spawn(run(url.clone(), secret.clone(), rx, LIVE));
+        tokio::spawn(run(url, secret, recovered_rx, RECOVERED));
+        let mut callbacks = Self::with_queue(Some(tx));
+        callbacks.recovered_tx = Some(recovered_tx);
+        callbacks
     }
 
     fn with_queue(tx: Option<mpsc::Sender<Queued>>) -> Self {
         Self {
             tx,
+            recovered_tx: None,
+            recovered_pending: Arc::new(watch::Sender::new(0)),
             scope: None,
             recording: None,
             pending: Arc::new(watch::Sender::new(0)),
@@ -115,11 +156,12 @@ impl Callbacks {
         self.outbox.as_ref()
     }
 
-    /// The identity a recovered completion of the recording `recording_id`
-    /// would carry: none for the legacy contract (`Some(None)`). A scoped
-    /// one reserves its own sequence now, since after a restart there is no
-    /// connection to take one from; live sequences skip it. None if the
-    /// sequence is exhausted.
+    /// The identity the completion of the recording `recording_id` carries,
+    /// live or recovered: none for the legacy contract (`Some(None)`). A
+    /// scoped one reserves the completion's sequence now, since after a
+    /// restart there is no connection to take one from; the live completion
+    /// uses the same one, so a resend is the same body. None if the sequence
+    /// is exhausted.
     pub(crate) fn recovery_identity(&self, recording_id: &str) -> Option<Option<ScopedIdentity>> {
         let Some(scope) = &self.scope else {
             return Some(None);
@@ -136,6 +178,8 @@ impl Callbacks {
     pub fn scoped(&self, scope: Arc<CallbackScope>) -> Self {
         Self {
             tx: self.tx.clone(),
+            recovered_tx: self.recovered_tx.clone(),
+            recovered_pending: self.recovered_pending.clone(),
             scope: Some(scope),
             recording: None,
             pending: self.pending.clone(),
@@ -167,7 +211,7 @@ impl Callbacks {
     }
 
     pub fn send(&self, path: &StreamPath, event: StreamEvent) {
-        self.send_inner(path, event, None, None);
+        self.send_inner(path, event, None);
     }
 
     /// Freeze the writer's synchronised result into both callback contracts.
@@ -178,20 +222,54 @@ impl Callbacks {
         event: StreamEvent,
         complete: bool,
         reason: Option<&str>,
-        entry: Option<OutboxEntry>,
     ) {
-        self.send_inner(path, event, Some((complete, reason)), entry);
+        self.send_inner(path, event, Some((complete, reason)));
+    }
+
+    /// The body of a recording's completion that has an outbox entry, with
+    /// the sequence its recording reserved, decided before the entry is
+    /// rewritten: [`enqueue_recording`](Self::enqueue_recording) then sends
+    /// it. None, with the callback counted failed, if it is refused, which
+    /// is for good: the caller removes the entry.
+    pub(crate) fn recording_body(
+        &self,
+        path: &StreamPath,
+        event: &StreamEvent,
+        complete: bool,
+        reason: Option<&str>,
+        sequence: Option<u64>,
+    ) -> Option<Bytes> {
+        tracing::info!(path = %path.as_path(), event = event.name(), "stream event");
+        let body = self.tx.as_ref().and_then(|_| {
+            let _order = self.scope.as_ref().map(|scope| scope.event_lock());
+            self.completion(path, event, complete, reason, sequence)
+        });
+        if body.is_none() {
+            if let Some(scope) = &self.scope {
+                scope.observations.callback_failed();
+            }
+            tracing::warn!(event = event.name(), "callback body refused");
+        }
+        body
+    }
+
+    /// Queues what [`recording_body`](Self::recording_body) decided, with
+    /// its entry, removed on delivery.
+    pub(crate) fn enqueue_recording(&self, path: &StreamPath, body: Bytes, entry: OutboxEntry) {
+        let _order = self.scope.as_ref().map(|scope| scope.event_lock());
+        self.enqueue(path, "recordSegmentComplete", body, false, Some(entry));
     }
 
     /// Queues a completion recovered at start ([`crate::recording_recovery`]),
-    /// its body as [`completion_body`] made it. None if the queue refused it.
+    /// its body as [`completion_body`] made it, on the recovered lane. None
+    /// if the lane refused it.
     pub(crate) fn send_recovered(
         &self,
         path: &StreamPath,
         body: Bytes,
         entry: OutboxEntry,
     ) -> Option<oneshot::Receiver<Delivery>> {
-        let tx = self.tx.as_ref()?;
+        let tx = self.recovered_tx.as_ref()?;
         let (done, outcome) = oneshot::channel();
         tracing::info!(path = %path.as_path(), file = entry.file(), "recovered recording event");
         tx.try_send(Queued {
@@ -201,7 +279,7 @@ impl Callbacks {
             ticket: None,
             entry: Some(entry),
             done: Some(done),
-            _pending: Pending::new(&self.pending),
+            _pending: Pending::new(&self.recovered_pending),
         })
         .ok()?;
         Some(outcome)
@@ -212,43 +290,69 @@ impl Callbacks {
         path: &StreamPath,
         event: StreamEvent,
         completion: Option<(bool, Option<&str>)>,
-        entry: Option<OutboxEntry>,
     ) {
         tracing::info!(path = %path.as_path(), event = event.name(), "stream event");
         // Allocation, sequencing and enqueue are serialised per immutable
-        // scope. Concurrent recorder/health tasks cannot enqueue sequence N+1
-        // ahead of N. No network or disk operation runs under this lock.
+        // scope: concurrent recorder/health tasks cannot enqueue sequence N+1
+        // ahead of N. A recording's completion with an outbox entry is the
+        // exception: it carries the sequence its recording reserved when the
+        // file was created, so it can be below telemetry already delivered;
+        // receivers must never fence recordings by sequence. No network or
+        // disk operation runs under this lock.
         let _order = self.scope.as_ref().map(|scope| scope.event_lock());
         let health = matches!(event, StreamEvent::Health(_));
-        let Some(tx) = &self.tx else {
+        if self.tx.is_none() {
             if let Some(scope) = &self.scope
                 && scope.observations.callbacks_enabled()
             {
                 scope.observations.callback_failed();
             }
             return;
+        }
+        let body = match completion {
+            None => self.body(path, &event, None).map(Bytes::from),
+            Some((complete, reason)) => self.completion(path, &event, complete, reason, None),
         };
-        let body = self.body(path, &event).and_then(|body| {
-            let Some((complete, reason)) = completion else {
-                return Some(body);
-            };
-            if !matches!(event, StreamEvent::RecordSegmentComplete { .. }) {
-                return None;
-            }
-            let mut body: serde_json::Value = serde_json::from_str(&body).ok()?;
-            completion_fields(body.as_object_mut()?, complete, reason)?;
-            let body = serde_json::to_string(&body).ok()?;
-            (body.len() <= MAX_BODY).then_some(body)
-        });
         let Some(body) = body else {
             if let Some(scope) = &self.scope {
                 scope.observations.callback_failed();
             }
-            // Refused here, it is refused for good: nothing is owed later.
-            if let Some(entry) = entry {
-                entry.remove_soon();
-            }
             tracing::warn!(event = event.name(), "callback body refused");
+            return;
+        };
+        self.enqueue(path, event.name(), body, health, None);
+    }
+
+    /// A completion's body: the event's, with the writer's integrity.
+    fn completion(
+        &self,
+        path: &StreamPath,
+        event: &StreamEvent,
+        complete: bool,
+        reason: Option<&str>,
+        sequence: Option<u64>,
+    ) -> Option<Bytes> {
+        if !matches!(event, StreamEvent::RecordSegmentComplete { .. }) {
+            return None;
+        }
+        let body = self.body(path, event, sequence)?;
+        let mut body: serde_json::Value = serde_json::from_str(&body).ok()?;
+        completion_fields(body.as_object_mut()?, complete, reason)?;
+        let body = serde_json::to_string(&body).ok()?;
+        (body.len() <= MAX_BODY).then(|| Bytes::from(body))
+    }
+
+    /// Queues a decided body on the live lane. The caller holds the scope's
+    /// event lock.
+    fn enqueue(
+        &self,
+        path: &StreamPath,
+        name: &'static str,
+        body: Bytes,
+        health: bool,
+        entry: Option<OutboxEntry>,
+    ) {
+        let Some(tx) = &self.tx else {
             return;
         };
         let ticket = self
@@ -257,8 +361,8 @@ impl Callbacks {
             .map(|scope| scope.observations.callback_ticket());
         let queued = Queued {
             path: path.clone(),
-            name: event.name(),
-            body: Bytes::from(body),
+            name,
+            body,
             ticket,
             entry,
             done: None,
@@ -277,7 +381,7 @@ impl Callbacks {
                 }
             }
             tracing::warn!(
-                event = event.name(),
+                event = name,
                 health_dropped = health && !unavailable,
                 unavailable,
                 "callback queue full or unavailable"
@@ -285,7 +389,14 @@ impl Callbacks {
         }
     }
 
-    fn body(&self, path: &StreamPath, event: &StreamEvent) -> Option<String> {
+    /// The event's body; a scoped one takes the next sequence, or
+    /// `sequence` if given (a recording's reserved one).
+    fn body(
+        &self,
+        path: &StreamPath,
+        event: &StreamEvent,
+        sequence: Option<u64>,
+    ) -> Option<String> {
         let legacy = event.callback_body(path);
         if legacy.len() > MAX_BODY {
             return None;
@@ -296,7 +407,10 @@ impl Callbacks {
         if scope.key().path != *path {
             return None;
         }
-        let sequence = scope.next_sequence()?;
+        let sequence = match sequence {
+            Some(sequence) => sequence,
+            None => scope.next_sequence()?,
+        };
         let mut body: serde_json::Value = serde_json::from_str(&legacy).ok()?;
         let object = body.as_object_mut()?;
         scoped_fields(
@@ -462,16 +576,42 @@ pub(crate) enum HeaderRead {
     Repeated,
 }
 
-/// One `POST`, then the answer's status, and with `want` the value of that
-/// header if the answer is 2xx. The connection is plain HTTP/1.1 and used once
-/// (`connection: close`). Only the status line and headers are read, within
-/// `MAX_HEAD`; the body is never read. A redirect is a status like any other:
-/// the `location` is never followed.
+/// Statuses that ask a client to come back later: failures, retried, not
+/// refusals.
+fn is_retry_later(status: u16) -> bool {
+    matches!(status, 408 | 429 | 503)
+}
+
+/// How long a 408, 429 or 503 asks to wait: `Retry-After` in seconds, or
+/// else the JSON body's `retryAfterMs` (v4v's rate limiter sends that).
+fn retry_hint(head: &[u8], body: &[u8]) -> Option<Duration> {
+    if let http_lite::ResponseHeader::One(value) = http_lite::response_header(head, "retry-after")
+        && let Ok(text) = std::str::from_utf8(value)
+        && let text = text.trim()
+        && (1..=10).contains(&text.len())
+        && text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return text.parse().ok().map(Duration::from_secs);
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("retryAfterMs")?
+        .as_u64()
+        .map(Duration::from_millis)
+}
+
+/// One `POST`, then the answer's status, with `want` the value of that
+/// header if the answer is 2xx, and a 408, 429 or 503's retry hint. The
+/// connection is plain HTTP/1.1 and used once (`connection: close`). Only
+/// the status line and headers are read, within `MAX_HEAD`, and of a 408,
+/// 429 or 503 at most [`MAX_HINT_BODY`] bytes of its body; other bodies are
+/// never read. A redirect is a status like any other: the `location` is
+/// never followed.
 async fn post(
     endpoint: &Endpoint,
     body: &[u8],
     want: Option<&str>,
-) -> std::io::Result<(u16, HeaderRead)> {
+) -> std::io::Result<(u16, HeaderRead, Option<Duration>)> {
     let mut socket = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
     // A receiver may answer, and close, before it has read the whole body.
     // Keep a write error to report only if no answer arrives.
@@ -511,7 +651,19 @@ async fn post(
                     }
                     _ => HeaderRead::Absent,
                 };
-                return Ok((status, header));
+                if !is_retry_later(status) {
+                    return Ok((status, header, None));
+                }
+                let mut rest = buf[used..].to_vec();
+                while rest.len() < MAX_HINT_BODY {
+                    let mut chunk = [0u8; 512];
+                    let room = (MAX_HINT_BODY - rest.len()).min(chunk.len());
+                    match socket.read(&mut chunk[..room]).await {
+                        Ok(n) if n > 0 => rest.extend_from_slice(&chunk[..n]),
+                        _ => break,
+                    }
+                }
+                return Ok((status, header, retry_hint(&buf[..used], &rest)));
             }
             ParsedResponse::Malformed => return Err(std::io::ErrorKind::InvalidData.into()),
             ParsedResponse::Partial => {}
@@ -537,9 +689,22 @@ pub(crate) async fn attempt(
     body: &[u8],
     limit: Duration,
 ) -> Result<u16, Failure> {
-    attempt_reading(endpoint, body, limit, None)
+    attempt_hinted(endpoint, body, limit)
         .await
         .map(|(status, _)| status)
+}
+
+/// [`attempt`], also giving a 408, 429 or 503's retry hint.
+async fn attempt_hinted(
+    endpoint: &Endpoint,
+    body: &[u8],
+    limit: Duration,
+) -> Result<(u16, Option<Duration>), Failure> {
+    match tokio::time::timeout(limit, post(endpoint, body, None)).await {
+        Ok(Ok((status, _, hint))) => Ok((status, hint)),
+        Ok(Err(_)) => Err(Failure::Transport),
+        Err(_) => Err(Failure::Timeout),
+    }
 }
 
 /// [`attempt`], also reading the header `want` of a 2xx answer.
@@ -550,13 +715,13 @@ pub(crate) async fn attempt_reading(
     want: Option<&str>,
 ) -> Result<(u16, HeaderRead), Failure> {
     match tokio::time::timeout(limit, post(endpoint, body, want)).await {
-        Ok(Ok(answer)) => Ok(answer),
+        Ok(Ok((status, header, _))) => Ok((status, header)),
         Ok(Err(_)) => Err(Failure::Transport),
         Err(_) => Err(Failure::Timeout),
     }
 }
 
-async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Queued>) {
+async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Queued>, lane: Lane) {
     while let Some(mut queued) = rx.recv().await {
         let url = callback_url(&template, &queued.path, secret.as_deref());
         let mut delay = Duration::from_millis(500);
@@ -564,20 +729,33 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
         let mut refused = false;
         // The URL carries the secret: it is parsed here and never logged.
         if let Some(endpoint) = Endpoint::parse(&url) {
-            for attempt_number in 1..=4 {
-                match attempt(&endpoint, &queued.body, ATTEMPT_TIMEOUT).await {
-                    Ok(status) if (200..300).contains(&status) => {
+            for attempt_number in 1..=lane.attempts {
+                let mut hint = None;
+                match attempt_hinted(&endpoint, &queued.body, lane.attempt_timeout).await {
+                    Ok((status, _)) if (200..300).contains(&status) => {
                         delivered = true;
                         tracing::debug!(event = queued.name, "callback delivered");
                         break;
                     }
-                    Ok(status) if (400..500).contains(&status) => {
+                    Ok((status, retry)) if is_retry_later(status) => {
+                        // Busy or rate-limited, not a refusal: come back
+                        // when asked, within reason.
+                        hint = retry;
+                        tracing::warn!(
+                            event = queued.name,
+                            status,
+                            attempt = attempt_number,
+                            retry_after_ms = retry.map(|d| d.as_millis() as u64),
+                            "callback deferred"
+                        );
+                    }
+                    Ok((status, _)) if (400..500).contains(&status) => {
                         // v4v refused it (wrong token or path): retrying won't help.
                         tracing::warn!(event = queued.name, status, "callback refused");
                         refused = true;
                         break;
                     }
-                    Ok(status) => {
+                    Ok((status, _)) => {
                         tracing::warn!(
                             event = queued.name,
                             status,
@@ -600,8 +778,9 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
                         );
                     }
                 }
-                if attempt_number < 4 {
-                    tokio::time::sleep(delay).await;
+                if attempt_number < lane.attempts {
+                    let wait = hint.map_or(delay, |hint| hint.min(MAX_RETRY_HINT).max(delay));
+                    tokio::time::sleep(wait).await;
                     delay *= 2;
                 }
             }
@@ -684,7 +863,6 @@ mod tests {
                     completion(),
                     complete,
                     (!complete).then_some("ingest-discarded-packets"),
-                    None,
                 );
                 let queued = rx.try_recv().expect("synchronised completion");
                 let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
@@ -720,10 +898,10 @@ mod tests {
         let (callbacks, observation) = callbacks.for_recording().expect("writer");
         let observation = observation.expect("scoped");
         observation.active();
-        callbacks.send_recording(&scope.key().path, completion(), true, None, None);
+        callbacks.send_recording(&scope.key().path, completion(), true, None);
         assert!(rx.try_recv().is_err());
         observation.synced_incomplete();
-        callbacks.send_recording(&scope.key().path, completion(), true, None, None);
+        callbacks.send_recording(&scope.key().path, completion(), true, None);
         assert!(rx.try_recv().is_err());
     }
 
@@ -903,13 +1081,13 @@ mod tests {
         assert_eq!(scope.observations.callback_state(), "failed");
         let legacy = Callbacks::with_queue(None);
         let body = legacy
-            .body(&scope.key().path, &StreamEvent::Publish)
+            .body(&scope.key().path, &StreamEvent::Publish, None)
             .expect("legacy");
         assert_eq!(body, StreamEvent::Publish.callback_body(&scope.key().path));
         assert!(!body.contains("sessionId"));
         let completion = completion();
         let body = legacy
-            .body(&scope.key().path, &completion)
+            .body(&scope.key().path, &completion, None)
             .expect("legacy completion");
         assert_eq!(body, completion.callback_body(&scope.key().path));
         assert_eq!(
@@ -924,7 +1102,8 @@ mod tests {
                         segment_path: "x".repeat(MAX_BODY),
                         duration_secs: 1.0,
                         recording_tracks: sapflow_core::RecordingTracks::AudioVideo,
-                    }
+                    },
+                    None,
                 )
                 .is_none()
         );
@@ -1323,5 +1502,66 @@ mod tests {
             attempt(&receiver.endpoint(), b"{}", Duration::from_secs(2)).await,
             Err(Failure::Transport)
         );
+    }
+
+    #[test]
+    fn a_retry_hint_comes_from_retry_after_or_v4v_s_retry_after_ms() {
+        let head = |header: Option<&str>| {
+            let mut head = b"HTTP/1.1 429 Too Many Requests\r\n".to_vec();
+            if let Some(value) = header {
+                head.extend_from_slice(format!("retry-after: {value}\r\n").as_bytes());
+            }
+            head.extend_from_slice(b"\r\n");
+            head
+        };
+        let body = br#"{"ok":false,"error":"Rate limit exceeded.","retryAfterMs":1500}"#;
+        assert_eq!(
+            retry_hint(&head(Some("3")), body),
+            Some(Duration::from_secs(3)),
+            "the header first"
+        );
+        assert_eq!(
+            retry_hint(&head(None), body),
+            Some(Duration::from_millis(1500))
+        );
+        // An HTTP-date, or nonsense, falls back to the body, then to nothing.
+        assert_eq!(
+            retry_hint(&head(Some("Wed, 21 Oct 2026 07:28:00 GMT")), body),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(retry_hint(&head(Some("-1")), b"not json"), None);
+        assert_eq!(retry_hint(&head(None), br#"{"retryAfterMs":"soon"}"#), None);
+        assert!(is_retry_later(408) && is_retry_later(429) && is_retry_later(503));
+        assert!(!is_retry_later(401) && !is_retry_later(404) && !is_retry_later(409));
+    }
+
+    #[tokio::test]
+    async fn busy_and_rate_limited_answers_are_retried_when_asked_not_refused() {
+        // v4v's limiter: 429 with retryAfterMs in its JSON body; then a 408
+        // with Retry-After; then the delivery.
+        let receiver = Receiver::start(|hit| {
+            Some(match hit {
+                0 => http_lite::response(
+                    429,
+                    &[("content-type", "application/json")],
+                    br#"{"ok":false,"error":"Rate limit exceeded.","retryAfterMs":1500}"#,
+                ),
+                1 => http_lite::response(408, &[("retry-after", "2")], b""),
+                _ => http_lite::response(204, &[], b""),
+            })
+        })
+        .await;
+        let scope = fixture_scope("a", 1, 1, 1);
+        let callbacks = Callbacks::start(Some(receiver.url()), None).scoped(scope.clone());
+        let started = std::time::Instant::now();
+        callbacks.send(&scope.key().path, StreamEvent::Publish);
+        state_is(&scope, "delivered", Duration::from_secs(8)).await;
+        assert_eq!(receiver.count(), 3);
+        // Its own backoff alone would wait 0.5 s then 1 s; the hints ask
+        // for 1.5 s then 2 s.
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(3_400), "{waited:?}");
+        assert_eq!(scope.observations.counts().callbacks_delivered, 1);
+        assert_eq!(scope.observations.counts().callbacks_failed, 0);
     }
 }

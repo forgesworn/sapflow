@@ -11,6 +11,7 @@
 //! 2. Once the file is finalised and synced, and before its callback is
 //!    queued, the writer rewrites the entry with the outcome the callback
 //!    carries (`finished`: its state, reason and duration).
+//!    The body is decided first: a refused one removes the entry instead.
 //! 3. The callback sender removes the entry once the app has answered 2xx.
 //!    A refusal, failed retries, a full queue or a stop before delivery leave
 //!    it for the next start (whose recovery also retries failures while it
@@ -89,9 +90,10 @@ pub struct ScopedIdentity {
     pub session_id: String,
     pub connection_epoch: u64,
     /// Reserved from the connection's sequence when the file was created,
-    /// for a completion sent after a restart; a completion sent live takes
-    /// its own sequence then. Lower than later live events, so a recovered
-    /// completion is matched by `recordingId`, never fenced by sequence.
+    /// since after a restart there is no connection to take one from. The
+    /// live completion uses it too, so a resend is the same body. It can be
+    /// below telemetry already sent: completions are matched by
+    /// `recordingId`, never fenced by sequence.
     pub event_sequence: u64,
     pub recording_id: String,
 }
@@ -262,6 +264,8 @@ pub struct Outbox {
     _lock: File,
     #[cfg(test)]
     pub(crate) fail_writes: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_directory_sync: std::sync::atomic::AtomicBool,
 }
 
 impl Outbox {
@@ -274,10 +278,11 @@ impl Outbox {
             fs::open(recordings, dir_flags, Mode::empty())
                 .map_err(|e| io_error("open recordings", e))?,
         );
-        match fs::mkdirat(&recordings_dir, DIRECTORY, Mode::from_raw_mode(0o700)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        let created = match fs::mkdirat(&recordings_dir, DIRECTORY, Mode::from_raw_mode(0o700)) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::EXIST) => false,
             Err(e) => return Err(io_error("create", e)),
-        }
+        };
         let directory = File::from(
             fs::openat(
                 &recordings_dir,
@@ -293,9 +298,15 @@ impl Outbox {
                 }
             })?,
         );
+        // In a setgid recordings directory Linux makes the new directory
+        // setgid too (2700). Set what was asked for; and judge only the
+        // permission bits, which say who can read and write it.
+        if created {
+            fs::fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(|e| io_error("chmod", e))?;
+        }
         let meta = directory.metadata().map_err(|e| io_error("metadata", e))?;
         if !meta.is_dir()
-            || meta.mode() & 0o7777 != 0o700
+            || meta.mode() & 0o777 != 0o700
             || meta.uid() != rustix::process::geteuid().as_raw()
         {
             return Err(OutboxError::InsecureDirectory);
@@ -328,6 +339,8 @@ impl Outbox {
             _lock: lock,
             #[cfg(test)]
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_directory_sync: std::sync::atomic::AtomicBool::new(false),
         };
         outbox.remove_stale_temporaries()?;
         Ok(outbox)
@@ -374,8 +387,10 @@ impl Outbox {
 
     /// Writes `entry` over any entry for the same file, durably: a new
     /// temporary file, synced, renamed over it, then the directory synced.
-    /// Blocks; call it off the async workers.
-    pub fn write(&self, entry: &Entry) -> io::Result<()> {
+    /// Once the rename has happened the entry is written: a failed directory
+    /// sync after it returns `Ok(false)`, written but perhaps not durable,
+    /// never an error. Blocks; call it off the async workers.
+    pub fn write(&self, entry: &Entry) -> io::Result<bool> {
         #[cfg(test)]
         if self.fail_writes.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(io::Error::other("test fault"));
@@ -410,7 +425,14 @@ impl Outbox {
             let _ = fs::unlinkat(&self.directory, &temporary, AtFlags::empty());
             return Err(error);
         }
-        self.directory.sync_all()
+        #[cfg(test)]
+        if self
+            .fail_directory_sync
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+        Ok(self.directory.sync_all().is_ok())
     }
 
     /// Removes the entry for `file`, if there is one. Not synced: should the
@@ -569,10 +591,21 @@ impl OutboxEntry {
         Self { outbox, entry }
     }
 
-    /// Writes the entry, `open`: before the writer writes its file.
-    pub async fn open(outbox: Arc<Outbox>, entry: Entry) -> Option<Self> {
+    /// Writes the entry, `open`: before the writer writes its file. The
+    /// handle comes back whatever the write did, so that the outcome is
+    /// still written after a transient failure, and delivery or a decided
+    /// failure still removes an entry the write did leave (removing a
+    /// missing one is harmless).
+    pub async fn open(outbox: Arc<Outbox>, entry: Entry) -> Self {
         let this = Self { outbox, entry };
-        this.store().await.then_some(this)
+        this.store().await;
+        this
+    }
+
+    /// The sequence a scoped completion reserved, which its live callback
+    /// uses too.
+    pub fn reserved_sequence(&self) -> Option<u64> {
+        self.entry.scoped.as_ref().map(|s| s.event_sequence)
     }
 
     async fn store(&self) -> bool {
@@ -580,7 +613,14 @@ impl OutboxEntry {
         let entry = self.entry.clone();
         let file = entry.file.clone();
         match tokio::task::spawn_blocking(move || outbox.write(&entry)).await {
-            Ok(Ok(())) => true,
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => {
+                tracing::warn!(
+                    file,
+                    "recording outbox entry written but its directory not synced; a power cut now could lose it"
+                );
+                true
+            }
             result => {
                 let error = match result {
                     Ok(Err(error)) => error.to_string(),
@@ -617,13 +657,6 @@ impl OutboxEntry {
                 file = self.entry.file,
                 "recording outbox entry not removed; its callback may be sent again at the next start"
             );
-        }
-    }
-
-    /// [`remove`](Self::remove) from synchronous code, without waiting.
-    pub fn remove_soon(self) {
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(self.remove());
         }
     }
 
@@ -865,5 +898,100 @@ pub(crate) mod tests {
         assert!(!junk.exists());
         // The recordings themselves are never touched by the outbox.
         assert!(event.join("100.mp4").exists() && event.join("200.mp4").exists());
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::tests::{Scratch, legacy};
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn a_setgid_recordings_directory_does_not_turn_recovery_off() {
+        // Linux makes a directory created in a setgid one setgid too: 2700.
+        // macOS does not, so the bit is set by hand where it can be.
+        let scratch = Scratch::new("setgid");
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o2755))
+            .expect("setgid recordings");
+        let outbox = Outbox::open(&scratch.0).expect("opens in a setgid directory");
+        let dir = scratch.0.join(DIRECTORY);
+        assert_eq!(mode(&dir) & 0o777, 0o700);
+        drop(outbox);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2700))
+            .expect("setgid outbox");
+        if mode(&dir) & 0o2000 != 0 {
+            let _outbox = Outbox::open(&scratch.0).expect("a 2700 outbox is still private");
+        } else {
+            eprintln!(
+                "this filesystem would not set the setgid bit; the 2700 case is untested here"
+            );
+        }
+        // Group or other access is still refused.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2750)).expect("mode");
+        assert!(matches!(
+            Outbox::open(&scratch.0),
+            Err(OutboxError::InsecureDirectory)
+        ));
+    }
+
+    #[test]
+    fn a_rename_whose_directory_sync_fails_is_written_but_not_durable() {
+        let scratch = Scratch::new("dir-sync");
+        let outbox = Outbox::open(&scratch.0).expect("outbox");
+        outbox
+            .fail_directory_sync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let entry = legacy("live/event-a/100.mp4");
+        assert!(!outbox.write(&entry).expect("written"), "not durable");
+        assert_eq!(outbox.list(10).expect("list").0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_entry_handle_survives_a_failed_write_and_still_writes_and_removes() {
+        let scratch = Scratch::new("handle");
+        let outbox = Arc::new(Outbox::open(&scratch.0).expect("outbox"));
+        let names = |outbox: &Outbox| outbox.list(10).expect("list").0;
+        // The directory sync fails after the rename: the entry is there, and
+        // its handle comes back, so delivery can still remove it.
+        outbox
+            .fail_directory_sync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let handle = OutboxEntry::open(outbox.clone(), legacy("live/event-a/100.mp4")).await;
+        assert_eq!(names(&outbox).len(), 1);
+        handle.remove().await;
+        assert!(names(&outbox).is_empty());
+        // A transient failure at open: the handle still comes back, and the
+        // outcome is written once writes work again.
+        outbox
+            .fail_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut handle = OutboxEntry::open(outbox.clone(), legacy("live/event-a/200.mp4")).await;
+        assert!(names(&outbox).is_empty());
+        outbox
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let finished = Finished {
+            complete: true,
+            reason: None,
+            duration_ms: 1_000,
+        };
+        handle.finish(finished.clone()).await;
+        let listed = names(&outbox);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            outbox.read(&listed[0]).expect("entry").0.finished,
+            Some(finished)
+        );
+        handle.remove().await;
+        assert!(names(&outbox).is_empty());
     }
 }
