@@ -280,10 +280,58 @@ With recording off, no `recordSegmentComplete` follows.
 
 sapflow waits up to 7.5 s for its files and callbacks, then exits, inside
 Docker's default 10 s stop timeout. A file still being written or a callback
-still unsent by then (one being retried while v4v is down, say) goes
-unreported, as does everything after a SIGKILL; the file stays on disk. An
-encoder that reconnects after the restart starts a new stream and a new
+still unsent by then (one being retried while v4v is down, say) is reported
+at the next start instead, as is a file a SIGKILL, an OOM kill, a crash or a
+power cut left unreported: see
+[recordings reported after a restart](#recordings-reported-after-a-restart).
+An encoder that reconnects after the restart starts a new stream and a new
 file.
+
+### Recordings reported after a restart
+
+With both `SAPFLOW_RECORDINGS` and `SAPFLOW_CALLBACK_URL` set, every
+recording's owed `recordSegmentComplete` is kept on disk until v4v answers
+it 2xx, in `.sapflow-outbox` in the recordings directory. sapflow creates
+that directory itself (owned by its user, mode 0700), so nothing needs
+setting up; the expiry of recordings never touches it, and it holds no
+callback URL or token. At each start, before it takes any encoder, sapflow
+lists what earlier runs still owed and then sends it from the background,
+while encoders connect:
+
+- A file that was finished, but whose callback was never delivered (v4v was
+  down, the stop deadline passed, the queue was full), gets the callback it
+  had: the same `recordingState`, `recordingReason`, `segmentDuration` and
+  `segmentPath`.
+- A file whose writer never finished (SIGKILL, OOM kill, crash, power cut,
+  or a stop whose deadline came first) gets `recordingState: "incomplete"`
+  with `recordingReason: "server-interrupted"` and, as `segmentDuration`,
+  the media of the file's whole fragments. The file is never rewritten,
+  truncated or copied: it plays, and v4v can copy it, as it is; a player
+  stops at its partial last fragment, if it has one, and may show a few more
+  frames from it than `segmentDuration` counts. Its header gives no total
+  duration (the writer writes that only when it finishes). A file with no
+  whole fragment is not reported.
+- A file that has gone, or is older than `SAPFLOW_RECORD_DELETE_AFTER`, is
+  not reported, and what it owed is forgotten.
+
+These callbacks go one at a time, at least a second apart (60 a minute at
+most, half of the 120 v4v takes from one address, leaving the rest to live
+stages), through the same queue as live events, each with the usual four
+attempts. One is forgotten only when v4v answers it 2xx. A failure (v4v not
+yet up after a power cut that restarted both, or answering 5xx) is tried
+again while sapflow runs, 30 s later, then at doubling waits up to every 10
+minutes, until it is delivered or expires; after three failures in a row the
+rest of that round waits too. A 4xx (a wrong token after a redeploy, say)
+is not retried in that run, but kept for the next start, so it is sent at
+each start until v4v takes it or it expires. A start sends at most 4,096,
+oldest first.
+
+A live callback that fails while sapflow keeps running (v4v down through all
+four attempts) stays owed too, but is sent only at the next start.
+
+Delivery is at least once: a callback v4v answered just before a crash, its
+record not yet removed, is sent again at the next start. v4v already treats
+the same file a second time as the same part (`kept`, `same-part`).
 
 v4v rejects a callback whose path does not match the prepared session.
 
@@ -313,9 +361,11 @@ the exact same state and reason. Reason codes include `ingest-discarded-packets`
 `epoch-unrecorded` (a codec epoch before this file was served but not
 recorded), `epoch-rate` (the encoder changed its codec configuration too
 often: codec epochs after this file, or before it, were served but not
-recorded; see `SAPFLOW_RECORDING_ROLL_*`) and `server-stopped` (sapflow
+recorded; see `SAPFLOW_RECORDING_ROLL_*`), `server-stopped` (sapflow
 was stopped while the encoder was connected; see
-[the callback](#the-callback)). A stream that changes
+[the callback](#the-callback)) and `server-interrupted` (sapflow ended
+before the file was finished, and reported it at its next start; see
+[recordings reported after a restart](#recordings-reported-after-a-restart)). A stream that changes
 configuration often can therefore end a show with a stretch that no file
 holds; the files on either side of it say so. A file keeps only its first
 reason, so the file before such a stretch can read another code (say

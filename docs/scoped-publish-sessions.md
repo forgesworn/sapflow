@@ -291,7 +291,23 @@ consumers must recognise the scoped suffix before inferring a replay start.
 The bounded callback queue retains completion failures in status. Only a real
 successful HTTP response records delivery. A dropped queue entry, exhausted
 retry, recorder failure or uncertain restart cannot silently become success.
-These are runtime receipts, not a transactional outbox surviving process restart.
+These are runtime receipts: after a restart the session's status still says
+`failed` or `incomplete`, as before.
+
+Separately, with recording and a callback URL, each recording's owed completion
+survives a restart in the recording outbox and is sent at the next start
+([recordings reported after a restart](v4v-contract.md#recordings-reported-after-a-restart)).
+A scoped recovered completion carries the recording's own identity:
+`eventId`, `eventGeneration`, `sessionId`, `connectionEpoch`, `recordingId`
+and `recordingTracks`, as its live completion would. Its `eventSequence` is
+one the recording reserved from its connection's sequence when its file was
+created, since after a restart there is no connection to take one from. So
+live sequences skip one number for each scoped recording, and a recovered
+completion's sequence is lower than events the receiver has already seen
+from that epoch. Match a recovered completion by `recordingId`, as any
+completion from an older epoch is, and never fence it by sequence. A
+completion that was finished before the restart keeps its state and reason;
+one whose writer never finished is `incomplete` with `server-interrupted`.
 
 The V4V connector supports explicit acknowledgement to abandon automatic
 recording adoption after a terminal incomplete/failed receipt. It rechecks fresh

@@ -20,6 +20,13 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-hls
 
+- `fmp4::recorded_prefix` reads a recording file as the recorder writes
+  it and returns its decodable prefix: the whole `moof` + `mdat` fragments
+  and where their media ends, by the writer's own rule. It reads only box
+  headers and `moof` boxes, and stops at a partial fragment, a zero-filled
+  tail or anything that is not one of ours. The `moof` parsing is shared
+  with `rebase_part_for_file`, unchanged in behaviour. Fuzzed by the new
+  `recorded_prefix` target.
 - `RuleCheck::default()` now enforces the live window (RFC 8216bis 6.2.2's
   segment rule), so it rejects some renders that rc.1 accepted. It also
   accepts short `INDEPENDENT=YES` parts in a segment whose every part is
@@ -162,9 +169,31 @@ Notes for the release after 0.2.0-rc.1.
   SIGTERM or ctrl-c exits at once. A live stage gets `unpublish` and a file marked `incomplete` with
   the new reason `server-stopped`; a stage held for a reconnect ends as at
   the end of its grace. The runtime then has half a second for blocking
-  file work, so the exit fits Docker's default 10 s. A SIGKILL, or a file
-  or callback not finished by the deadline, is still unreported; finding
-  such files at startup is not built.
+  file work, so the exit fits Docker's default 10 s. A file or callback
+  not finished by the deadline is reported at the next start (below).
+
+- A recording the app never heard about (its writer killed by a SIGKILL,
+  an OOM kill, a crash or a power cut, or still writing at the stop
+  deadline, or its callback not delivered because v4v was down or the queue
+  was full) was lost to the app, the gig's replay with it, though the file
+  was on disk. With `SAPFLOW_RECORDINGS` and `SAPFLOW_CALLBACK_URL` set,
+  each recording's owed `recordSegmentComplete` is now kept in
+  `.sapflow-outbox` in the recordings directory, from before its file is
+  written until v4v answers 2xx, and sent at the next start. A finished
+  file gets the callback it had; one whose writer never finished gets
+  `recordingState: "incomplete"`, the new reason `server-interrupted`, and
+  the duration of its whole fragments. Files are never rewritten; gone or
+  expired ones are not reported. The reports go from the background while
+  encoders connect, one at a time and at least a second apart; a failure
+  is retried in later rounds (30 s, doubling to 10 minutes) until delivered
+  or expired, and a 4xx keeps the report for the next start. A live
+  callback that fails while sapflow runs is sent at the next start. sapflow creates the directory (0700) itself, so no setup is
+  needed; if it cannot be used, sapflow logs an error and records as before.
+  A scoped recording reserves one `eventSequence` when its file is created,
+  for a recovered completion, so live sequences skip one per recording. See
+  the [v4v contract](../v4v-contract.md#recordings-reported-after-a-restart).
+  v4v's reason messages do not yet name `server-interrupted`; it shows its
+  generic recording-fault note until they do.
 
 - A recording refused its first part, for want of a writer or byte budget,
   stopped before it had a file, so its codec epoch was served and then lost
