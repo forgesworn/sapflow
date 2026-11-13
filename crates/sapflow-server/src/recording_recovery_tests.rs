@@ -44,9 +44,14 @@ impl Receiver {
     async fn start(
         answer: impl Fn(usize, &serde_json::Value) -> Option<u16> + Send + Sync + 'static,
     ) -> Self {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("listener");
+        Self::start_on((std::net::Ipv4Addr::LOCALHOST, 0).into(), answer).await
+    }
+
+    async fn start_on(
+        addr: std::net::SocketAddr,
+        answer: impl Fn(usize, &serde_json::Value) -> Option<u16> + Send + Sync + 'static,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind(addr).await.expect("listener");
         let addr = listener.local_addr().expect("addr");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let answer = Arc::new(answer);
@@ -777,7 +782,12 @@ fn a_receiver_that_keeps_failing_is_asked_a_bounded_number_of_times_a_run() {
         // A slow importer, say, timing out every time: each attempt makes
         // it copy the file again.
         let receiver = Receiver::start(|_, _| Some(503)).await;
-        let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
+        let summary = tokio::time::timeout(
+            Duration::from_secs(30),
+            restart(&dir, &receiver, Duration::from_millis(10)),
+        )
+        .await
+        .expect("bounded: the run ends rather than retrying for ever");
         assert_eq!(
             (summary.retry_rounds, summary.deferred, summary.delivered),
             (recording_recovery::RETRY_ROUNDS, 2, 0),
@@ -790,6 +800,48 @@ fn a_receiver_that_keeps_failing_is_asked_a_bounded_number_of_times_a_run() {
         );
     });
     assert_eq!(entries(&dir).len(), 2, "kept for the next start");
+}
+
+#[test]
+fn an_app_that_refuses_connections_past_the_capped_rounds_still_gets_every_report() {
+    let scratch = Scratch::new("unreachable");
+    let dir = scratch.0.clone();
+    pending_files(&dir, 2);
+    block_on(async {
+        // A port nothing listens on yet: connections are refused, as while
+        // v4v is still starting after a power cut.
+        let addr = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("free port")
+            .local_addr()
+            .expect("addr");
+        let outbox = Arc::new(Outbox::open(&dir).expect("outbox"));
+        let pending = Pending::list(&outbox, MAX_PER_START);
+        let callbacks = Callbacks::start(Some(format!("http://{addr}/callback")), None);
+        let recovery = tokio::spawn(recording_recovery::run(
+            outbox,
+            pending,
+            callbacks,
+            WEEK,
+            pacing(Duration::from_millis(10)),
+        ));
+        // Long enough for more retry rounds than the cap on failures that
+        // reached the app: two attempts 0.5 s apart per send, two entries.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let receiver = Receiver::start_on(addr, |_, _| Some(204)).await;
+        let summary = tokio::time::timeout(Duration::from_secs(30), recovery)
+            .await
+            .expect("delivered once the app is up")
+            .expect("recovery");
+        assert_eq!((summary.delivered, summary.deferred), (2, 0), "{summary:?}");
+        assert!(
+            summary.retry_rounds > recording_recovery::RETRY_ROUNDS,
+            "{summary:?}"
+        );
+        assert_eq!(summary.failed, 0, "no failure reached the app");
+        assert!(summary.unreachable >= 2 * (recording_recovery::RETRY_ROUNDS + 1));
+        assert_eq!(receiver.completions().len(), 2);
+    });
+    assert!(entries(&dir).is_empty());
 }
 
 #[test]

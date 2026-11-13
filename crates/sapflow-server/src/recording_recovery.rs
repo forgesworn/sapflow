@@ -12,14 +12,19 @@
 //! [`INTERVAL`] apart (60 a minute at most, half of the 120 a minute v4v
 //! takes from one address, leaving the rest to live stages), and its entry is
 //! removed only once the app has answered 2xx. A refusal (4xx) leaves the
-//! entry for the next start. A failure (the app down or answering 5xx, as
-//! after a power cut that restarts it with sapflow, or answering 408, 429
-//! or 5xx) is tried again in later rounds, the first [`RETRY_FIRST`] after,
-//! doubling to [`RETRY_MAX`], at most [`RETRY_ROUNDS`] times in one run, so
-//! a receiver that keeps failing (copying the file each time) is not asked
-//! without end; then it waits for the next start. After
-//! [`STOP_AFTER_FAILURES`] failures in a row a round ends, and the entries
-//! not yet tried in it wait for the next round too.
+//! entry for the next start. A failure is tried again in later rounds, the
+//! first [`RETRY_FIRST`] after, doubling to [`RETRY_MAX`]:
+//!
+//! - one that reached the app (it answered 408, 429 or 5xx, or timed out
+//!   once connected) counts: after [`RETRY_ROUNDS`] such retries in one
+//!   run the entry waits for the next start, so a receiver that keeps
+//!   failing (copying the file each time) is not asked without end;
+//! - one that never connected (the app not yet up after a power cut that
+//!   restarted it with sapflow) does not count, and is retried, up to every
+//!   [`RETRY_MAX`], until the app comes back or the recording expires.
+//!
+//! After [`STOP_AFTER_FAILURES`] failures in a row a round ends, and the
+//! entries not yet tried in it wait for the next round too.
 //!
 //! - A `finished` entry is sent as its live callback was, or would have
 //!   been: the same state, reason, duration and, for a scoped recording,
@@ -59,8 +64,8 @@ pub const STOP_AFTER_FAILURES: usize = 3;
 pub const RETRY_FIRST: Duration = Duration::from_secs(30);
 /// The longest wait between retry rounds.
 pub const RETRY_MAX: Duration = Duration::from_secs(600);
-/// Retry rounds in one run; what is still undelivered then waits for the
-/// next start. An entry is sent at most this many times plus one per run.
+/// Retries of an entry in one run whose failure reached the app; then it
+/// waits for the next start. Failures to connect do not count.
 pub const RETRY_ROUNDS: usize = 3;
 
 /// How fast recovery goes.
@@ -130,9 +135,12 @@ pub struct Summary {
     pub dropped: usize,
     /// Entries left unsent: unreadable, or written by a newer sapflow.
     pub left: usize,
+    /// Sends whose app could not be reached at all.
+    pub unreachable: usize,
     /// Rounds that retried failed entries.
     pub retry_rounds: usize,
-    /// Entries still failing after the last round, kept for the next start.
+    /// Entries that still failed at the app after [`RETRY_ROUNDS`]
+    /// retries, kept for the next start.
     pub deferred: usize,
     /// Whether a round ended after [`STOP_AFTER_FAILURES`] failures.
     pub stopped: bool,
@@ -167,6 +175,8 @@ pub async fn run(
     let mut summary = Summary::default();
     let mut round: std::collections::VecDeque<OsString> = pending.names.into();
     let mut backoff = pacing.retry_first;
+    // Failures that reached the app, per entry, this run.
+    let mut reached: std::collections::HashMap<OsString, usize> = Default::default();
     while !round.is_empty() {
         let mut failed = Vec::new();
         let mut failures = 0;
@@ -181,9 +191,24 @@ pub async fn run(
                     summary.refused += 1;
                     failures = 0;
                 }
-                Sent::Failed => {
-                    summary.failed += 1;
-                    failed.push(name);
+                sent @ (Sent::Failed | Sent::Unreachable) => {
+                    if matches!(sent, Sent::Failed) {
+                        summary.failed += 1;
+                        let count = reached.entry(name.clone()).or_default();
+                        *count += 1;
+                        if *count > RETRY_ROUNDS {
+                            summary.deferred += 1;
+                            tracing::warn!(
+                                failures = *count,
+                                "recovered recording still not taken by the app; it waits for the next start"
+                            );
+                        } else {
+                            failed.push(name);
+                        }
+                    } else {
+                        summary.unreachable += 1;
+                        failed.push(name);
+                    }
                     failures += 1;
                     if failures >= STOP_AFTER_FAILURES && !round.is_empty() {
                         tracing::warn!(
@@ -200,15 +225,6 @@ pub async fn run(
         if failed.is_empty() {
             break;
         }
-        if summary.retry_rounds >= RETRY_ROUNDS {
-            summary.deferred = failed.len();
-            tracing::warn!(
-                entries = failed.len(),
-                rounds = summary.retry_rounds,
-                "recovered recordings still not delivered; they wait for the next start"
-            );
-            break;
-        }
         tracing::warn!(
             entries = failed.len(),
             retry_in_secs = backoff.as_secs_f64(),
@@ -223,7 +239,8 @@ pub async fn run(
         tracing::info!(
             delivered = summary.delivered,
             refused = summary.refused,
-            failed_attempts = summary.failed,
+            failed_at_app = summary.failed,
+            unreachable = summary.unreachable,
             removed = summary.dropped,
             left = summary.left,
             retry_rounds = summary.retry_rounds,
@@ -253,6 +270,7 @@ enum Sent {
     Delivered,
     Refused,
     Failed,
+    Unreachable,
 }
 
 /// Prepares and sends the entry `name`, then waits out what is left of
@@ -304,6 +322,7 @@ async fn send_one(
         Delivery::Delivered => Sent::Delivered,
         Delivery::Refused => Sent::Refused,
         Delivery::Failed => Sent::Failed,
+        Delivery::Unreachable => Sent::Unreachable,
     }
 }
 

@@ -34,28 +34,35 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RECOVERED_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Queued recovered completions: recovery sends one at a time.
 const RECOVERED_QUEUE: usize = 4;
-/// The longest wait a `Retry-After` or `retryAfterMs` hint can ask for.
-const MAX_RETRY_HINT: Duration = Duration::from_secs(60);
 /// How much of a 408, 429 or 503 body is read, for its `retryAfterMs`.
 const MAX_HINT_BODY: usize = 1024;
+/// How long that body read may take, apart from the attempt's own limit.
+const HINT_READ_TIMEOUT: Duration = Duration::from_millis(1_500);
 
-/// How one sender sends: its attempts per event and each attempt's limit.
+/// How one sender sends: its attempts per event, each attempt's limit, and
+/// the longest wait a `Retry-After` or `retryAfterMs` hint can ask for.
 #[derive(Debug, Clone, Copy)]
 struct Lane {
     attempts: u32,
     attempt_timeout: Duration,
+    max_hint: Duration,
 }
 
-/// Live events: four attempts of five seconds.
+/// Live events: four attempts of five seconds, and hints honoured up to
+/// 10 s, so one event holds the queue at most about 50 s (three waits and
+/// four attempts), not minutes.
 const LIVE: Lane = Lane {
     attempts: 4,
     attempt_timeout: ATTEMPT_TIMEOUT,
+    max_hint: Duration::from_secs(10),
 };
 /// Recovered completions: their own sender, so a slow import never holds up
-/// a live `publish`, and two long attempts; recovery's rounds retry beyond.
+/// a live `publish`, two long attempts, and hints honoured up to a minute;
+/// recovery's rounds retry beyond.
 const RECOVERED: Lane = Lane {
     attempts: 2,
     attempt_timeout: RECOVERED_ATTEMPT_TIMEOUT,
+    max_hint: Duration::from_secs(60),
 };
 /// Interim `1xx` answers skipped before a final one; more is a broken peer.
 const MAX_INTERIM: usize = 4;
@@ -79,8 +86,11 @@ pub(crate) enum Delivery {
     Delivered,
     /// The app answered 4xx: not retried.
     Refused,
-    /// Every attempt failed, or the URL is not valid.
+    /// An attempt reached the app (it answered, or timed out once
+    /// connected) and none succeeded; or the URL is not valid.
     Failed,
+    /// No attempt reached the app: every connection failed.
+    Unreachable,
 }
 
 /// Counts one event from enqueue until the sender is done with it, delivered
@@ -601,18 +611,23 @@ fn retry_hint(head: &[u8], body: &[u8]) -> Option<Duration> {
 }
 
 /// One `POST`, then the answer's status, with `want` the value of that
-/// header if the answer is 2xx, and a 408, 429 or 503's retry hint. The
-/// connection is plain HTTP/1.1 and used once (`connection: close`). Only
-/// the status line and headers are read, within `MAX_HEAD`, and of a 408,
-/// 429 or 503 at most [`MAX_HINT_BODY`] bytes of its body; other bodies are
-/// never read. A redirect is a status like any other: the `location` is
-/// never followed.
+/// header if the answer is 2xx, and with `hint` a 408, 429 or 503's retry
+/// hint. The connection is plain HTTP/1.1 and used once (`connection:
+/// close`); `connected` says whether it was made. Only the status line and
+/// headers are read, within `MAX_HEAD`. A body is read only with `hint`
+/// (the callback lanes, never publish authorisation), only of a 408, 429 or
+/// 503, up to its `content-length`, at most [`MAX_HINT_BODY`] bytes and for
+/// at most [`HINT_READ_TIMEOUT`]. A redirect is a status like any other:
+/// the `location` is never followed.
 async fn post(
     endpoint: &Endpoint,
     body: &[u8],
     want: Option<&str>,
+    hint: bool,
+    connected: &mut bool,
 ) -> std::io::Result<(u16, HeaderRead, Option<Duration>)> {
     let mut socket = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    *connected = true;
     // A receiver may answer, and close, before it has read the whole body.
     // Keep a write error to report only if no answer arrives.
     let wrote = socket
@@ -651,19 +666,31 @@ async fn post(
                     }
                     _ => HeaderRead::Absent,
                 };
-                if !is_retry_later(status) {
+                if !hint || !is_retry_later(status) {
                     return Ok((status, header, None));
                 }
+                let head = &buf[..used];
+                let declared = match http_lite::response_header(head, "content-length") {
+                    http_lite::ResponseHeader::One(value) => std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok()),
+                    _ => None,
+                };
+                let want_bytes = declared.unwrap_or(MAX_HINT_BODY).min(MAX_HINT_BODY);
                 let mut rest = buf[used..].to_vec();
-                while rest.len() < MAX_HINT_BODY {
-                    let mut chunk = [0u8; 512];
-                    let room = (MAX_HINT_BODY - rest.len()).min(chunk.len());
-                    match socket.read(&mut chunk[..room]).await {
-                        Ok(n) if n > 0 => rest.extend_from_slice(&chunk[..n]),
-                        _ => break,
+                rest.truncate(want_bytes);
+                let _ = tokio::time::timeout(HINT_READ_TIMEOUT, async {
+                    while rest.len() < want_bytes {
+                        let mut chunk = [0u8; 512];
+                        let room = (want_bytes - rest.len()).min(chunk.len());
+                        match socket.read(&mut chunk[..room]).await {
+                            Ok(n) if n > 0 => rest.extend_from_slice(&chunk[..n]),
+                            _ => break,
+                        }
                     }
-                }
-                return Ok((status, header, retry_hint(&buf[..used], &rest)));
+                })
+                .await;
+                return Ok((status, header, retry_hint(head, &rest)));
             }
             ParsedResponse::Malformed => return Err(std::io::ErrorKind::InvalidData.into()),
             ParsedResponse::Partial => {}
@@ -689,21 +716,26 @@ pub(crate) async fn attempt(
     body: &[u8],
     limit: Duration,
 ) -> Result<u16, Failure> {
-    attempt_hinted(endpoint, body, limit)
+    attempt_reading(endpoint, body, limit, None)
         .await
         .map(|(status, _)| status)
 }
 
-/// [`attempt`], also giving a 408, 429 or 503's retry hint.
+/// A callback lane's attempt: [`attempt`], also giving a 408, 429 or
+/// 503's retry hint, and on failure whether the connection was made (a
+/// timeout after it reached the app; a failure before it did not).
 async fn attempt_hinted(
     endpoint: &Endpoint,
     body: &[u8],
     limit: Duration,
-) -> Result<(u16, Option<Duration>), Failure> {
-    match tokio::time::timeout(limit, post(endpoint, body, None)).await {
+) -> Result<(u16, Option<Duration>), (Failure, bool)> {
+    let mut connected = false;
+    let outcome =
+        tokio::time::timeout(limit, post(endpoint, body, None, true, &mut connected)).await;
+    match outcome {
         Ok(Ok((status, _, hint))) => Ok((status, hint)),
-        Ok(Err(_)) => Err(Failure::Transport),
-        Err(_) => Err(Failure::Timeout),
+        Ok(Err(_)) => Err((Failure::Transport, connected)),
+        Err(_) => Err((Failure::Timeout, connected)),
     }
 }
 
@@ -714,11 +746,18 @@ pub(crate) async fn attempt_reading(
     limit: Duration,
     want: Option<&str>,
 ) -> Result<(u16, HeaderRead), Failure> {
-    match tokio::time::timeout(limit, post(endpoint, body, want)).await {
+    let mut connected = false;
+    match tokio::time::timeout(limit, post(endpoint, body, want, false, &mut connected)).await {
         Ok(Ok((status, header, _))) => Ok((status, header)),
         Ok(Err(_)) => Err(Failure::Transport),
         Err(_) => Err(Failure::Timeout),
     }
+}
+
+/// The wait before the next attempt: the lane's backoff, or longer if a
+/// hint asks, up to the lane's limit.
+fn hinted_wait(lane: Lane, delay: Duration, hint: Option<Duration>) -> Duration {
+    hint.map_or(delay, |hint| hint.min(lane.max_hint).max(delay))
 }
 
 async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Queued>, lane: Lane) {
@@ -727,11 +766,16 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
         let mut delay = Duration::from_millis(500);
         let mut delivered = false;
         let mut refused = false;
+        // Whether any attempt reached the app; an invalid URL counts, so it
+        // is a failure and not "unreachable".
+        let mut reached = false;
         // The URL carries the secret: it is parsed here and never logged.
         if let Some(endpoint) = Endpoint::parse(&url) {
             for attempt_number in 1..=lane.attempts {
                 let mut hint = None;
-                match attempt_hinted(&endpoint, &queued.body, lane.attempt_timeout).await {
+                let outcome = attempt_hinted(&endpoint, &queued.body, lane.attempt_timeout).await;
+                reached |= !matches!(outcome, Err((_, false)));
+                match outcome {
                     Ok((status, _)) if (200..300).contains(&status) => {
                         delivered = true;
                         tracing::debug!(event = queued.name, "callback delivered");
@@ -763,14 +807,14 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
                             "callback failed"
                         );
                     }
-                    Err(Failure::Transport) => {
+                    Err((Failure::Transport, _)) => {
                         tracing::warn!(
                             event = queued.name,
                             attempt = attempt_number,
                             "callback transport failed"
                         );
                     }
-                    Err(Failure::Timeout) => {
+                    Err((Failure::Timeout, _)) => {
                         tracing::warn!(
                             event = queued.name,
                             attempt = attempt_number,
@@ -779,12 +823,13 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
                     }
                 }
                 if attempt_number < lane.attempts {
-                    let wait = hint.map_or(delay, |hint| hint.min(MAX_RETRY_HINT).max(delay));
+                    let wait = hinted_wait(lane, delay, hint);
                     tokio::time::sleep(wait).await;
                     delay *= 2;
                 }
             }
         } else {
+            reached = true;
             tracing::error!(event = queued.name, "callback URL is not valid");
         }
         if let Some(ticket) = queued.ticket.take() {
@@ -810,8 +855,10 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
                 Delivery::Delivered
             } else if refused {
                 Delivery::Refused
-            } else {
+            } else if reached {
                 Delivery::Failed
+            } else {
+                Delivery::Unreachable
             });
         }
     }
@@ -1563,5 +1610,106 @@ mod tests {
         assert!(waited >= Duration::from_millis(3_400), "{waited:?}");
         assert_eq!(scope.observations.counts().callbacks_delivered, 1);
         assert_eq!(scope.observations.counts().callbacks_failed, 0);
+    }
+
+    #[test]
+    fn a_hint_holds_the_live_lane_seconds_and_the_recovered_lane_a_minute() {
+        let hint = Some(Duration::from_secs(600));
+        let backoff = Duration::from_millis(500);
+        assert_eq!(hinted_wait(LIVE, backoff, hint), Duration::from_secs(10));
+        assert_eq!(
+            hinted_wait(RECOVERED, backoff, hint),
+            Duration::from_secs(60)
+        );
+        assert_eq!(hinted_wait(LIVE, backoff, None), backoff);
+        assert_eq!(
+            hinted_wait(LIVE, backoff, Some(Duration::from_millis(1))),
+            backoff,
+            "never shorter than the backoff"
+        );
+        // One live event, answered 503 with a long hint every time, holds
+        // the queue for at most its three waits and four attempts.
+        let worst = LIVE.max_hint * (LIVE.attempts - 1) + LIVE.attempt_timeout * LIVE.attempts;
+        assert!(worst <= Duration::from_secs(50), "{worst:?}");
+    }
+
+    /// A listener that answers `head` (and `body`) to one request and then
+    /// holds the connection open.
+    async fn holding(answer: Vec<u8>) -> Endpoint {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(&answer).await;
+            std::future::pending::<()>().await;
+        });
+        Endpoint::parse(&format!("http://{addr}/callback")).expect("URL")
+    }
+
+    #[tokio::test]
+    async fn a_hint_body_is_read_to_its_length_with_its_own_deadline_and_only_for_callbacks() {
+        let body = br#"{"retryAfterMs":1500}"#;
+        let whole = |declared: usize, sent: &[u8]| {
+            let mut answer =
+                format!("HTTP/1.1 429 Too Many Requests\r\ncontent-length: {declared}\r\n\r\n")
+                    .into_bytes();
+            answer.extend_from_slice(sent);
+            answer
+        };
+        // The whole declared body, and the connection held open: the read
+        // stops at the length, not at the close.
+        let endpoint = holding(whole(body.len(), body)).await;
+        let started = std::time::Instant::now();
+        let answer = attempt_hinted(&endpoint, b"{}", Duration::from_secs(5)).await;
+        assert!(matches!(answer, Ok((429, Some(hint))) if hint == Duration::from_millis(1500)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        // A body that never comes in full: given up at its own deadline,
+        // well inside the attempt's, with no hint.
+        let endpoint = holding(whole(100, &body[..5])).await;
+        let started = std::time::Instant::now();
+        let answer = attempt_hinted(&endpoint, b"{}", Duration::from_secs(5)).await;
+        assert!(matches!(answer, Ok((429, None))));
+        let took = started.elapsed();
+        assert!(
+            took >= HINT_READ_TIMEOUT && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        // Publish authorisation never reads a body: it has its status at once.
+        let endpoint = holding(whole(100, &body[..5])).await;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            attempt(&endpoint, b"{}", Duration::from_secs(5)).await,
+            Ok(429)
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_never_reached_the_app_but_a_timeout_after_connecting_did() {
+        let closed = {
+            let listener =
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("listener");
+            let addr = listener.local_addr().expect("addr");
+            Endpoint::parse(&format!("http://{addr}/callback")).expect("URL")
+        };
+        assert!(matches!(
+            attempt_hinted(&closed, b"{}", Duration::from_secs(2)).await,
+            Err((Failure::Transport, false))
+        ));
+        let silent = Receiver::start(|_| None).await;
+        assert!(matches!(
+            attempt_hinted(&silent.endpoint(), b"{}", Duration::from_millis(200)).await,
+            Err((Failure::Timeout, true))
+        ));
     }
 }

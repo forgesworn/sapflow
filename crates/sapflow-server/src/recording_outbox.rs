@@ -918,7 +918,8 @@ mod durability_tests {
     #[test]
     fn a_setgid_recordings_directory_does_not_turn_recovery_off() {
         // Linux makes a directory created in a setgid one setgid too: 2700.
-        // macOS does not, so the bit is set by hand where it can be.
+        // Only Linux exercises that inheritance (CI runs it); macOS does
+        // not inherit the bit, so there the 2700 case is set by hand below.
         let scratch = Scratch::new("setgid");
         std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o2755))
             .expect("setgid recordings");
