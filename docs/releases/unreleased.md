@@ -325,7 +325,8 @@ Notes for the release after 0.2.0-rc.1.
 - Reorder tolerance in the receiver. It still sends a NAK at the first
   sequence gap, as libsrt does by default, until a missing packet arrives
   as an original rather than a retransmission. It then holds the first NAK
-  of each new gap for 5/4 of how late that packet came plus 1 ms, at most
+  of each new gap for 5/4 of the latest such packet's lateness plus 1 ms
+  (the latest since the path last went a second without reordering), at most
   `Config::reorder_wait_max` (new, default 50 ms) and an eighth of the
   latency, and never into the last three round trips before the gap's
   delivery time; the wait halves after every second with no reordering,
@@ -351,6 +352,9 @@ Notes for the release after 0.2.0-rc.1.
   `..Default::default()`.
 - `loss::LossList` gains `hold`, which lists a loss with its first report
   held, and `take`, which says when a loss was found and whether it had
-  been asked for. `loss::Loss` gains `found`, and its `requests` is 0 while
-  the first report is held. A held loss the list has to give up to stay
-  within `MAX_RANGES` is reported at the next `due`, ahead of the rest.
+  been asked for, and bounds the hold of the part of a held loss before
+  the packet that arrived by that packet's delivery time. `loss::Loss` gains
+  `found`, and its `requests` is 0 while the first report is held. A held
+  loss the list has to give up to stay within `MAX_RANGES` is reported at
+  the next `due`, ahead of the rest; until then `next_due` returns `now`,
+  and `is_empty` is false even when no range is listed.

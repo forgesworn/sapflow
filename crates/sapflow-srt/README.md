@@ -71,7 +71,8 @@ more), connection and handshake limits, buffer size, idle and accept
 timeouts, encryption (`crypto`, `require_encryption`) and the reorder
 wait (`reorder_wait_max`, default 50 ms): once a caller's path is seen to
 reorder packets, the first NAK of a new gap is held for a little longer
-than the latest late packet took, so it is not resent for nothing. It
+than the latest packet has been late since the path last went a second
+without reordering, so it is not resent for nothing. It
 adapts only for callers that flag their retransmissions (`REXMITFLG`, as
 libsrt does), and zero sends every NAK at the first gap. To refuse a
 caller, `listener.reject(id, code)`, where `RejectCode` has the SRT

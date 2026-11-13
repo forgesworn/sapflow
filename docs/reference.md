@@ -348,13 +348,16 @@ follows the observed behaviour.
   NAK at the first sequence gap, so a packet that is only late is resent.
   sapflow-srt watches for a missing packet that arrives as an original
   rather than a retransmission, and from then on holds the first NAK of
-  each new gap for 5/4 of how late that packet came plus 1 ms: at most
-  `SAPFLOW_SRT_REORDER_WAIT_MAX_MS` (default 50) and an eighth of the
-  latency, and never into the last three RTTs before the gap's delivery
-  time, where re-requests come every quarter RTT; a gap already that close
-  is reported at once. The wait halves after each second with no reordering, back to none. A held
-  gap is reported from the timer when the wait ends, and at once if the
-  loss list is full or has to drop it. Only for a caller that sets
+  each new gap for 5/4 of the latest such packet's lateness plus 1 ms,
+  where the latest is counted since the path last went a whole second
+  without reordering: at most `SAPFLOW_SRT_REORDER_WAIT_MAX_MS` (default
+  50) and an eighth of the latency, and never into the last three RTTs
+  before the gap's delivery time, where re-requests come every quarter
+  RTT; a gap already that close is reported at once. The wait halves
+  after each second with no reordering, back to none. A held gap is
+  reported from the timer when the wait ends, at once if the loss list is
+  full, and at the next timer if the list has to give it up to stay
+  bounded. Only for a caller that sets
   `REXMITFLG`: without it a retransmission that fills a gap looks like an
   original a round trip late, and real loss would push the wait to its cap.
   libsrt has a comparable option, `SRTO_LOSSMAXTTL`: a tolerance counted
