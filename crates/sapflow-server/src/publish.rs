@@ -596,8 +596,10 @@ impl Drop for Publication {
             }
             return;
         }
-        // Unless a stop has sent it already (Registry::stop_all).
-        if let Some(callbacks) = self.stream.session().take_unpublish(self.generation) {
+        // Unless a stop has sent it already (Registry::stop_all). Taken
+        // first, so the session lock is not held while it is queued.
+        let owed = self.stream.session().take_unpublish(self.generation);
+        if let Some(callbacks) = owed {
             callbacks.send(&self.stream.path, StreamEvent::Unpublish);
         }
         // The last complete AAC PES can create the first servable part only

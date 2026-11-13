@@ -40,8 +40,10 @@ pub struct Outcome {
 ///
 /// The listeners stop after the streams have ended: dropping the SRT
 /// listener marks its publishers' recordings `srt-listener-stopped`, which
-/// would otherwise come first. Its connections end with it; RTMP and WHIP
-/// connections end at their next packet, refused as superseded.
+/// would otherwise come first. Its connections end with it, and so does an
+/// SRT handshake still being admitted, unanswered. RTMP connections end at
+/// their next packet, refused as superseded; WHIP sessions end when the
+/// WHIP task that feeds them is aborted.
 pub async fn stop(app: &App, listeners: &[AbortHandle], within: Duration) -> Outcome {
     let started = Instant::now();
     let deadline = started + within;

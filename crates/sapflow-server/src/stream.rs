@@ -1367,9 +1367,10 @@ impl Registry {
                     continue;
                 }
                 let generation = session.generation;
-                if session.attached {
-                    // Before the terminal drain in end, whose loss would
-                    // otherwise be the recording's first reason.
+                let live = session.attached;
+                if live {
+                    // Before the terminal drain, whose loss would otherwise
+                    // be the recording's first reason.
                     session.mark_recording_incomplete(generation, IncompleteReason::ServerStopped);
                     stopped.live += 1;
                 } else {
@@ -1377,6 +1378,14 @@ impl Registry {
                 }
                 if let Some((_, callbacks)) = session.unpublish.take() {
                     callbacks.send(&stream.path, sapflow_core::StreamEvent::Unpublish);
+                }
+                if live {
+                    // The terminal drain can start a codec epoch and roll the
+                    // recording to a new, unmarked file: mark that one too (a
+                    // reason it already has is kept). end's drain repeats
+                    // nothing.
+                    stream.finish_connection(&mut session);
+                    session.mark_recording_incomplete(generation, IncompleteReason::ServerStopped);
                 }
             }
             Self::end(&mut map, &stream);

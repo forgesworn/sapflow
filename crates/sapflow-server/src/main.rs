@@ -301,7 +301,13 @@ async fn run(config: Config) -> std::io::Result<()> {
     ];
     tokio::select! {
         () = stop_signal() => {
-            shutdown::stop(&app, &listeners, shutdown::DEADLINE).await;
+            // A second signal, as a second ctrl-c, exits without waiting.
+            tokio::select! {
+                _ = shutdown::stop(&app, &listeners, shutdown::DEADLINE) => {}
+                () = stop_signal() => {
+                    tracing::warn!("second stop signal; exiting without waiting for recordings or callbacks");
+                }
+            }
             Ok(())
         }
         r = srt_task => match r {
