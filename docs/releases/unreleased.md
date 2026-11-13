@@ -364,8 +364,8 @@ Notes for the release after 0.2.0-rc.1.
   rather than "passphrase, key length or admission handshake refused". One that gives up before the app
   answers is no longer counted by the throttle, and claims nothing. The
   check costs one more key derivation per encrypting caller with a global
-  passphrase, before the accept's own. The replay guard still applies only
-  with app keys.
+  passphrase, before the accept's own. The replay guard applies with app
+  keys and with scoped sessions, not here.
 - Scoped publish sessions now check an SRT caller's key material against
   the session's passphrase and key length as soon as its credentials
   match, before the claim is reserved. A caller with the session's
@@ -379,6 +379,22 @@ Notes for the release after 0.2.0-rc.1.
   Admitted callers see nothing new: grants, epochs, limits and callbacks
   are as before, and the accept is as strict. The check is one more key
   derivation per scoped admission, before the accept's own.
+- The SRT replay guard now covers scoped publish sessions. A captured
+  conclusion of an admitted scoped connection, replayed within its grant
+  while the stage was held for a reconnect, passed the key check and
+  resumed the stage, and its recorded media decrypted onto it. Scoped
+  callers now get the owner check at Connect, and once the key passes and
+  before the claim is reserved, key material that already admitted a
+  connection is refused (`BADSECRET`, not counted by the throttle);
+  otherwise it is remembered and written to the replay store first, and a
+  failed write refuses the caller (`503`) with nothing reserved, saved or
+  resumed. Bounds and eviction are as with app keys. In scoped mode the
+  replay store defaults to `srt-replay` in `SAPFLOW_SESSION_STORE`'s
+  directory, which already has to be private and persistent, so nothing
+  new needs configuring; `SAPFLOW_SRT_REPLAY_STORE` names another file,
+  and may not name the session store. The first start after upgrading
+  writes it empty and logs a warning, as any first start does. Live
+  scoped stages were never open to takeover (409), and still are not.
 - `SAPFLOW_SRT_ENCRYPTION=required` set explicitly without
   `SAPFLOW_SRT_PASSPHRASE` now stops startup unless app keys are on, where
   it refuses callers that send no key material. It used to start and

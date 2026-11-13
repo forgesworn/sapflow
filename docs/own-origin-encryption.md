@@ -48,8 +48,13 @@ and a live or held stream keeps its publisher. Scoped publish sessions, which
 never take over a live stream, check the key against the session's passphrase
 once the session's credentials match, before the claim is reserved, so a
 wrong key spends no connection epoch and resumes no held stream; if key
-negotiation still fails at accept, the claim is immediately released. No
-media is submitted, so
+negotiation still fails at accept, the claim is immediately released.
+Scoped admissions are also checked by the SRT replay guard: the caller's key
+material is refused if another caller sent it first or if it already
+admitted a connection, before the claim is reserved, and the admitted
+digests are kept across restarts in the replay store, by default
+`srt-replay` beside `SAPFLOW_SESSION_STORE` (`SAPFLOW_SRT_REPLAY_STORE` names
+another file). No media is submitted, so
 there is no healthy/publish/unpublish callback or recording-complete event;
 the recorder waits for its first media part before creating a file. Ordinary
 connection/leave log messages may still describe that provisional claim.
