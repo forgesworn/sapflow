@@ -80,6 +80,36 @@ rejection codes as constants (`PEER`, `BADSECRET`, `RESOURCE`, ...) and
 `RejectCode::http(status)` for the application range; to choose a per-caller
 secret, `accept_with_crypto`. Sending is `Caller` (`examples/send.rs`).
 
+When the application holds a passphrase per stream, set `app_keys` in
+`Config`: a caller's key material then waits for the application even with
+no global `crypto` secret. `check_key(id, &crypto)` unwraps it with the
+application's passphrase without answering the caller, so it can be called
+again and the caller can still be refused for another reason; it returns the
+caller's key length (AES-128 or AES-256, whichever the caller chose) or a
+`KeyCheckError` whose `reject_code()` says how to refuse.
+`accept_with_key(id, now, &crypto)` then accepts only a caller whose key
+matches, and never falls back to plaintext: no key material is refused with
+`UNSECURE` whatever `allow_plaintext` says, a wrong key with `BADSECRET`.
+A failed check must end in `reject`, never in `accept` or
+`accept_with_crypto`, which still admit what the listener's own settings
+allow. A passing check proves the key material was wrapped under the
+passphrase, not that its sender made it: a replayed conclusion passes too,
+so do not turn on `app_keys` in production before the application guards
+against replay.
+
+```rust
+use sapflow_srt::crypto::{CryptoConfig, KeySize};
+
+// passphrase: the stream's own, 10 to 79 bytes; the caller picks the key length.
+let key = CryptoConfig::new(passphrase, KeySize::Aes256)?;
+match listener.check_key(id, &key) {
+    Ok(_size) => { listener.accept_with_key(id, Instant::now(), &key); }
+    Err(e) => { listener.reject(id, e.reject_code().unwrap_or(RejectCode::BADSECRET)); }
+}
+```
+
+`examples/listen-app-key.rs` is a complete listener that does this.
+
 | Module | What |
 |--------|------|
 | `seq` | 31-bit sequence numbers and 32-bit timestamps, wrapping |
@@ -117,5 +147,8 @@ How it compares with libsrt and gosrt under loss, with measurements, is in
   reordering and altered key flags cannot replenish spent refresh credit.
 - `tests/black_box_sender.py`, `tests/black_box_crypto.py`: our sender and
   encryption against libsrt's tools, as black boxes.
-- Fuzz targets `own_srt_packet`, `own_srt_listener` and `own_srt_caller`
-  (`fuzz/README.md`).
+- `tests/app_keys.rs`: application-held passphrases (`app_keys`,
+  `check_key`, `accept_with_key`) with our caller at AES-128 and AES-256,
+  encrypted media through, wrong and missing keys refused.
+- Fuzz targets `own_srt_packet`, `own_srt_listener`, `own_srt_app_keys` and
+  `own_srt_caller` (`fuzz/README.md`).

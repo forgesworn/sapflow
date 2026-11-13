@@ -104,6 +104,7 @@ source-EOF qualification. No Rust build is involved.
 | `opus_packaging` | Opus packaging in `sapflow-hls`. Every input goes to both TOC and framing checks, `sapflow_hls::codec::opus_packet` and `sapflow_rtp::opus::parse_packet`, which must agree on validity, duration, frame count and stereo flag, so packaging never refuses a packet the receiver passed on. `OPT1` inputs then feed records of packet shapes, jitter, gaps, steps back, truncated packets and interrupts into an audio-only or video-led Opus muxer; rendered playlists must pass `playlist::RuleCheck`, and a refused packet must change nothing: neither what a viewer or recorder could observe (parts, segments, breaks, epoch and the rendered playlist) nor the muxer's internal state (`Muxer::internal_state`, behind sapflow-hls's `testing` feature). Seeded with real libopus packets from `crates/sapflow-hls/tests/fixtures` and generated `OPT1` streams |
 | `own_srt_packet` | Our SRT packet codec (`sapflow_srt::packet`): parse, then encode, parse again and encode again; both must agree |
 | `own_srt_listener` | Our SRT listener (`sapflow_srt::Listener`) as the server drives it: datagrams from three peers, time steps, accept or refuse, the application closing connections. Each peer echoes its SYN cookie and addresses the socket id it was given, so data, ACKACKs, drop requests and shutdowns reach open connections. Checks that everything sent parses and that a timer exists exactly while connections do. Seeded with recorded sessions (see below) |
+| `own_srt_app_keys` | The listener with `Config::app_keys`, in `own_srt_listener`'s record format, as a server with one passphrase per stream drives it: each caller is checked with a fixed passphrase (`check_key`, twice, and sometimes a wrong one) and answered with `accept_with_key`, plain `accept` or a refusal. The listener has no global secret, or (first record's peer bits 3) a global secret with `allow_plaintext`, as the reference deployment runs during the migration. A check changes nothing and gives the same answer again, a wrong passphrase never passes, the strict accept admits exactly what the check passed and otherwise sends the check's code, and plain `accept` admits only what the listener's own settings allow. Seeded with encrypting callers (see below) |
 | `rtmp_session` | Our RTMP connection (`sapflow_rtmp`): from C0 on arbitrary bytes, or replaying the recorded ffmpeg session to its publish and continuing with arbitrary chunk bytes so media reaches `FlvIngest`. Seeded from `crates/sapflow-rtmp/tests/fixtures/ffmpeg-rtmp-publish.bin` (see below) |
 | `amf0` | AMF0 decoding (every RTMP command and metadata message) and stable re-encoding |
 | `rtmp_client` | Own publishing client before or after an original publish exchange, then fragmented hostile receiver bytes; cancellation clears pending output |
@@ -292,6 +293,14 @@ rewriting on. The caller's datagrams of
 `crates/sapflow-srt/tests/fixtures/*.trace` (records `[u32 microseconds,
 u16 length, datagram]`) convert directly; `own_srt_packet` can start from
 the same datagrams one per file.
+
+`seeds/own_srt_app_keys/` holds two sessions of our own `Caller`, AES-128
+and AES-256, keyed with the target's passphrase, in the same record format,
+so mutation starts from a check that passes and encrypted data on an open
+connection; the `-optional` copies differ only in the first record's peer
+bits (3), which select the second mode. `cargo test -p sapflow-srt --test app_keys` replays them and
+fails if either stops reaching a successful check; `-- --ignored
+write_fuzz_seeds` records them again, with fresh keys.
 
 To recapture the SRT session seed: run sapflow on 127.0.0.1:8890, proxy a
 `srt-live-transmit` publish through a UDP relay that writes each client

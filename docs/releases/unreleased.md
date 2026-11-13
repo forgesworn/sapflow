@@ -358,3 +358,28 @@ Notes for the release after 0.2.0-rc.1.
   loss the list has to give up to stay within `MAX_RANGES` is reported at
   the next `due`, ahead of the rest; until then `next_due` returns `now`,
   and `is_empty` is false even when no range is listed.
+- Keys the application holds, one passphrase per stream. With
+  `Config::app_keys` (new, default off), a caller's key material waits for
+  the application even when the listener has no `crypto` secret; off, such a
+  caller is still refused in the handshake with `UNSECURE`, and nothing else
+  changes. `Listener::check_key` (new) unwraps a waiting caller's key
+  material with the application's passphrase without answering it, so it
+  can be called again and the caller can still be refused for another
+  reason. It takes AES-128 and AES-256, whichever the caller chose, and
+  returns the key length or a `KeyCheckError` (new: `NotPending`,
+  `NoKeyMaterial`, `BadSecret`, `UnsupportedKey`, `InvalidConfig`), whose
+  `reject_code()` says how to refuse. `Listener::accept_with_key` (new)
+  accepts only a matching key and never falls back to plaintext: a caller
+  with no key material is refused with `UNSECURE` even with
+  `allow_plaintext`, a wrong key with `BADSECRET`. `accept` and
+  `accept_with_crypto` are unchanged. `listener::Config` is not
+  `#[non_exhaustive]`, so a struct literal needs `..Config::default()`.
+  A failed check must end in `reject`: `accept` and `accept_with_crypto`
+  still admit what the listener's own settings allow. A passing check
+  proves the key material was wrapped under the passphrase, not that its
+  sender made it, so a replayed conclusion passes; do not turn on
+  `app_keys` in production before the application guards against replay.
+  `examples/listen-app-key.rs` is a complete listener. The new fuzz target
+  `own_srt_app_keys` drives `check_key`, `accept_with_key`, `accept`,
+  `reject` and `close`, with no global secret or with a global secret and
+  `allow_plaintext`; it does not call `accept_with_crypto` directly.
