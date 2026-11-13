@@ -290,6 +290,10 @@ impl<'a> Km<'a> {
         })
     }
 }
+/// The key length a well-formed KM message carries.
+pub(crate) fn km_key_size(bytes: &[u8]) -> Result<KeySize, CryptoError> {
+    Km::parse(bytes).map(|km| km.size)
+}
 pub(crate) fn valid_km(bytes: &[u8], field: u16) -> bool {
     Km::parse(bytes).is_ok_and(|km| field == 0 || km.size.field() == field)
 }

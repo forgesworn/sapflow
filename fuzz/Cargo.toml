@@ -91,6 +91,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "own_srt_app_keys"
+path = "fuzz_targets/own_srt_app_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "own_srt_caller"
 path = "fuzz_targets/own_srt_caller.rs"
 test = false

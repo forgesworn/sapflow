@@ -29,7 +29,7 @@
 //!
 //! Every byte that arrives is hostile until the application accepts the
 //! caller: nothing here indexes without a bound or trusts a length, and
-//! it is fuzzed (`own_srt_packet`, `own_srt_listener`).
+//! it is fuzzed (`own_srt_packet`, `own_srt_listener`, `own_srt_app_keys`).
 
 #![warn(missing_docs)]
 #![cfg_attr(
@@ -57,5 +57,5 @@ pub mod seq;
 pub use caller::{Caller, CallerCloseReason, CallerConfig, CallerEvent, CallerStats};
 pub use sender::{SendConfig, SendError, SendStats};
 
-pub use listener::{Config, ConnId, Event, Listener, ListenerStats, RejectCode};
+pub use listener::{Config, ConnId, Event, KeyCheckError, Listener, ListenerStats, RejectCode};
 pub use receiver::{CloseReason, Stats};

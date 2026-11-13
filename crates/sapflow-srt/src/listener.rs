@@ -11,13 +11,14 @@ use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use crate::crypto::{CryptoConfig, Decryptor};
+use crate::crypto::{CryptoConfig, CryptoError, Decryptor, KeySize};
 use crate::packet::{
     Control, ControlPacket, Extension, Handshake, HandshakeKind, Packet, SRT_MAGIC, SrtHandshake,
     ext_flags, srt_flags,
 };
 use crate::receiver::{CloseReason, Receiver, Settings, Stats};
 use crate::seq::Seq;
+use std::fmt;
 
 /// The version this implementation reports in its handshake response:
 /// the protocol level of draft-sharabayko-srt-01 that libsrt calls 1.5.0.
@@ -71,6 +72,13 @@ pub struct Config {
     /// that flag their retransmissions (`REXMITFLG`). Zero turns it off,
     /// reporting every gap at once as libsrt does.
     pub reorder_wait_max: Duration,
+    /// Keep a caller's key material for the application to check, with
+    /// [`Listener::check_key`] and [`Listener::accept_with_key`], even when
+    /// `crypto` is `None` and encryption is not required: the passphrase is
+    /// the application's, one per stream. Off (the default), such a caller
+    /// is refused in the handshake with [`RejectCode::UNSECURE`]. It changes
+    /// nothing for callers that send no key material.
+    pub app_keys: bool,
 }
 
 impl Default for Config {
@@ -86,6 +94,7 @@ impl Default for Config {
             require_encryption: false,
             allow_plaintext: false,
             reorder_wait_max: Duration::from_millis(50),
+            app_keys: false,
         }
     }
 }
@@ -149,8 +158,10 @@ impl RejectCode {
 pub enum Event {
     /// A caller passed bounded handshake parsing and cookie checks. The
     /// stream ID is untrusted; KM/secret validation happens during acceptance.
-    /// Answer with [`Listener::accept`], [`Listener::accept_with_crypto`] or
-    /// [`Listener::reject`]. This event does not establish peer identity.
+    /// Answer with [`Listener::accept`], [`Listener::accept_with_crypto`],
+    /// [`Listener::accept_with_key`] or [`Listener::reject`]; check a
+    /// caller's key first with [`Listener::check_key`]. This event does not
+    /// establish peer identity.
     Connect {
         /// The connection, for [`Listener::accept`] and [`Listener::reject`].
         id: ConnId,
@@ -199,11 +210,79 @@ pub struct ListenerStats {
     pub rejected: u64,
 }
 
+/// Why [`Listener::check_key`] cannot accept a caller's key. Never carries
+/// the passphrase or key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheckError {
+    /// No caller with this id is waiting for an answer: unknown, already
+    /// answered, or forgotten after [`Config::accept_timeout`].
+    NotPending,
+    /// The caller sent no key material.
+    NoKeyMaterial,
+    /// The key material does not unwrap with this passphrase.
+    BadSecret,
+    /// The key material is outside the supported profile. Defensive: the
+    /// handshake already refuses any key length but 16 or 32 bytes
+    /// ([`RejectCode::ROGUE`]), so such a caller never waits for an answer.
+    UnsupportedKey,
+    /// The application's [`CryptoConfig`] has invalid refresh settings.
+    InvalidConfig,
+}
+
+impl KeyCheckError {
+    /// The code [`Listener::accept_with_key`] refuses this caller with, for an
+    /// application that refuses without calling it; `None` for
+    /// [`NotPending`](Self::NotPending), where there is no one to answer.
+    pub const fn reject_code(self) -> Option<RejectCode> {
+        match self {
+            Self::NotPending => None,
+            Self::NoKeyMaterial => Some(RejectCode::UNSECURE),
+            Self::BadSecret | Self::UnsupportedKey | Self::InvalidConfig => {
+                Some(RejectCode::BADSECRET)
+            }
+        }
+    }
+}
+
+impl fmt::Display for KeyCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotPending => "no SRT caller waiting with this id",
+            Self::NoKeyMaterial => "SRT caller sent no key material",
+            Self::BadSecret => "SRT key material does not match the passphrase",
+            Self::UnsupportedKey => "SRT key material outside the supported profile",
+            Self::InvalidConfig => "invalid SRT key refresh settings",
+        })
+    }
+}
+
+impl std::error::Error for KeyCheckError {}
+
+impl From<CryptoError> for KeyCheckError {
+    fn from(e: CryptoError) -> Self {
+        match e {
+            CryptoError::BadSecret => Self::BadSecret,
+            CryptoError::Config => Self::InvalidConfig,
+            _ => Self::UnsupportedKey,
+        }
+    }
+}
+
 struct Pending {
     hs: Handshake,
     hs_timestamp: u32,
     latency: i64,
     since: i64,
+}
+
+impl Pending {
+    /// The caller's key material, if it sent any.
+    fn km(&self) -> Option<&Vec<u8>> {
+        self.hs.extensions.iter().find_map(|e| match e {
+            Extension::KmReq(b) => Some(b),
+            _ => None,
+        })
+    }
 }
 
 enum State {
@@ -421,6 +500,11 @@ impl<S: BuildHasher> Listener<S> {
     /// `allow_plaintext` admits a caller that sent none; a missing secret
     /// never downgrades an encrypted or encryption-required session.
     /// Failed key validation rejects and removes the pending connection.
+    ///
+    /// The secret's `key_size` must match the caller's. For a passphrase
+    /// the application holds per stream, [`accept_with_key`](Self::accept_with_key)
+    /// is stricter: it takes either key length and never admits a caller
+    /// without key material, whatever `allow_plaintext` says.
     pub fn accept_with_crypto(
         &mut self,
         id: ConnId,
@@ -529,6 +613,57 @@ impl<S: BuildHasher> Listener<S> {
         };
         self.collect(id.0);
         true
+    }
+
+    /// Checks a waiting caller's key material against an application's
+    /// passphrase, without answering the caller: it stays waiting, so this
+    /// can be called again, and the application can still refuse it for
+    /// another reason. The caller's key length (AES-128 or AES-256) is used,
+    /// not `crypto.key_size`. Returns that length, or why the key cannot be
+    /// accepted; [`KeyCheckError::reject_code`] gives the code to refuse
+    /// with. Costs one key derivation (PBKDF2, 2048 rounds), as accepting
+    /// does.
+    pub fn check_key(&self, id: ConnId, crypto: &CryptoConfig) -> Result<KeySize, KeyCheckError> {
+        let p = self.pending(id).ok_or(KeyCheckError::NotPending)?;
+        let km = p.km().ok_or(KeyCheckError::NoKeyMaterial)?;
+        let config = for_km(crypto, km)?;
+        Decryptor::new(&config, km)?;
+        Ok(config.key_size)
+    }
+
+    /// Accepts a waiting caller only if its key material matches the
+    /// application's passphrase, at either key length, as
+    /// [`check_key`](Self::check_key) checks it; the session is then
+    /// encrypted under that key. Never falls back to plaintext: a caller with
+    /// no key material is refused with [`RejectCode::UNSECURE`] whatever
+    /// [`Config::allow_plaintext`] says, and one whose key does not match
+    /// with [`RejectCode::BADSECRET`]. Returns whether it was accepted;
+    /// `false` with nothing sent when no caller with this id is waiting.
+    pub fn accept_with_key(&mut self, id: ConnId, now: Instant, crypto: &CryptoConfig) -> bool {
+        let config = match self.pending(id) {
+            None => return false,
+            Some(p) => p.km().map(|km| for_km(crypto, km)),
+        };
+        match config {
+            // With key material present, accept_with_crypto never admits
+            // plaintext: it unwraps the key or refuses with BADSECRET.
+            Some(Ok(config)) => self.accept_with_crypto(id, now, Some(config)),
+            Some(Err(e)) => {
+                self.reject(id, e.reject_code().unwrap_or(RejectCode::BADSECRET));
+                false
+            }
+            None => {
+                self.reject(id, RejectCode::UNSECURE);
+                false
+            }
+        }
+    }
+
+    fn pending(&self, id: ConnId) -> Option<&Pending> {
+        match &self.conns.get(&id.0)?.state {
+            State::Pending(p) => Some(&**p),
+            State::Open { .. } => None,
+        }
     }
 
     /// Refuses a caller announced by [`Event::Connect`].
@@ -758,7 +893,10 @@ impl<S: BuildHasher> Listener<S> {
             return Err(RejectCode::ROGUE);
         }
         if let Some(km) = km {
-            if !self.config.require_encryption && self.config.crypto.is_none() {
+            if !self.config.require_encryption
+                && self.config.crypto.is_none()
+                && !self.config.app_keys
+            {
                 return Err(RejectCode::UNSECURE);
             }
             if h.extension & ext_flags::KMREQ == 0 || !crate::crypto::valid_km(km, h.encryption) {
@@ -809,6 +947,14 @@ impl<S: BuildHasher> Listener<S> {
         ControlPacket::new(0, h.socket_id, Control::Handshake(reply)).encode(&mut out);
         self.transmits.push_back((peer, out));
     }
+}
+
+/// The application's passphrase and refresh settings at the key length the
+/// caller chose.
+fn for_km(crypto: &CryptoConfig, km: &[u8]) -> Result<CryptoConfig, KeyCheckError> {
+    let mut config = crypto.clone();
+    config.key_size = crate::crypto::km_key_size(km)?;
+    Ok(config)
 }
 
 fn duration_micros(d: Duration) -> i64 {
@@ -1350,6 +1496,335 @@ mod tests {
             Some(&[0x80, 0x05, 0, 0][..])
         );
         assert_eq!(l.connections(), 0);
+    }
+
+    const APP: &[u8] = b"per-stream app passphrase";
+
+    fn app(size: KeySize) -> CryptoConfig {
+        CryptoConfig::new(APP.to_vec(), size).expect("passphrase")
+    }
+
+    /// A caller's first key material, wrapped with `passphrase`.
+    fn key_material(passphrase: &[u8], size: KeySize) -> Vec<u8> {
+        let config = CryptoConfig::new(passphrase.to_vec(), size).expect("passphrase");
+        crate::crypto::Encryptor::new(&config)
+            .and_then(|e| e.initial())
+            .expect("key material")
+    }
+
+    /// A conclusion from a caller that sends `km`, as libsrt does: the KMREQ
+    /// flag and the key length in the encryption field.
+    fn conclusion_km(socket: u32, cookie: u32, km: &[u8]) -> Vec<u8> {
+        let mut out = conclusion(socket, cookie, vec![Extension::KmReq(km.to_vec())]);
+        let Ok(Packet::Control(ControlPacket {
+            body: Control::Handshake(mut h),
+            ..
+        })) = Packet::parse(&out)
+        else {
+            panic!("conclusion");
+        };
+        h.extension |= ext_flags::KMREQ;
+        h.encryption = crate::crypto::km_key_size(km).map_or(0, KeySize::field);
+        out.clear();
+        ControlPacket::new(500, 0, Control::Handshake(h)).encode(&mut out);
+        out
+    }
+
+    fn with_config(t0: Instant, config: Config) -> Listener<Fixed> {
+        Listener::with_key(config, t0, Fixed::default())
+    }
+
+    fn app_keys() -> Config {
+        Config {
+            app_keys: true,
+            ..Config::default()
+        }
+    }
+
+    /// A caller sending `km` (or none) that reaches the application.
+    fn waiting(l: &mut Listener<Fixed>, t: Instant, socket: u32, km: Option<&[u8]>) -> ConnId {
+        let c = l.cookie(peer(), 0);
+        let datagram = match km {
+            Some(km) => conclusion_km(socket, c, km),
+            None => conclusion(socket, c, vec![]),
+        };
+        l.handle_datagram(t, peer(), &datagram);
+        match l.poll_event() {
+            Some(Event::Connect { id, .. }) => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn rejection<S: BuildHasher>(l: &mut Listener<S>) -> Option<u32> {
+        match sent_handshakes(l).as_slice() {
+            [(_, h)] => match h.kind {
+                HandshakeKind::Rejection(code) => Some(code),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn check_key_takes_either_key_length_and_leaves_the_caller_waiting() {
+        let t0 = Instant::now();
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let km = key_material(APP, size);
+            // The application's key_size is not consulted: the caller's is.
+            for app_size in [KeySize::Aes128, KeySize::Aes256] {
+                let mut l = with_config(t0, app_keys());
+                let id = waiting(&mut l, t0, 1, Some(&km));
+                assert_eq!(l.check_key(id, &app(app_size)), Ok(size));
+                assert_eq!(l.check_key(id, &app(app_size)), Ok(size), "again");
+                assert!(sent_handshakes(&mut l).is_empty(), "nothing answered");
+                assert_eq!(l.connections(), 1);
+                assert_eq!(l.connection_stats(id), None, "still waiting");
+                assert!(l.accept_with_key(id, t0, &app(app_size)));
+                let hs = sent_handshakes(&mut l);
+                let [(1, r)] = hs.as_slice() else {
+                    panic!("{hs:?}");
+                };
+                assert_eq!(r.kind, HandshakeKind::Conclusion);
+                assert_eq!(r.encryption, size.field());
+                assert_eq!(r.extension, ext_flags::HSREQ | ext_flags::KMREQ);
+                assert!(r.extensions.contains(&Extension::KmRsp(km.clone())));
+                assert_eq!(
+                    l.check_key(id, &app(app_size)),
+                    Err(KeyCheckError::NotPending)
+                );
+                assert!(!l.accept_with_key(id, t0, &app(app_size)), "answered once");
+                assert!(sent_handshakes(&mut l).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrong_passphrase_is_reported_then_refused_as_badsecret() {
+        let t0 = Instant::now();
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let mut l = with_config(t0, app_keys());
+            let id = waiting(
+                &mut l,
+                t0,
+                1,
+                Some(&key_material(b"not the app passphrase", size)),
+            );
+            let err = l.check_key(id, &app(size));
+            assert_eq!(err, Err(KeyCheckError::BadSecret));
+            assert_eq!(l.check_key(id, &app(size)), err, "again");
+            assert_eq!(l.connections(), 1, "still waiting");
+            assert!(sent_handshakes(&mut l).is_empty());
+            assert!(!l.accept_with_key(id, t0, &app(size)));
+            assert_eq!(rejection(&mut l), Some(RejectCode::BADSECRET.0));
+            assert_eq!(
+                KeyCheckError::BadSecret.reject_code(),
+                Some(RejectCode::BADSECRET)
+            );
+            assert_eq!(l.connections(), 0);
+        }
+    }
+
+    #[test]
+    fn accept_with_key_never_admits_a_caller_without_key_material() {
+        let t0 = Instant::now();
+        let global = CryptoConfig::new(b"global lab passphrase".to_vec(), KeySize::Aes128)
+            .expect("passphrase");
+        // No global secret; and a global secret with plaintext allowed, as
+        // the reference deployment runs during the migration.
+        for crypto in [None, Some(global)] {
+            let mut l = with_config(
+                t0,
+                Config {
+                    crypto,
+                    allow_plaintext: true,
+                    ..app_keys()
+                },
+            );
+            let id = waiting(&mut l, t0, 1, None);
+            assert_eq!(
+                l.check_key(id, &app(KeySize::Aes256)),
+                Err(KeyCheckError::NoKeyMaterial)
+            );
+            assert_eq!(l.connections(), 1);
+            assert!(!l.accept_with_key(id, t0, &app(KeySize::Aes256)));
+            assert_eq!(rejection(&mut l), Some(RejectCode::UNSECURE.0));
+            assert_eq!(
+                KeyCheckError::NoKeyMaterial.reject_code(),
+                Some(RejectCode::UNSECURE)
+            );
+            assert_eq!(l.connections(), 0);
+        }
+    }
+
+    #[test]
+    fn unknown_or_answered_callers_are_not_pending() {
+        let t0 = Instant::now();
+        let mut l = with_config(t0, app_keys());
+        let key = app(KeySize::Aes128);
+        assert_eq!(
+            l.check_key(ConnId(42), &key),
+            Err(KeyCheckError::NotPending)
+        );
+        assert!(!l.accept_with_key(ConnId(42), t0, &key));
+        assert!(sent_handshakes(&mut l).is_empty(), "no one to answer");
+        assert_eq!(KeyCheckError::NotPending.reject_code(), None);
+        // Accepted without a key (plaintext, no global secret): open, so no
+        // longer waiting, and a strict accept now changes nothing.
+        let id = waiting(&mut l, t0, 1, None);
+        assert!(l.accept(id, t0));
+        sent_handshakes(&mut l);
+        assert_eq!(l.check_key(id, &key), Err(KeyCheckError::NotPending));
+        assert!(!l.accept_with_key(id, t0, &key));
+        assert!(sent_handshakes(&mut l).is_empty());
+        assert!(l.connection_stats(id).is_some(), "still open");
+        // Forgotten after the accept timeout.
+        let id = waiting(&mut l, t0, 2, Some(&key_material(APP, KeySize::Aes128)));
+        l.handle_timeout(t0 + Duration::from_secs(5));
+        assert_eq!(l.check_key(id, &key), Err(KeyCheckError::NotPending));
+    }
+
+    #[test]
+    fn app_keys_never_downgrade_a_caller_that_sends_key_material() {
+        let t0 = Instant::now();
+        let km = key_material(APP, KeySize::Aes128);
+        for strict in [false, true] {
+            let mut l = with_config(t0, app_keys());
+            let id = waiting(&mut l, t0, 1, Some(&km));
+            // Without a secret there is no session key: refused, never plaintext.
+            assert!(!if strict {
+                l.accept_with_crypto(id, t0, None)
+            } else {
+                l.accept(id, t0)
+            });
+            assert_eq!(rejection(&mut l), Some(RejectCode::UNSECURE.0));
+        }
+    }
+
+    #[test]
+    fn app_keys_refuse_aes_192_in_the_handshake() {
+        let t0 = Instant::now();
+        let mut km = key_material(APP, KeySize::Aes128);
+        km[15] = 6;
+        let mut l = with_config(t0, app_keys());
+        let c = l.cookie(peer(), 0);
+        l.handle_datagram(t0, peer(), &conclusion_km(1, c, &km));
+        assert_eq!(l.poll_event(), None);
+        assert_eq!(rejection(&mut l), Some(RejectCode::ROGUE.0));
+    }
+
+    #[test]
+    fn without_app_keys_key_material_and_no_secret_is_refused_as_before() {
+        let t0 = Instant::now();
+        let mut l = listener(t0);
+        let c = l.cookie(peer(), 0);
+        l.handle_datagram(
+            t0,
+            peer(),
+            &conclusion_km(1, c, &key_material(APP, KeySize::Aes128)),
+        );
+        assert_eq!(l.poll_event(), None);
+        assert_eq!(rejection(&mut l), Some(RejectCode::UNSECURE.0));
+    }
+
+    /// Everything a listener sends while plaintext, matching and wrong
+    /// callers are answered with accept and accept_with_crypto.
+    fn legacy_answers(config: Config, kms: &[Vec<u8>], secret: &CryptoConfig) -> Vec<Vec<u8>> {
+        let t0 = Instant::now();
+        let mut l = with_config(t0, config);
+        let mut out = Vec::new();
+        let callers = std::iter::once(None).chain(kms.iter().map(Some));
+        for (i, km) in callers.enumerate() {
+            let socket = i as u32 + 1;
+            let c = l.cookie(peer(), 0);
+            let datagram = match km {
+                Some(km) => conclusion_km(socket, c, km),
+                None => conclusion(socket, c, vec![]),
+            };
+            l.handle_datagram(t0, peer(), &datagram);
+            while let Some(e) = l.poll_event() {
+                if let Event::Connect { id, .. } = e {
+                    let accepted = if i % 2 == 0 {
+                        l.accept(id, t0)
+                    } else {
+                        l.accept_with_crypto(id, t0, Some(secret.clone()))
+                    };
+                    out.push(vec![u8::from(accepted)]);
+                }
+            }
+            out.extend(std::iter::from_fn(|| l.poll_transmit()).map(|(_, b)| b));
+        }
+        out.push(format!("{:?}", l.stats()).into_bytes());
+        out
+    }
+
+    #[test]
+    fn app_keys_leave_accept_and_accept_with_crypto_unchanged() {
+        let secret = CryptoConfig::new(b"global lab passphrase".to_vec(), KeySize::Aes128)
+            .expect("passphrase");
+        let kms = [
+            key_material(b"global lab passphrase", KeySize::Aes128),
+            key_material(b"global lab passphrase", KeySize::Aes128),
+            key_material(b"another passphrase", KeySize::Aes128),
+            key_material(b"another passphrase", KeySize::Aes128),
+            key_material(b"global lab passphrase", KeySize::Aes256),
+        ];
+        let optional = Config {
+            crypto: Some(secret.clone()),
+            allow_plaintext: true,
+            ..Config::default()
+        };
+        let required = Config {
+            require_encryption: true,
+            ..optional.clone()
+        };
+        let scoped = Config {
+            require_encryption: true,
+            ..Config::default()
+        };
+        for base in [optional, required, scoped] {
+            let off = legacy_answers(base.clone(), &kms, &secret);
+            let on = legacy_answers(
+                Config {
+                    app_keys: true,
+                    ..base
+                },
+                &kms,
+                &secret,
+            );
+            assert_eq!(off, on, "byte for byte");
+            assert!(off.len() > kms.len() + 2);
+        }
+    }
+
+    #[test]
+    fn key_check_errors_never_carry_the_passphrase() {
+        let all = [
+            KeyCheckError::NotPending,
+            KeyCheckError::NoKeyMaterial,
+            KeyCheckError::BadSecret,
+            KeyCheckError::UnsupportedKey,
+            KeyCheckError::InvalidConfig,
+        ];
+        let config = Config {
+            crypto: Some(app(KeySize::Aes256)),
+            ..app_keys()
+        };
+        let printed = all
+            .iter()
+            .flat_map(|e| [format!("{e}"), format!("{e:?}")])
+            .chain([format!("{config:?}"), format!("{:?}", app(KeySize::Aes128))]);
+        let secret = String::from_utf8_lossy(APP);
+        for text in printed {
+            assert!(!text.contains(&*secret), "{text}");
+        }
+        let mut bad = app(KeySize::Aes128);
+        bad.preannounce_packets = 0;
+        let t0 = Instant::now();
+        let mut l = with_config(t0, app_keys());
+        let id = waiting(&mut l, t0, 1, Some(&key_material(APP, KeySize::Aes128)));
+        assert_eq!(l.check_key(id, &bad), Err(KeyCheckError::InvalidConfig));
+        assert!(!l.accept_with_key(id, t0, &bad));
+        assert_eq!(rejection(&mut l), Some(RejectCode::BADSECRET.0));
     }
 
     #[test]
