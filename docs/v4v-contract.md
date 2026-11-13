@@ -78,7 +78,8 @@ handshake carries in clear in the stream id, no longer admits on its own.
   field: a sapflow that sends none admits on the 2xx alone.
 - A 2xx may carry the stream's passphrase in one `sapflow-srt-passphrase`
   header: 10 to 79 bytes, no NUL (libsrt's limits), exactly as the encoder
-  is given it (libsrt does not percent-decode a passphrase). sapflow then
+  is given it (libsrt does not percent-decode a passphrase). Spaces and
+  tabs around the value are not part of it. sapflow then
   admits the caller only if its SRT key material was made with that
   passphrase, at key length 16 or 32, whichever the caller chose.
 - The key is checked before the path is claimed. A caller with no key
@@ -92,8 +93,8 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - A 2xx without the header admits as before. A header sent twice, or
   outside the bounds, refuses as an unusable answer does (`PREDEFINED:503`,
   not counted). The header is read only from a 2xx to an SRT request.
-- The passphrase is never logged and is kept only until the caller is
-  answered. The "SRT publisher accepted" log line says how each publisher
+- The passphrase is never logged and is dropped once the caller is
+  answered; an accepted connection keeps only the keys derived from it. The "SRT publisher accepted" log line says how each publisher
   encrypts: `encryption="none"`, `"deployment-key"` (the global
   `SAPFLOW_SRT_PASSPHRASE`), `"app-key"` or `"session-key"` (scoped), with
   `key_len`.
