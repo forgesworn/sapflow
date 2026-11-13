@@ -56,12 +56,12 @@ pub(crate) fn key(passphrase: &str, size: KeySize) -> CryptoConfig {
 /// One encoder over a real UDP socket.
 pub(crate) struct Encoder {
     caller: Caller,
-    socket: TokioUdp,
+    pub(crate) socket: TokioUdp,
     pub(crate) connected: bool,
     pub(crate) closed: Option<CallerCloseReason>,
     /// The last conclusion handshake with key material it sent, as an
     /// eavesdropper captures it.
-    conclusion: Option<Vec<u8>>,
+    pub(crate) conclusion: Option<Vec<u8>>,
     /// Conclusion responses still to drop, as if lost on the way.
     drop_responses: u32,
 }
@@ -454,6 +454,7 @@ async fn the_passphrase_never_reaches_logs_or_errors() {
         "127.0.0.1".parse().expect("ip"),
         0,
         None,
+        None,
     )
     .await
     .expect("admitted");
@@ -529,7 +530,7 @@ async fn a_caller_gone_before_the_app_answered_claims_nothing_and_is_not_counted
     // More than the throttle's ten: none of them counts.
     for _ in 0..12 {
         let Ok(Admission::Pending(keyed)) =
-            crate::srt::admit(&fixture.app, STREAM_ID, peer.ip(), 0, None).await
+            crate::srt::admit(&fixture.app, STREAM_ID, peer.ip(), 0, None, None).await
         else {
             panic!("expected a keyed admission")
         };
@@ -662,7 +663,7 @@ async fn without_the_header_a_caller_refused_at_accept_never_replaces_a_live_sta
 
 /// How the origin answered a replayed conclusion.
 #[derive(Debug, PartialEq)]
-enum Answered {
+pub(crate) enum Answered {
     Rejected(u32),
     Accepted,
     Nothing,
@@ -694,7 +695,7 @@ async fn handshake_for(socket: &TokioUdp, id: u32) -> Option<Handshake> {
 /// as its caller socket id (the captured one if `None`) and, when `induct`,
 /// a cookie for its own address from an induction first (the captured
 /// cookie stays valid only from the address it was issued to).
-async fn replay(
+pub(crate) async fn replay(
     socket: &TokioUdp,
     origin: SocketAddr,
     captured: &[u8],
@@ -929,7 +930,7 @@ async fn a_lost_response_resend_is_answered_not_refused() {
 /// Whether `ip` has no failed attempts on the fixture's throttle (ten a
 /// minute): with none, nine more still leave it allowed. Uses up nine, so
 /// call it last.
-fn uncharged(app: &Arc<App>, ip: &str) -> bool {
+pub(crate) fn uncharged(app: &Arc<App>, ip: &str) -> bool {
     let ip = ip.parse().expect("ip");
     let mut throttle = app.auth_throttle.lock().expect("throttle");
     for _ in 0..9 {

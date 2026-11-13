@@ -210,6 +210,10 @@ The durable document is bounded to 4 MiB and checksummed. Replacement writes a
 new exclusive temporary file, syncs it, renames it and syncs the parent directory.
 An uncertain durability result poisons the running authority and closes admission.
 The checksum detects corruption, not a privileged operator rolling storage back.
+The SRT replay store (`srt-replay` beside the session store unless
+`SAPFLOW_SRT_REPLAY_STORE` names another file) shares this directory, so
+restoring the directory from a backup also restores an older `srt-replay`
+and reopens replay of SRT connections admitted since the backup.
 
 Clock floors, terminal states and per-event connection epochs survive restart.
 Restart restores every grant with admission disabled and without keys. An exact

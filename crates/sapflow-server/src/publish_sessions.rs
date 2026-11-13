@@ -29,7 +29,21 @@ pub enum Refused {
     /// Its key material does not unwrap with the session's passphrase at its
     /// key length, or it sent none. Nothing was reserved for it.
     Key(KeyCheckError),
+    /// Its key material already admitted another connection: a replayed
+    /// handshake ([`crate::srt_replay`]). Nothing was reserved for it.
+    Replay,
+    /// Its key material could not be written to the replay store, so a
+    /// restart could forget it. Nothing was reserved for it.
+    Unrecorded,
 }
+
+/// Run once a caller's key has passed, under the operation lock and before
+/// anything is reserved for it: the SRT replay guard's admitted-tier check,
+/// remember and store write.
+pub type BeforeReserve = Box<
+    dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Refused>> + Send>>
+        + Send,
+>;
 impl From<Error> for Refused {
     fn from(error: Error) -> Self {
         Self::Session(error)
@@ -616,7 +630,7 @@ impl PublishSessions {
             .map_err(|error| match error {
                 Refused::Session(error) => error,
                 // Unreachable: nothing was asked to check.
-                Refused::Key(_) => Error::Denied,
+                Refused::Key(_) | Refused::Replay | Refused::Unrecorded => Error::Denied,
             })
     }
 
@@ -626,18 +640,22 @@ impl PublishSessions {
     /// will require. Checked once the credentials match and before anything
     /// else: a caller refused for its key reserves no claim, burns no
     /// connection epoch, writes nothing to the store and resumes nothing.
+    /// Once the key passes, `before_reserve` runs, still before anything is
+    /// reserved and under the same lock; its refusal reserves nothing either.
     pub async fn admit_with_key(
         &self,
         request: &PublishRequest,
         key_material: Option<Vec<u8>>,
+        before_reserve: Option<BeforeReserve>,
     ) -> Result<ScopedLease, Refused> {
-        self.admit_checked(request, Some(key_material)).await
+        self.admit_checked(request, Some((key_material, before_reserve)))
+            .await
     }
 
     async fn admit_checked(
         &self,
         request: &PublishRequest,
-        key_material: Option<Option<Vec<u8>>>,
+        key_material: Option<(Option<Vec<u8>>, Option<BeforeReserve>)>,
     ) -> Result<ScopedLease, Refused> {
         let slot = self.slot()?;
         let manager = self.clone();
@@ -678,10 +696,10 @@ impl PublishSessions {
     async fn admit_inner(
         &self,
         request: &PublishRequest,
-        key_material: Option<Option<Vec<u8>>>,
+        key_material: Option<(Option<Vec<u8>>, Option<BeforeReserve>)>,
     ) -> Result<ScopedLease, Refused> {
         let _operation = self.0.operation.lock().await;
-        if let Some(key_material) = key_material {
+        if let Some((key_material, before_reserve)) = key_material {
             // Credentials first, so a wrong password is refused below exactly
             // as before; then the key, before any draft, reservation or save.
             let crypto = {
@@ -694,6 +712,9 @@ impl PublishSessions {
                     size if size == crypto.key_size => {}
                     // The strict accept takes the session's key length only.
                     _ => return Err(Refused::Key(KeyCheckError::BadSecret)),
+                }
+                if let Some(before_reserve) = before_reserve {
+                    before_reserve().await?;
                 }
             }
         }

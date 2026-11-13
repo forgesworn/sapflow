@@ -68,6 +68,12 @@ pub enum ScopedRefusal {
     /// Its key material does not match the session's passphrase and key
     /// length, or it sent none. Nothing was reserved or claimed for it.
     Key(sapflow_srt::KeyCheckError),
+    /// Its key material already admitted another connection: a replayed
+    /// handshake. Nothing was reserved or claimed for it.
+    Replay,
+    /// Its key material could not be written to the replay store. Nothing
+    /// was reserved or claimed for it.
+    Unrecorded,
 }
 
 /// A live publisher went over the bitrate cap and is dropped.
@@ -356,7 +362,9 @@ impl Publication {
             .map_err(|refusal| match refusal {
                 ScopedRefusal::Policy(refusal) => refusal,
                 // Unreachable: nothing was asked to check.
-                ScopedRefusal::Key(_) => Refusal::Request(PublishError::Unauthorized),
+                ScopedRefusal::Key(_) | ScopedRefusal::Replay | ScopedRefusal::Unrecorded => {
+                    Refusal::Request(PublishError::Unauthorized)
+                }
             })
     }
 
@@ -364,21 +372,26 @@ impl Publication {
     /// checked against the session's passphrase before anything is reserved
     /// for it, so a caller the strict accept would refuse burns no connection
     /// epoch, writes nothing to the session store and resumes no held stage.
-    /// A key refusal counts against the address's throttle.
+    /// A key refusal counts against the address's throttle. With `seen`, the
+    /// caller's key material as the SRT replay guard compares it, key material
+    /// that already admitted a connection is refused next, and otherwise
+    /// remembered and written to the replay store before anything is
+    /// reserved; neither refusal counts against the throttle.
     pub async fn begin_scoped_srt(
         app: &Arc<App>,
         req: &PublishRequest,
         from: IpAddr,
         key_material: Option<Vec<u8>>,
+        seen: Option<crate::srt_replay::Seen>,
     ) -> Result<Self, ScopedRefusal> {
-        Self::begin_scoped(app, req, from, Some(key_material)).await
+        Self::begin_scoped(app, req, from, Some((key_material, seen))).await
     }
 
     async fn begin_scoped(
         app: &Arc<App>,
         req: &PublishRequest,
         from: IpAddr,
-        key_material: Option<Option<Vec<u8>>>,
+        key_material: Option<(Option<Vec<u8>>, Option<crate::srt_replay::Seen>)>,
     ) -> Result<Self, ScopedRefusal> {
         let Some(manager) = &app.publish_sessions else {
             return Err(ScopedRefusal::Policy(Refusal::Request(
@@ -396,7 +409,13 @@ impl Publication {
         use crate::publish_sessions::{Error, Refused};
         let admitted = match key_material {
             None => manager.admit(req).await.map_err(Refused::Session),
-            Some(key_material) => manager.admit_with_key(req, key_material).await,
+            Some((key_material, seen)) => {
+                let before_reserve =
+                    seen.map(|seen| crate::srt_replay::scoped_check(app, req.path.as_path(), seen));
+                manager
+                    .admit_with_key(req, key_material, before_reserve)
+                    .await
+            }
         };
         let scope = admitted.map_err(|refused| {
             if matches!(refused, Refused::Session(Error::Denied) | Refused::Key(_)) {
@@ -407,6 +426,8 @@ impl Publication {
             }
             match refused {
                 Refused::Key(error) => ScopedRefusal::Key(error),
+                Refused::Replay => ScopedRefusal::Replay,
+                Refused::Unrecorded => ScopedRefusal::Unrecorded,
                 Refused::Session(Error::Busy) => ScopedRefusal::Policy(Refusal::AlreadyLive),
                 Refused::Session(_) => {
                     ScopedRefusal::Policy(Refusal::Request(PublishError::Unauthorized))

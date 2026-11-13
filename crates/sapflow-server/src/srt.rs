@@ -47,6 +47,13 @@ pub enum Refused {
     /// own code ([`sapflow_srt::KeyCheckError::reject_code`]), as the accept
     /// answered it.
     Key(sapflow_srt::KeyCheckError),
+    /// A scoped caller whose key material already admitted another
+    /// connection, refused as a wrong passphrase is (`BADSECRET`), without
+    /// counting against the throttle.
+    Replay,
+    /// A scoped caller whose key material the replay store could not keep:
+    /// refused, nothing reserved.
+    Unrecorded,
 }
 
 impl Refused {
@@ -70,8 +77,9 @@ impl Refused {
                 | Refusal::MemoryLimit,
             )
             | Self::PublisherLimit => 402,
-            // Not sent as a status: see `Refused::Key`.
-            Self::Key(_) => 401,
+            // Not sent as a status: see `Refused::Key` and `Refused::Replay`.
+            Self::Key(_) | Self::Replay => 401,
+            Self::Unrecorded => 503,
         }
     }
 }
@@ -126,6 +134,7 @@ pub async fn admit(
     from: IpAddr,
     active: usize,
     key_material: Option<Vec<u8>>,
+    seen: Option<crate::srt_replay::Seen>,
 ) -> Result<Admission, Refused> {
     let admitted = match PublishRequest::parse_srt_stream_id(stream_id) {
         Err(e) => Err(Refused::Policy(Refusal::Request(e))),
@@ -136,12 +145,14 @@ pub async fn admit(
         Ok(req) if app.publish_sessions.is_none() => admit_unclaimed(app, req, from)
             .await
             .map_err(Refused::Policy),
-        Ok(req) => Publication::begin_scoped_srt(app, &req, from, key_material)
+        Ok(req) => Publication::begin_scoped_srt(app, &req, from, key_material, seen)
             .await
             .map(Admission::Claimed)
             .map_err(|refusal| match refusal {
                 ScopedRefusal::Policy(refusal) => Refused::Policy(refusal),
                 ScopedRefusal::Key(error) => Refused::Key(error),
+                ScopedRefusal::Replay => Refused::Replay,
+                ScopedRefusal::Unrecorded => Refused::Unrecorded,
             }),
     };
     if let Err(r) = &admitted {
@@ -150,6 +161,11 @@ pub async fn admit(
             Refused::Policy(p) => app.log_refusal("srt", p),
             // The error names the failure only, never the key.
             Refused::Key(error) => app.log_refusal("srt", error),
+            Refused::Replay => {
+                app.log_refusal("srt", &"key material already admitted another connection")
+            }
+            // Logged as an error where the write failed.
+            Refused::Unrecorded => {}
         }
     }
     admitted

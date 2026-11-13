@@ -604,7 +604,7 @@ mod tests {
         let fixture = fixture(stub.endpoint.clone());
         assert!(!fixture.app.config.srt_app_keys);
         let stream_id = format!("publish:live/event-a:encoder:{PASSWORD}");
-        let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0, None)
+        let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0, None, None)
             .await
             .expect("admitted");
         // Admitted but not claimed: the listener claims once it knows the
@@ -632,7 +632,7 @@ mod tests {
             .config
             .srt_app_keys = true;
         let stream_id = format!("publish:live/event-a:encoder:{PASSWORD}");
-        let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0, None)
+        let admission = crate::srt::admit(&fixture.app, &stream_id, from(), 0, None, None)
             .await
             .expect("admitted");
         // Keyed: nothing is claimed until the listener checks the key.

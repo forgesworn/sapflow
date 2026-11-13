@@ -47,8 +47,9 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            SAPFLOW_SRT_APP_KEYS=1: digests of admitted
                            callers' key material, kept across restarts so a
                            recorded handshake and its media cannot be
-                           replayed after one. Unreadable or malformed at
-                           start refuses to start
+                           replayed after one. In scoped mode it defaults
+                           to srt-replay beside SAPFLOW_SESSION_STORE.
+                           Unreadable or malformed at start refuses to start
   SAPFLOW_SRT_REORDER_WAIT_MAX_MS  once a caller's path reorders packets, hold
                            a new gap's first NAK up to this long, so a packet
                            that is only late is not resent (default 50, 0 to
@@ -162,6 +163,24 @@ rtmp://<host>:1935/live with key <eventId>?user=<user>&pass=<pass>, or WHIP,
 POST <SAPFLOW_WHIP_PUBLIC_URL>/whip/live/<eventId> with bearer <user>:<pass>.
 Play at http://<host>:8888/live/<eventId>/index.m3u8.
 ";
+
+/// Whether two stores in one directory would use the same file: each keeps
+/// `<name>`, `<name>.lock` and `.<name>.tmp-*` beside it.
+fn stores_share_files(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a.parent() != b.parent() {
+        return false;
+    }
+    let (Some(a), Some(b)) = (
+        a.file_name().and_then(|n| n.to_str()),
+        b.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return a == b;
+    };
+    let one_way = |x: &str, y: &str| {
+        x == y || x == format!("{y}.lock") || x.starts_with(&format!(".{y}.tmp-"))
+    };
+    one_way(a, b) || one_way(b, a)
+}
 
 /// Every setting, as an environment variable.
 const KEYS: &[&str] = &[
@@ -633,6 +652,19 @@ impl Config {
         if srt_app_keys && publish_auth.is_none() {
             return Err(ConfigError::Invalid(
                 "SAPFLOW_SRT_APP_KEYS=1 requires SAPFLOW_PUBLISH_AUTH_URL: the app returns each stream's passphrase".into(),
+            ));
+        }
+        // Scoped sessions keep their digests beside the session store, whose
+        // private directory already outlives restarts, unless told otherwise.
+        let srt_replay_store = match (srt_replay_store, &control) {
+            (None, Some(control)) => Some(control.store.with_file_name("srt-replay")),
+            (store, _) => store,
+        };
+        if let (Some(replay), Some(control)) = (&srt_replay_store, &control)
+            && stores_share_files(replay, &control.store)
+        {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_SRT_REPLAY_STORE and SAPFLOW_SESSION_STORE would share a file (the store, its .lock or its temporary files); set SAPFLOW_SRT_REPLAY_STORE to another name".into(),
             ));
         }
         if srt_app_keys && srt_replay_store.is_none() {
@@ -2143,6 +2175,67 @@ mod tests {
             Err(ConfigError::Invalid(m)) if m.contains("scoped control mode")
         ));
         assert!(HELP.contains("SAPFLOW_SRT_APP_KEYS"));
+    }
+
+    #[test]
+    fn scoped_mode_keeps_the_replay_store_beside_the_session_store() {
+        let scoped = |extra: &[(&'static str, &'static str)]| {
+            let mut env = vec![
+                ("SAPFLOW_CONTROL_ADDR", "127.0.0.1:9000"),
+                (
+                    "SAPFLOW_CONTROL_TOKEN",
+                    "independent-control-token-32-bytes-minimum",
+                ),
+                ("SAPFLOW_SESSION_STORE", "/var/lib/sapflow/sessions.json"),
+            ];
+            env.extend_from_slice(extra);
+            load(&env, &[])
+        };
+        let c = scoped(&[]).expect("scoped");
+        assert_eq!(
+            c.srt_replay_store.as_deref(),
+            Some(std::path::Path::new("/var/lib/sapflow/srt-replay"))
+        );
+        let c = scoped(&[("SAPFLOW_SRT_REPLAY_STORE", "/srv/replay/digests")]).expect("own");
+        assert_eq!(
+            c.srt_replay_store.as_deref(),
+            Some(std::path::Path::new("/srv/replay/digests"))
+        );
+        for replay in [
+            "/var/lib/sapflow/sessions.json",
+            "/var/lib/sapflow/sessions.json.lock",
+            "/var/lib/sapflow/.sessions.json.tmp-0011",
+        ] {
+            let Err(ConfigError::Invalid(error)) = scoped(&[("SAPFLOW_SRT_REPLAY_STORE", replay)])
+            else {
+                panic!("{replay} accepted beside the session store")
+            };
+            assert!(error.contains("would share a file"), "{error}");
+        }
+        // A session store named for the default replay store's own files.
+        for session in [
+            "/var/lib/sapflow/srt-replay",
+            "/var/lib/sapflow/srt-replay.lock",
+            "/var/lib/sapflow/.srt-replay.tmp-0011223344556677",
+        ] {
+            let env = [
+                ("SAPFLOW_CONTROL_ADDR", "127.0.0.1:9000"),
+                (
+                    "SAPFLOW_CONTROL_TOKEN",
+                    "independent-control-token-32-bytes-minimum",
+                ),
+                ("SAPFLOW_SESSION_STORE", session),
+            ];
+            let Err(ConfigError::Invalid(error)) = load(&env, &[]) else {
+                panic!("session store {session} accepted")
+            };
+            assert!(error.contains("would share a file"), "{error}");
+        }
+        // Another directory is fine whatever the names.
+        assert!(scoped(&[("SAPFLOW_SRT_REPLAY_STORE", "/srv/r/sessions.json")]).is_ok());
+        // Outside scoped mode and app keys there is no store by default.
+        let open = load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &[]).expect("open");
+        assert!(open.srt_replay_store.is_none());
     }
 
     #[test]

@@ -208,6 +208,9 @@ pub struct ReplayStore {
     written: u64,
     #[cfg(test)]
     pub(crate) fail_before_rename: bool,
+    /// How long each write stalls before its rename, as on a hung disk.
+    #[cfg(test)]
+    pub(crate) stall: std::time::Duration,
 }
 
 /// What the lock holds once a store has been written beside it.
@@ -254,6 +257,8 @@ impl ReplayStore {
             written: 0,
             #[cfg(test)]
             fail_before_rename: false,
+            #[cfg(test)]
+            stall: std::time::Duration::ZERO,
         };
         store.remove_stale_temporaries()?;
         let records = match store.read()? {
@@ -378,6 +383,8 @@ impl ReplayStore {
             file.write_all(bytes)
                 .map_err(|e| io_error("write temporary", e))?;
             file.sync_all().map_err(|e| io_error("sync temporary", e))?;
+            #[cfg(test)]
+            std::thread::sleep(self.stall);
             #[cfg(test)]
             if self.fail_before_rename {
                 return Err(io_error("rename", io::Error::other("test fault")));
