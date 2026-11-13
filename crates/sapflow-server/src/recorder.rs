@@ -22,6 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::callback::Callbacks;
 use crate::publish_observer::RecordingObservation;
+use crate::recording_outbox::{Entry, Finished, Outbox, OutboxEntry};
 use crate::stream::Tracks;
 
 /// Writes behind ingest by at most this many parts (about 50 s) before
@@ -230,10 +231,15 @@ pub enum IncompleteReason {
     EpochRate,
     /// sapflow was stopped (SIGTERM or ctrl-c) while the publisher was live.
     ServerStopped,
+    /// sapflow ended before this file was finished (SIGKILL, OOM kill, a
+    /// crash, a power cut, or a stop whose deadline passed first): reported
+    /// at the next start with what of the file can be decoded. Only
+    /// recovery ([`crate::recording_recovery`]) uses it.
+    ServerInterrupted,
 }
 
 impl IncompleteReason {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::TransportDrop,
         Self::TransportTimeout,
         Self::IngestQueueFull,
@@ -250,6 +256,7 @@ impl IncompleteReason {
         Self::EpochUnrecorded,
         Self::EpochRate,
         Self::ServerStopped,
+        Self::ServerInterrupted,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -270,7 +277,13 @@ impl IncompleteReason {
             Self::EpochUnrecorded => "epoch-unrecorded",
             Self::EpochRate => "epoch-rate",
             Self::ServerStopped => "server-stopped",
+            Self::ServerInterrupted => "server-interrupted",
         }
+    }
+
+    /// The reason whose [`as_str`](Self::as_str) is `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == name)
     }
 
     fn from_code(code: u8) -> Option<Self> {
@@ -807,6 +820,7 @@ fn publish_recording(
     file_path: &Path,
     duration: Duration,
     recording_tracks: RecordingTracks,
+    entry: Option<OutboxEntry>,
 ) {
     if let Some(observation) = &receipt.observation {
         if complete {
@@ -828,12 +842,19 @@ fn publish_recording(
         path,
         StreamEvent::RecordSegmentComplete {
             segment_path: file_path.display().to_string(),
-            duration_secs: (duration.as_secs_f64() * 1000.0).round() / 1000.0,
+            duration_secs: duration_ms(duration) as f64 / 1000.0,
             recording_tracks,
         },
         complete,
         reason.map(IncompleteReason::as_str),
+        entry,
     );
+}
+
+/// A callback's duration, in whole milliseconds as `segmentDuration` gives
+/// it.
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
+    (duration.as_secs_f64() * 1000.0).round() as u64
 }
 
 trait RecordingFile: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin + Send {
@@ -925,7 +946,8 @@ impl RecordingWriter {
         #[cfg(test)]
         if let Some(files) = &self.test_files {
             let (path, file) = files.open(&self.path, self.observation.as_ref().map(|o| o.id()));
-            self.write_file(file, path, rx, tracks, init, receipt).await;
+            self.write_file(file, path, rx, tracks, init, receipt, None)
+                .await;
             return;
         }
         let start = SystemTime::now()
@@ -947,10 +969,40 @@ impl RecordingWriter {
         let Some((file_path, file)) = created else {
             return;
         };
-        self.write_file(file, file_path, rx, tracks, init, receipt)
+        // Durable before any of the file is written, so a crash from here
+        // on leaves the file with its entry.
+        let entry = self.open_entry(&file_path, &tracks).await;
+        self.write_file(file, file_path, rx, tracks, init, receipt, entry)
             .await;
     }
 
+    /// The recording's outbox entry, written `open`. None without an outbox,
+    /// or if it cannot be written: the recording goes on regardless.
+    async fn open_entry(&self, file_path: &Path, tracks: &Tracks) -> Option<OutboxEntry> {
+        let outbox: Arc<Outbox> = self.callbacks.outbox()?.clone();
+        let Some(file) = outbox.relative(file_path) else {
+            tracing::error!(file = %file_path.display(), "recording is not in the outbox's directory");
+            return None;
+        };
+        let recording_id = self.observation.as_ref().map_or("", |o| o.id());
+        let Some(scoped) = self.callbacks.recovery_identity(recording_id) else {
+            tracing::error!(
+                file,
+                "no callback sequence left to reserve; this recording has no outbox entry"
+            );
+            return None;
+        };
+        let entry = Entry::new(
+            file,
+            tracks.video().is_some(),
+            tracks.audio_config().is_some(),
+            tracks.audio_rate(),
+            scoped,
+        );
+        OutboxEntry::open(outbox, entry).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn write_file(
         self,
         mut file: impl RecordingFile,
@@ -959,8 +1011,9 @@ impl RecordingWriter {
         tracks: Tracks,
         init: bytes::Bytes,
         receipt: WriteReceipt,
+        entry: Option<OutboxEntry>,
     ) {
-        self.write_open_file(&mut file, &file_path, rx, tracks, init, receipt)
+        self.write_open_file(&mut file, &file_path, rx, tracks, init, receipt, entry)
             .await;
         // Tokio can return from write_all after copying into an owned buffer,
         // while blocking I/O still holds that buffer and the underlying file.
@@ -972,6 +1025,10 @@ impl RecordingWriter {
         }
     }
 
+    /// Only the decided failures below, which owe the app nothing, remove
+    /// the outbox entry. Any other end of this future (the runtime dropping
+    /// it at the stop deadline, say) leaves the entry for the next start.
+    #[allow(clippy::too_many_arguments)]
     async fn write_open_file(
         self,
         file: &mut impl RecordingFile,
@@ -980,10 +1037,12 @@ impl RecordingWriter {
         tracks: Tracks,
         init: bytes::Bytes,
         mut receipt: WriteReceipt,
+        mut entry: Option<OutboxEntry>,
     ) {
         let Some(recording_tracks) =
             RecordingTracks::new(tracks.video().is_some(), tracks.audio_config().is_some())
         else {
+            discard(entry).await;
             return;
         };
         if let Some(observation) = &self.observation {
@@ -1029,16 +1088,33 @@ impl RecordingWriter {
         // Now the length is known: rewrite the init in place (same size).
         let Some(final_init) = tracks.recording_init(duration) else {
             tracing::error!(file = %file_path.display(), "recording header is invalid");
+            discard(entry).await;
             return;
         };
         if failed || finalise_file(file, init.len(), &final_init).await.is_err() {
             tracing::error!(file = %file_path.display(), "recording write failed");
+            discard(entry).await;
             return;
         }
         let Some(complete) = self.status.try_commit() else {
             tracing::error!(file = %file_path.display(), "recording input failed");
+            discard(entry).await;
             return;
         };
+        let reason = self.status.reason();
+        if let Some(entry) = &mut entry {
+            entry
+                .finish(Finished {
+                    complete,
+                    reason: if complete {
+                        None
+                    } else {
+                        reason.map(|r| r.as_str().to_owned())
+                    },
+                    duration_ms: duration_ms(duration),
+                })
+                .await;
+        }
         publish_recording(
             &mut receipt,
             complete,
@@ -1048,7 +1124,15 @@ impl RecordingWriter {
             file_path,
             duration,
             recording_tracks,
+            entry,
         );
+    }
+}
+
+/// Removes the entry of a file the writer decided owes nothing.
+async fn discard(entry: Option<OutboxEntry>) {
+    if let Some(entry) = entry {
+        entry.remove().await;
     }
 }
 
@@ -1109,12 +1193,23 @@ async fn create_scoped(
 }
 
 /// Deletes recordings older than `max_age`, every ten minutes. Only files
-/// named like ours, under `live/<eventId>/`, are touched.
-pub async fn expire_forever(dir: PathBuf, max_age: Duration) {
+/// named like ours, under `live/<eventId>/`, are touched. Then removes the
+/// outbox entries of recordings that have gone or are as old.
+pub async fn expire_forever(dir: PathBuf, max_age: Duration, outbox: Option<Arc<Outbox>>) {
     loop {
         let removed = expire(&dir, max_age, SystemTime::now()).await;
         if removed > 0 {
             tracing::info!(removed, "expired old recordings");
+        }
+        if let Some(outbox) = &outbox {
+            let outbox = outbox.clone();
+            let swept =
+                tokio::task::spawn_blocking(move || outbox.sweep(max_age, SystemTime::now()))
+                    .await
+                    .unwrap_or(0);
+            if swept > 0 {
+                tracing::info!(removed = swept, "expired recording outbox entries");
+            }
         }
         tokio::time::sleep(Duration::from_secs(600)).await;
     }
@@ -1970,7 +2065,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let writer_guard = reservation;
             writer
-                .write_file(file, file_path, input, tracks, init.into(), receipt)
+                .write_file(file, file_path, input, tracks, init.into(), receipt, None)
                 .await;
             drop(writer_guard);
         });
@@ -2133,9 +2228,11 @@ mod tests {
         let mut names = std::collections::HashSet::new();
         for reason in IncompleteReason::ALL {
             assert_eq!(IncompleteReason::from_code(reason as u8), Some(reason));
+            assert_eq!(IncompleteReason::from_name(reason.as_str()), Some(reason));
             assert!(names.insert(reason.as_str()), "{reason:?}");
         }
         assert_eq!(IncompleteReason::from_code(0), None);
+        assert_eq!(IncompleteReason::from_name("server-crashed"), None);
     }
 
     #[test]
@@ -3172,6 +3269,7 @@ mod tests {
                         Path::new("recording.mp4"),
                         first.span,
                         RecordingTracks::AudioVideo,
+                        None,
                     );
                 }
                 drop(receipt);

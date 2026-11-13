@@ -20,6 +20,10 @@ mod publish_session_store;
 mod publish_session_wire;
 mod publish_sessions;
 mod recorder;
+mod recording_outbox;
+mod recording_recovery;
+#[cfg(test)]
+mod recording_recovery_tests;
 mod roll_budget;
 mod rtmp;
 mod shutdown;
@@ -184,11 +188,33 @@ async fn run(config: Config) -> std::io::Result<()> {
         }
         None => srt_replay::ReplayGuard::default(),
     };
+    // Recordings owe callbacks only when there is a URL to send them to.
+    let outbox = match (&config.recordings, &config.callback_url) {
+        (Some(dir), Some(_)) => open_outbox(dir.clone()).await,
+        _ => None,
+    };
+    // Listed before any listener starts: none of this run's own entries.
+    let recovery = match &outbox {
+        Some(outbox) => {
+            let outbox = outbox.clone();
+            tokio::task::spawn_blocking(move || {
+                recording_recovery::Pending::list(&outbox, recording_recovery::MAX_PER_START)
+            })
+            .await
+            .ok()
+        }
+        None => None,
+    };
+    let mut callbacks =
+        Callbacks::start(config.callback_url.clone(), config.callback_secret.clone());
+    if let Some(outbox) = &outbox {
+        callbacks = callbacks.with_outbox(outbox.clone());
+    }
     let app = Arc::new(App {
         srt_replay: std::sync::Mutex::new(srt_replay),
         recording_limits: Arc::new(recorder::RecordingLimits::new(config.max_publishers)),
         publish_sessions,
-        callbacks: Callbacks::start(config.callback_url.clone(), config.callback_secret.clone()),
+        callbacks,
         streams: Arc::new(Registry::with_budgets(
             config.max_presentations,
             config.max_fragment_bytes,
@@ -315,8 +341,27 @@ async fn run(config: Config) -> std::io::Result<()> {
         tokio::spawn(recorder::expire_forever(
             dir.clone(),
             app.config.record_delete_after,
+            outbox.clone(),
         ));
     }
+    // Publishers connect while earlier runs' recordings are reported.
+    let recovery_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            if let (Some(outbox), Some(pending)) = (outbox, recovery)
+                && pending.len() > 0
+            {
+                recording_recovery::run(
+                    outbox,
+                    pending,
+                    app.callbacks.clone(),
+                    app.config.record_delete_after,
+                    recording_recovery::Pacing::PRODUCTION,
+                )
+                .await;
+            }
+        }
+    });
 
     // Stopped once every stream has ended, so that no claim can come between.
     let listeners = [
@@ -326,6 +371,9 @@ async fn run(config: Config) -> std::io::Result<()> {
         control_task.abort_handle(),
         whip_task.abort_handle(),
         expiry_task.abort_handle(),
+        // A stop sends no more recovered recordings; the one in the queue,
+        // if any, is waited for like any other callback.
+        recovery_task.abort_handle(),
     ];
     tokio::select! {
         () = stop_signal() => {
@@ -353,6 +401,23 @@ async fn run(config: Config) -> std::io::Result<()> {
         r = control_task => r.map_err(std::io::Error::other)?,
         r = whip_task => r.map_err(std::io::Error::other)?,
         r = expiry_task => r.map_err(std::io::Error::other)?,
+    }
+}
+
+/// The recording outbox in `dir`, or None, loudly: recording goes on
+/// without it, but a recording a crash interrupts then goes unreported.
+async fn open_outbox(dir: std::path::PathBuf) -> Option<Arc<recording_outbox::Outbox>> {
+    let opened = tokio::task::spawn_blocking(move || recording_outbox::Outbox::open(&dir)).await;
+    match opened {
+        Ok(Ok(outbox)) => Some(Arc::new(outbox)),
+        Ok(Err(error)) => {
+            tracing::error!(
+                %error,
+                "recording outbox unavailable: recordings are made and reported as before, but one that a crash, SIGKILL or power cut interrupts, or whose callback is not delivered, will not be reported at the next start"
+            );
+            None
+        }
+        Err(_) => None,
     }
 }
 

@@ -4,6 +4,10 @@
 //!
 //! Events go through one queue and are sent in order, so an `unpublish`
 //! never overtakes the `publish` before it.
+//!
+//! A `recordSegmentComplete` can carry its recording's outbox entry
+//! ([`crate::recording_outbox`]): the sender removes the entry once the app
+//! has answered 2xx, and leaves it otherwise, for the next start to send.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,10 +16,11 @@ use bytes::Bytes;
 use sapflow_core::{StreamEvent, StreamPath, callback_url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::http_lite::{self, Endpoint, ParsedResponse};
 use crate::publish_observer::{CallbackScope, CallbackTicket, RecordingObservation};
+use crate::recording_outbox::{Outbox, OutboxEntry, ScopedIdentity};
 
 const QUEUE: usize = 512;
 const MAX_BODY: usize = 16 * 1024;
@@ -29,7 +34,22 @@ pub(crate) struct Queued {
     name: &'static str,
     pub(crate) body: Bytes,
     ticket: Option<CallbackTicket>,
+    /// A recording's outbox entry, removed once the app has answered 2xx.
+    entry: Option<OutboxEntry>,
+    /// Told how the sender finished with the event.
+    done: Option<oneshot::Sender<Delivery>>,
     _pending: Pending,
+}
+
+/// How the sender finished with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// The app answered 2xx.
+    Delivered,
+    /// The app answered 4xx: not retried.
+    Refused,
+    /// Every attempt failed, or the URL is not valid.
+    Failed,
 }
 
 /// Counts one event from enqueue until the sender is done with it, delivered
@@ -57,6 +77,8 @@ pub struct Callbacks {
     recording: Option<RecordingObservation>,
     /// Events queued and not yet done with, shared by every clone.
     pending: Arc<watch::Sender<usize>>,
+    /// Where recordings keep their owed callbacks; only with a queue.
+    outbox: Option<Arc<Outbox>>,
 }
 
 impl Callbacks {
@@ -76,7 +98,39 @@ impl Callbacks {
             scope: None,
             recording: None,
             pending: Arc::new(watch::Sender::new(0)),
+            outbox: None,
         }
+    }
+
+    /// Recordings keep their owed callbacks in `outbox`. Without a callback
+    /// URL nothing is owed, and no outbox is kept.
+    pub fn with_outbox(mut self, outbox: Arc<Outbox>) -> Self {
+        if self.tx.is_some() {
+            self.outbox = Some(outbox);
+        }
+        self
+    }
+
+    pub(crate) fn outbox(&self) -> Option<&Arc<Outbox>> {
+        self.outbox.as_ref()
+    }
+
+    /// The identity a recovered completion of the recording `recording_id`
+    /// would carry: none for the legacy contract (`Some(None)`). A scoped
+    /// one reserves its own sequence now, since after a restart there is no
+    /// connection to take one from; live sequences skip it. None if the
+    /// sequence is exhausted.
+    pub(crate) fn recovery_identity(&self, recording_id: &str) -> Option<Option<ScopedIdentity>> {
+        let Some(scope) = &self.scope else {
+            return Some(None);
+        };
+        Some(Some(ScopedIdentity {
+            event_generation: scope.key().event_generation.get(),
+            session_id: scope.key().session_id.as_str().to_owned(),
+            connection_epoch: scope.connection_epoch(),
+            event_sequence: scope.next_sequence()?,
+            recording_id: recording_id.to_owned(),
+        }))
     }
 
     pub fn scoped(&self, scope: Arc<CallbackScope>) -> Self {
@@ -85,6 +139,7 @@ impl Callbacks {
             scope: Some(scope),
             recording: None,
             pending: self.pending.clone(),
+            outbox: self.outbox.clone(),
         }
     }
 
@@ -112,7 +167,7 @@ impl Callbacks {
     }
 
     pub fn send(&self, path: &StreamPath, event: StreamEvent) {
-        self.send_inner(path, event, None);
+        self.send_inner(path, event, None, None);
     }
 
     /// Freeze the writer's synchronised result into both callback contracts.
@@ -123,8 +178,33 @@ impl Callbacks {
         event: StreamEvent,
         complete: bool,
         reason: Option<&str>,
+        entry: Option<OutboxEntry>,
     ) {
-        self.send_inner(path, event, Some((complete, reason)));
+        self.send_inner(path, event, Some((complete, reason)), entry);
+    }
+
+    /// Queues a completion recovered at start ([`crate::recording_recovery`]),
+    /// its body as [`completion_body`] made it. None if the queue refused it.
+    pub(crate) fn send_recovered(
+        &self,
+        path: &StreamPath,
+        body: Bytes,
+        entry: OutboxEntry,
+    ) -> Option<oneshot::Receiver<Delivery>> {
+        let tx = self.tx.as_ref()?;
+        let (done, outcome) = oneshot::channel();
+        tracing::info!(path = %path.as_path(), file = entry.file(), "recovered recording event");
+        tx.try_send(Queued {
+            path: path.clone(),
+            name: "recordSegmentComplete",
+            body,
+            ticket: None,
+            entry: Some(entry),
+            done: Some(done),
+            _pending: Pending::new(&self.pending),
+        })
+        .ok()?;
+        Some(outcome)
     }
 
     fn send_inner(
@@ -132,6 +212,7 @@ impl Callbacks {
         path: &StreamPath,
         event: StreamEvent,
         completion: Option<(bool, Option<&str>)>,
+        entry: Option<OutboxEntry>,
     ) {
         tracing::info!(path = %path.as_path(), event = event.name(), "stream event");
         // Allocation, sequencing and enqueue are serialised per immutable
@@ -154,28 +235,18 @@ impl Callbacks {
             if !matches!(event, StreamEvent::RecordSegmentComplete { .. }) {
                 return None;
             }
-            let state = if complete { "finalised" } else { "incomplete" };
             let mut body: serde_json::Value = serde_json::from_str(&body).ok()?;
-            let object = body.as_object_mut()?;
-            // A scoped completion must also have passed the existing sync
-            // receipt gate; never overwrite a conflicting writer observation.
-            if object
-                .get("recordingState")
-                .is_some_and(|value| value != state)
-            {
-                return None;
-            }
-            object.insert("recordingState".into(), state.into());
-            object.insert(
-                "recordingReason".into(),
-                if complete { None } else { reason }.into(),
-            );
+            completion_fields(body.as_object_mut()?, complete, reason)?;
             let body = serde_json::to_string(&body).ok()?;
             (body.len() <= MAX_BODY).then_some(body)
         });
         let Some(body) = body else {
             if let Some(scope) = &self.scope {
                 scope.observations.callback_failed();
+            }
+            // Refused here, it is refused for good: nothing is owed later.
+            if let Some(entry) = entry {
+                entry.remove_soon();
             }
             tracing::warn!(event = event.name(), "callback body refused");
             return;
@@ -189,6 +260,8 @@ impl Callbacks {
             name: event.name(),
             body: Bytes::from(body),
             ticket,
+            entry,
+            done: None,
             _pending: Pending::new(&self.pending),
         };
         if let Err(error) = tx.try_send(queued) {
@@ -226,36 +299,131 @@ impl Callbacks {
         let sequence = scope.next_sequence()?;
         let mut body: serde_json::Value = serde_json::from_str(&legacy).ok()?;
         let object = body.as_object_mut()?;
-        object.insert("contractVersion".into(), 1.into());
-        object.insert("eventId".into(), path.event_id().into());
-        object.insert(
-            "eventGeneration".into(),
-            scope.key().event_generation.get().into(),
+        scoped_fields(
+            object,
+            path,
+            scope.key().event_generation.get(),
+            scope.key().session_id.as_str(),
+            scope.connection_epoch(),
+            sequence,
         );
-        object.insert("sessionId".into(), scope.key().session_id.as_str().into());
-        object.insert("connectionEpoch".into(), scope.connection_epoch().into());
-        object.insert("eventSequence".into(), sequence.into());
         if let StreamEvent::RecordSegmentComplete {
             recording_tracks, ..
         } = event
         {
             let recording = self.recording.as_ref()?;
-            object.insert("recordingId".into(), recording.id().into());
-            object.insert(
-                "recordingState".into(),
-                recording.completion_state()?.into(),
-            );
-            object.insert(
-                "recordingTracks".into(),
-                serde_json::json!({
-                    "hasVideo": recording_tracks.has_video(),
-                    "hasAudio": recording_tracks.has_audio(),
-                }),
+            recording_fields(
+                object,
+                recording.id(),
+                recording.completion_state()?,
+                *recording_tracks,
             );
         }
         let body = serde_json::to_string(&body).ok()?;
         (body.len() <= MAX_BODY).then_some(body)
     }
+}
+
+/// The scoped contract's identity fields.
+fn scoped_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    path: &StreamPath,
+    generation: u64,
+    session_id: &str,
+    connection_epoch: u64,
+    sequence: u64,
+) {
+    object.insert("contractVersion".into(), 1.into());
+    object.insert("eventId".into(), path.event_id().into());
+    object.insert("eventGeneration".into(), generation.into());
+    object.insert("sessionId".into(), session_id.into());
+    object.insert("connectionEpoch".into(), connection_epoch.into());
+    object.insert("eventSequence".into(), sequence.into());
+}
+
+/// A scoped completion's recording fields.
+fn recording_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    recording_id: &str,
+    state: &str,
+    tracks: sapflow_core::RecordingTracks,
+) {
+    object.insert("recordingId".into(), recording_id.into());
+    object.insert("recordingState".into(), state.into());
+    object.insert(
+        "recordingTracks".into(),
+        serde_json::json!({
+            "hasVideo": tracks.has_video(),
+            "hasAudio": tracks.has_audio(),
+        }),
+    );
+}
+
+/// Both contracts' writer integrity. None if a scoped body already says
+/// otherwise: a scoped completion must also have passed the existing sync
+/// receipt gate, and a conflicting writer observation is never overwritten.
+fn completion_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    complete: bool,
+    reason: Option<&str>,
+) -> Option<()> {
+    let state = if complete { "finalised" } else { "incomplete" };
+    if object
+        .get("recordingState")
+        .is_some_and(|value| value != state)
+    {
+        return None;
+    }
+    object.insert("recordingState".into(), state.into());
+    object.insert(
+        "recordingReason".into(),
+        if complete { None } else { reason }.into(),
+    );
+    Some(())
+}
+
+/// A `recordSegmentComplete` body for a recording reported after a restart,
+/// built as the live one is: the same fields, and for a scoped recording the
+/// identity it had, with the sequence it reserved ([`ScopedIdentity`]).
+pub(crate) fn completion_body(
+    path: &StreamPath,
+    segment_path: String,
+    duration_secs: f64,
+    recording_tracks: sapflow_core::RecordingTracks,
+    scoped: Option<&ScopedIdentity>,
+    complete: bool,
+    reason: Option<&str>,
+) -> Option<Bytes> {
+    let event = StreamEvent::RecordSegmentComplete {
+        segment_path,
+        duration_secs,
+        recording_tracks,
+    };
+    let legacy = event.callback_body(path);
+    if legacy.len() > MAX_BODY {
+        return None;
+    }
+    let mut body: serde_json::Value = serde_json::from_str(&legacy).ok()?;
+    let object = body.as_object_mut()?;
+    if let Some(scoped) = scoped {
+        scoped_fields(
+            object,
+            path,
+            scoped.event_generation,
+            &scoped.session_id,
+            scoped.connection_epoch,
+            scoped.event_sequence,
+        );
+        recording_fields(
+            object,
+            &scoped.recording_id,
+            if complete { "finalised" } else { "incomplete" },
+            recording_tracks,
+        );
+    }
+    completion_fields(object, complete, reason)?;
+    let body = serde_json::to_string(&body).ok()?;
+    (body.len() <= MAX_BODY).then(|| Bytes::from(body))
 }
 
 /// A queue without a publish-session scope: the legacy, global-publisher mode.
@@ -393,6 +561,7 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
         let url = callback_url(&template, &queued.path, secret.as_deref());
         let mut delay = Duration::from_millis(500);
         let mut delivered = false;
+        let mut refused = false;
         // The URL carries the secret: it is parsed here and never logged.
         if let Some(endpoint) = Endpoint::parse(&url) {
             for attempt_number in 1..=4 {
@@ -405,6 +574,7 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
                     Ok(status) if (400..500).contains(&status) => {
                         // v4v refused it (wrong token or path): retrying won't help.
                         tracing::warn!(event = queued.name, status, "callback refused");
+                        refused = true;
                         break;
                     }
                     Ok(status) => {
@@ -440,6 +610,30 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
         }
         if let Some(ticket) = queued.ticket.take() {
             ticket.finish(delivered);
+        }
+        // Removed before the event stops counting, so a stop that waited
+        // for the queue leaves no entry for a delivered callback. A refused
+        // or failed one stays for the next start: a restart with a wrong
+        // token must not erase what is owed.
+        if let Some(entry) = queued.entry.take() {
+            if delivered {
+                entry.remove().await;
+            } else {
+                tracing::warn!(
+                    event = queued.name,
+                    file = entry.file(),
+                    "recording callback not delivered; its outbox entry is kept to send again"
+                );
+            }
+        }
+        if let Some(done) = queued.done.take() {
+            let _ = done.send(if delivered {
+                Delivery::Delivered
+            } else if refused {
+                Delivery::Refused
+            } else {
+                Delivery::Failed
+            });
         }
     }
 }
@@ -490,6 +684,7 @@ mod tests {
                     completion(),
                     complete,
                     (!complete).then_some("ingest-discarded-packets"),
+                    None,
                 );
                 let queued = rx.try_recv().expect("synchronised completion");
                 let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
@@ -525,10 +720,10 @@ mod tests {
         let (callbacks, observation) = callbacks.for_recording().expect("writer");
         let observation = observation.expect("scoped");
         observation.active();
-        callbacks.send_recording(&scope.key().path, completion(), true, None);
+        callbacks.send_recording(&scope.key().path, completion(), true, None, None);
         assert!(rx.try_recv().is_err());
         observation.synced_incomplete();
-        callbacks.send_recording(&scope.key().path, completion(), true, None);
+        callbacks.send_recording(&scope.key().path, completion(), true, None, None);
         assert!(rx.try_recv().is_err());
     }
 

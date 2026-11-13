@@ -97,7 +97,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            explicit values: 1..256
   SAPFLOW_HTTP_BODY_TIMEOUT absolute ready-response transfer seconds, including
                            headers (default 120, 1..3600); excludes parked waits
-  SAPFLOW_RECORDINGS       record every show to this directory (unset: off)
+  SAPFLOW_RECORDINGS       record every show to this directory (unset: off);
+                           with SAPFLOW_CALLBACK_URL, callbacks still owed at
+                           a crash or stop wait in its .sapflow-outbox and are
+                           sent at the next start
   SAPFLOW_RECORD_SKIP      paths not to record, comma-separated; a trailing *
                            matches a prefix (live/event-loop-*)
   SAPFLOW_RECORD_DELETE_AFTER  delete recordings older than this (default 7d)
