@@ -208,6 +208,12 @@ pub struct ListenerStats {
     /// Callers refused with a rejection handshake, by the listener or by the
     /// application.
     pub rejected: u64,
+    /// Callers the listener itself refused in the handshake for their
+    /// encryption, before any [`Event::Connect`]: no key material where
+    /// encryption is required, or key material with no passphrase to check
+    /// it. Also counted in `rejected`. The application never hears of these
+    /// callers, so this is its only way to report them.
+    pub unsecure: u64,
 }
 
 /// Why [`Listener::check_key`] cannot accept a caller's key. Never carries
@@ -883,6 +889,9 @@ impl<S: BuildHasher> Listener<S> {
 
     fn conclusion(&mut self, t: i64, peer: SocketAddr, timestamp: u32, h: Handshake) {
         if let Err(code) = self.check(&h) {
+            if code == RejectCode::UNSECURE {
+                self.stats.unsecure += 1;
+            }
             self.send_rejection(peer, &h, code);
             return;
         }
@@ -1399,6 +1408,12 @@ mod tests {
                 matches!(hs.as_slice(), [(_, h)] if h.kind == HandshakeKind::Rejection(code.0)),
                 "{code:?}: {hs:?}"
             );
+            let stats = l.stats();
+            assert_eq!(
+                (stats.unsecure, stats.rejected),
+                (u64::from(code == RejectCode::UNSECURE), 1),
+                "{code:?}"
+            );
         }
         // Live congestion control is what we do.
         let mut l = listener(t0);
@@ -1624,6 +1639,28 @@ mod tests {
             },
             _ => None,
         }
+    }
+
+    #[test]
+    fn a_plaintext_caller_refused_for_required_encryption_is_counted() {
+        let t0 = Instant::now();
+        let mut l = with_config(
+            t0,
+            Config {
+                require_encryption: true,
+                ..app_keys()
+            },
+        );
+        let c = l.cookie(peer(), 0);
+        l.handle_datagram(t0, peer(), &conclusion(1, c, vec![]));
+        assert_eq!(l.poll_event(), None, "the application never hears of it");
+        assert_eq!(rejection(&mut l), Some(RejectCode::UNSECURE.0));
+        assert_eq!((l.stats().unsecure, l.stats().rejected), (1, 1));
+        // A refusal the application makes is its own to report.
+        let mut l = with_config(t0, app_keys());
+        let id = waiting(&mut l, t0, 2, None);
+        assert!(l.reject(id, RejectCode::UNSECURE));
+        assert_eq!((l.stats().unsecure, l.stats().rejected), (0, 1));
     }
 
     #[test]
