@@ -86,7 +86,7 @@ SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
 SAPFLOW_CALLBACK_URL="http://127.0.0.1:$CB_PORT/api/public/live-events/{eventId}/stream-health" \
 SAPFLOW_CALLBACK_SECRET=tok SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:$SRT_PORT \
 SAPFLOW_RTMP_ADDR=127.0.0.1:$RTMP_PORT SAPFLOW_RECORDINGS="$WORK/rec" SAPFLOW_RECORD_SKIP='live/event-norec' \
-SAPFLOW_RECONNECT_GRACE=4 SAPFLOW_HEALTH_INTERVAL=2 \
+SAPFLOW_RECONNECT_GRACE=4 SAPFLOW_HEALTH_INTERVAL=2 SAPFLOW_TAKEOVER_SILENCE=1 \
 "$SAPFLOW_BIN" > "$WORK/sapflow.log" 2>&1 & pids+=($!)
 sleep 1
 grep 'SRT listening' "$WORK/sapflow.log" | grep -q 'implementation="own"' || fail "SRT is not served by our own receiver"
@@ -205,13 +205,21 @@ start_rtmp() { # key seconds
 }
 rtmp() { start_rtmp "$@"; wait_child "$publisher"; }
 start_rtmp "event-norec?user=pub&pass=secret" 8 > /dev/null 2>&1
+first=$publisher
 for _ in $(seq 1 40); do
   curl -sf "http://$HTTP/live/event-norec/index.m3u8" -o /dev/null && break; sleep 0.25
 done
 curl -sf "http://$HTTP/live/event-norec/index.m3u8" -o /dev/null || fail "RTMP stream never appeared"
 rtmp "event-other?user=pub&pass=wrong" 2 > /dev/null 2>&1 && fail "RTMP wrong password accepted"
-# The same publisher again takes the stream over (see the SRT check below).
-rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 || fail "RTMP takeover refused"
+# The same key again while the first publisher is still sending is refused;
+# once the first has gone quiet, as after a network change, it takes the
+# stream over (SAPFLOW_TAKEOVER_SILENCE, 1 s here; see the SRT check below).
+rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 && fail "RTMP took over a publisher still sending"
+grep -q 'publish refused protocol="rtmp" reason=AlreadyLive' "$WORK/sapflow.log" \
+  || fail "no already-live refusal for a publisher still sending"
+kill -STOP "$first"; sleep 1.5
+rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 || { kill -CONT "$first" 2> /dev/null; fail "RTMP takeover refused after the silence"; }
+kill -CONT "$first" 2> /dev/null || true
 grep -q 'publisher replaced by a new connection path=live/event-norec' "$WORK/sapflow.log" \
   || fail "second RTMP connection did not take the stream over"
 for _ in $(seq 1 40); do grep -q '"unpublish","path":"live/event-norec"' "$WORK/cb.log" && break; sleep 0.5; done
@@ -248,16 +256,33 @@ awk "BEGIN { exit !($secs > 12) }" || fail "recording too short across the recon
 ffmpeg -hide_banner -v error -xerror -i "$rec" -f null - || fail "resumed recording does not decode"
 echo "ok   reconnect within grace: same playlist, discontinuity, one recording (${secs}s)"
 
-# The same publisher connecting again takes its stream over, as mediamtx's
-# overridePublisher does: an encoder that changed network must not wait for
-# its old connection to time out.
+# The same publisher connecting again takes its stream over once its old
+# connection has gone quiet (SAPFLOW_TAKEOVER_SILENCE): an encoder that
+# changed network must not wait for its old connection to time out, but a
+# second connection with the same credentials cannot take over a publisher
+# that is still sending.
 start_publish "publish:live/event-take:pub:secret" 10 18905 > /dev/null 2>&1
+first=$publisher
 for _ in $(seq 1 40); do
   curl -sf "http://$HTTP/live/event-take/index.m3u8" -o /dev/null && break; sleep 0.25
 done
+publish "publish:live/event-take:pub:secret" 2 18906 > /dev/null 2>&1 || true
+grep -q 'publish refused protocol="srt" reason=AlreadyLive' "$WORK/sapflow.log" \
+  || fail "no already-live refusal for an SRT publisher still sending"
+# Silence the first sender (srt-live-transmit, the publisher's child), as a
+# network change would: no packets at all, not even keepalives. Found by its
+# command line: Linux matches process names on their first 15 characters.
+sender=$(pgrep -P "$first" -f srt-live-transmit || true)
+[ -n "$sender" ] || fail "no SRT sender to pause"
+kill -STOP $sender; sleep 1.5
 publish "publish:live/event-take:pub:secret" 3 18906 > /dev/null 2>&1 || true
+# The publisher may already have killed its paused sender.
+kill -CONT $sender 2> /dev/null || true
 grep -q 'path=live/event-take.*publisher replaced by a new connection\|publisher replaced by a new connection path=live/event-take' "$WORK/sapflow.log" \
   || fail "second connection did not take the stream over"
+for _ in $(seq 1 40); do
+  grep -q 'replaced publisher closed path=live/event-take' "$WORK/sapflow.log" && break; sleep 0.25
+done
 grep -q 'replaced publisher closed path=live/event-take' "$WORK/sapflow.log" \
   || fail "the replaced connection was not closed"
 echo "ok   the same publisher reconnecting takes its stream over"

@@ -4,7 +4,8 @@
 //! `KMREQ`: salt and wrapped keys, sent in clear) was wrapped under the
 //! passphrase, not who sent it. Anyone who captured an encoder's conclusion
 //! handshake can replay it from another address and pass the check, and an
-//! SRT claim takes over a live path. A copy of an attempt that never carried
+//! SRT claim can take over a live path (once its publisher has gone quiet;
+//! `Registry::with_takeover_silence`). A copy of an attempt that never carried
 //! media gives its sender nothing to decrypt or send, but it would knock the
 //! real encoder off; a copy of an admitted connection's handshake also
 //! restores that connection's keys, so whoever recorded the connection could

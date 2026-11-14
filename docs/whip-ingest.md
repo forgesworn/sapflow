@@ -2163,7 +2163,9 @@ Implementation notes (W3c part 2a, lifecycle):
   media keeps the path, and the claim answers `409`.
 - **SRT and RTMP over WHIP, kept.** In global-publisher and
   app-authorised mode an admitted SRT or RTMP publisher takes over any
-  attached stream, a live WHIP session's included: that is the existing
+  attached stream, a live WHIP session's included, once its publisher has
+  sent nothing for `SAPFLOW_TAKEOVER_SILENCE` (default 3 s) or the app has
+  withdrawn its credentials (`docs/reference.md`): that is the existing
   rule ("the one authorised publisher may replace its own stale
   connection"), and SRT and RTMP already take over each other under it. A
   WHIP session that loses its stream so ends on its next packet. Tested
@@ -2272,7 +2274,7 @@ Implementation notes (W3c part 2a, lifecycle):
 | A3.3: a second `POST` while the first session is still taking media gets `409` | `whip::tests::a_second_post_while_media_flows_gets_409` | Met in process |
 | A3.3: after `SAPFLOW_WHIP_STALE` without media, a second `POST` takes over at once | `whip::tests::a_stalled_session_is_superseded` | Met in process (stale set to 1 s) |
 | A3.3: a second `POST` during the first session's handshake replaces it at once | `whip::tests::a_post_during_the_first_handshake_replaces_it` | Met in process |
-| SRT takes over a live WHIP stream in global-publisher mode, and a WHIP `POST` never takes over SRT | `whip::tests::srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt` | Met in process |
+| SRT takes over a live WHIP stream in global-publisher mode, and a WHIP `POST` never takes over SRT | `whip::tests::srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt` | Met in process, with the takeover silence off (the test registry's default); with it on, the SRT claim waits for the WHIP session's silence as any takeover does |
 | A3.4: a panic in a call into a session, or in a read of one (its deadline, a tuple owner's state, the owner's reads), ends only that session; another keeps publishing with nothing lost; its recording is marked | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on`, `a_session_whose_deadline_panics_is_dropped_and_the_others_go_on`, `a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check`, `a_session_whose_inspected_read_panics_is_dropped` (sapflow-whip); `whip::tests::a_panic_in_one_session_ends_only_that_session`, `a_panic_in_a_session_deadline_ends_only_that_session`, `a_panic_in_the_owners_read_ends_only_that_session`, `a_panic_in_the_supersede_read_ends_only_that_session` | Met in process |
 | A3.4: a panic in the UDP owner's feed for a session, or in its ingest inside the publication, ends only that session, as above | `whip::tests::a_panic_in_the_feed_ends_only_that_session`, `whip::tests::a_panic_in_the_ingest_ends_only_that_session` | Met in process. Each A3.4 server test checks that A ends as `panicked` and never as `ingest-ended`; that A's recording reads `ingest-error` (when nothing marked it before the panic); that A's entries are gone and its publication released; and that a new `POST` for A's path gets 201. B must show no marks, and its playlist must grow after A has gone |
 | A3.4 over ICE-TCP: a panic in a session on a TCP tuple ends only that session; another on its own connection keeps publishing with nothing marked | `whip::tcp_tests::a_panic_in_a_tcp_session_ends_only_that_session` | Met in process |

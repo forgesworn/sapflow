@@ -49,7 +49,7 @@ the file at tag v1.21.2.
 | Other publish routes: MPEG-TS, RTP, HLS, Media-over-QUIC | ✗ | ✓ (README feature list). |
 | Pull from a remote source (`source:` on a path) | ✗ | ✓ RTSP, RTMP, HLS, UDP MPEG-TS and RTP, SRT, WHEP, MoQT, Raspberry Pi camera (mediamtx.yml). |
 | Codecs through the whole pipeline | partial. H.264 and AAC only. A TS stream whose video is not H.264 is refused (`UnsupportedVideo`, `crates/sapflow-hls/src/ingest.rs`); audio other than AAC is ignored. | ✓ Many (see rows above). Does not transcode: its README describes a media router and lists no transcoding. |
-| Several publishers | ✓ `SAPFLOW_MAX_PUBLISHERS`, default 16 per protocol. A second publisher on a live path is refused (`docs/threat-model.md` T5). | ✓ Many paths. `overridePublisher: true` by default lets a new client disconnect the current publisher and take its place (mediamtx.yml); sapflow does the opposite. |
+| Several publishers | ✓ `SAPFLOW_MAX_PUBLISHERS`, default 16 per protocol. A second publisher on a live path is refused while the first is sending; one with the same credentials takes over only after `SAPFLOW_TAKEOVER_SILENCE` (default 3 s) of silence, as after a network change (`docs/threat-model.md` T5). | ✓ Many paths. `overridePublisher: true` by default lets a new client disconnect the current publisher and take its place at once (mediamtx.yml). |
 
 ### Output and HLS
 
