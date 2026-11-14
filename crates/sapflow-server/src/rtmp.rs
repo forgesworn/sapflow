@@ -712,6 +712,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_publisher_is_not_taken_over_on_the_wire_until_it_goes_quiet() {
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.streams = Arc::new(
+            crate::stream::Registry::new(4)
+                .with_takeover_silence(std::time::Duration::from_secs(3)),
+        );
+        let from = "127.0.0.1".parse().expect("loopback");
+        let mut first = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut first, "event-first")
+                .await
+                .0
+                .is_ok()
+        );
+        // The same stream key again while the first is live: refused.
+        let mut second = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        let (result, wire, done) = negotiate_capacity_fixture(&mut second, "event-first").await;
+        assert!(
+            matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code)) if code == "NetStream.Publish.BadName")
+        );
+        assert!(done && second.publication.is_none());
+        assert!(
+            wire.windows(b"already live".len())
+                .any(|bytes| bytes == b"already live")
+        );
+        // Once the first has sent nothing for the silence, it is taken over.
+        fixture
+            .app
+            .streams
+            .get("event-first")
+            .expect("live stream")
+            .session()
+            .backdate_input(std::time::Duration::from_secs(4));
+        let mut third = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut third, "event-first")
+                .await
+                .0
+                .is_ok()
+        );
+        third.publication.take().expect("took over").end();
+        if let Some(publication) = first.publication.take() {
+            publication.end();
+        }
+    }
+
+    #[tokio::test]
+    async fn rotating_the_key_takes_over_a_sending_holder_on_the_first_try() {
+        use crate::publish_auth::stub::{self, Answer};
+        const OLD: &str = "event-one?user=encoder&pass=gig-key-old";
+        const NEW: &str = "event-one?user=encoder&pass=gig-key-new";
+        let stub = stub::start(Answer::Password("gig-key-old")).await;
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.config.publish_auth = Some(stub.endpoint.clone());
+        // Only revocation lets a newer publisher in, never the holder's silence.
+        app.streams = Arc::new(
+            crate::stream::Registry::new(4)
+                .with_takeover_silence(std::time::Duration::from_secs(60)),
+        );
+        let from = "127.0.0.1".parse().expect("loopback");
+        let conn = || Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        let mut holder = conn();
+        assert!(negotiate_capacity_fixture(&mut holder, OLD).await.0.is_ok());
+        let stream = fixture.app.streams.get("event-one").expect("live stream");
+        let (held, _) = stream.session().owner();
+        // The organiser makes a new stream URL: the old key is refused...
+        stub.answer(Answer::Password("gig-key-new"));
+        let mut stale = conn();
+        let (result, _, _) = negotiate_capacity_fixture(&mut stale, OLD).await;
+        assert!(
+            matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code)) if code == "NetStream.Publish.Denied")
+        );
+        // ...and the encoder's first connection with the new key takes the
+        // stage from the holder, which is still live.
+        let mut new = conn();
+        assert!(negotiate_capacity_fixture(&mut new, NEW).await.0.is_ok());
+        let (generation, attached) = stream.session().owner();
+        assert!(attached && generation > held);
+        assert!(
+            !stream.session().owns_connection(held),
+            "the holder no longer owns the stage"
+        );
+        new.publication.take().expect("took over").end();
+        if let Some(publication) = holder.publication.take() {
+            publication.end();
+        }
+    }
+
+    #[tokio::test]
     async fn resident_capacity_refusal_is_visible_on_the_actual_rtmp_wire() {
         let mut fixture = crate::publish::loss_tests::Fixture::new();
         let app = Arc::get_mut(&mut fixture.app).expect("sole App");

@@ -43,6 +43,13 @@ pub enum Refusal {
     Stopping,
 }
 
+/// How long a publisher's admission waits for the app to say whether it
+/// still admits the live publisher ([`Publication::recheck_holder`]). With
+/// the admission's own 3 s it stays inside the SRT listener's 5 s accept
+/// wait; an SRT caller whose own connect timeout is shorter (libsrt's
+/// default is 3 s) may give up first, unanswered.
+pub const RECHECK_LIMIT: Duration = Duration::from_secs(1);
+
 /// Proof that [`Publication::admit`] admitted a request; spent by
 /// [`Publication::claim_admitted`].
 #[derive(Debug)]
@@ -50,6 +57,9 @@ pub struct Admitted {
     /// The SRT passphrase the app holds for this stream, from
     /// [`Publication::admit_srt_key`]. Its `Debug` is redacted.
     srt_key: Option<sapflow_srt::crypto::CryptoConfig>,
+    /// What the app admitted this publisher with, kept with its stream so
+    /// the app can be asked again later; `None` when no app admitted it.
+    holder: Option<Arc<crate::publish_auth::Recheck>>,
 }
 
 impl Admitted {
@@ -97,6 +107,9 @@ pub struct Publication {
     scope: Option<ScopedLease>,
     callbacks: Callbacks,
     grace: Duration,
+    /// Input is timed by [`Publication::note_arrival`] (SRT, whose media is
+    /// delivered up to its latency after it arrives), not by each push.
+    arrival_clock: bool,
 }
 
 /// A bounded connection-scoped loss notice, independent of the media queue.
@@ -236,7 +249,10 @@ impl Publication {
             throttle().failed(from, Instant::now());
             return Err(Refusal::Request(e));
         }
-        Ok(Admitted { srt_key: None })
+        Ok(Admitted {
+            srt_key: None,
+            holder: None,
+        })
     }
 
     /// Claims the path for a request [`Publication::admit`] admitted, or
@@ -256,6 +272,7 @@ impl Publication {
             req,
             kind,
             None,
+            admitted.holder,
             app.config.max_publish_bps,
             app.config.reconnect_grace,
         )
@@ -342,7 +359,21 @@ impl Publication {
             Verdict::Throttled => return Err(Refusal::Throttled),
             Verdict::Unavailable => return Err(Refusal::AuthUnavailable),
         }
-        Ok(Admitted { srt_key })
+        let holder = Arc::new(crate::publish_auth::Recheck::new(
+            req,
+            protocol,
+            from,
+            offer_srt_key,
+            srt_key.clone(),
+        ));
+        // WHIP never takes a stage over, so it has no holder to check.
+        if !matches!(kind, SourceKind::Es) {
+            Self::recheck_holder(app, endpoint, &req.path, &holder).await;
+        }
+        Ok(Admitted {
+            srt_key,
+            holder: Some(holder),
+        })
     }
 
     /// The tests' entry point for an SRT publication: authorised and claimed
@@ -452,6 +483,7 @@ impl Publication {
                     req,
                     SourceKind::Ts,
                     Some(scope.clone()),
+                    None,
                     limits.max_publish_bps.min(app.config.max_publish_bps),
                     grace,
                 )
@@ -464,6 +496,7 @@ impl Publication {
         req: &PublishRequest,
         kind: SourceKind,
         scope: Option<ScopedLease>,
+        holder: Option<Arc<crate::publish_auth::Recheck>>,
         max_bps: u64,
         grace: Duration,
     ) -> Result<Self, Refusal> {
@@ -493,6 +526,7 @@ impl Publication {
                 take_over,
                 app.config.max_publishers,
                 |session, claim| {
+                    session.set_holder(holder);
                     session.recorder_factory = recorder_factory;
                     if claim == Claim::Fresh {
                         session.rolls =
@@ -507,6 +541,7 @@ impl Publication {
             )
             .map_err(|error| match error {
                 ClaimError::AlreadyLive => Refusal::AlreadyLive,
+                ClaimError::Sending => Refusal::AlreadyLive,
                 ClaimError::PublisherLimit => Refusal::PublisherLimit,
                 ClaimError::PresentationLimit => Refusal::PresentationLimit,
                 ClaimError::MemoryLimit => Refusal::MemoryLimit,
@@ -534,7 +569,55 @@ impl Publication {
             scope,
             callbacks,
             grace,
+            arrival_clock: false,
         })
+    }
+
+    /// A publisher the app has just admitted for a stage whose live publisher
+    /// is still sending, so its claim would be refused: does the app still
+    /// admit the holder? If not (its key was rotated), the holder is revoked
+    /// and this publisher's claim takes the stage over at once, before anyone
+    /// who read the new key off the network can.
+    ///
+    /// Only the app's answer about the holder's own request revokes it. When
+    /// `newcomer` asked the same thing (the same user, password, protocol,
+    /// address and SRT offer), the app's answer to it is that answer: the holder is
+    /// revoked if the app now hands out a different SRT passphrase, and no
+    /// second request is made. Otherwise the holder's request is sent again,
+    /// within [`RECHECK_LIMIT`]; an app that cannot say in time, or is
+    /// throttling, changes nothing, and the claim is refused as already live.
+    async fn recheck_holder(
+        app: &Arc<App>,
+        endpoint: &crate::http_lite::Endpoint,
+        path: &sapflow_core::StreamPath,
+        newcomer: &crate::publish_auth::Recheck,
+    ) {
+        let Some((stream, generation, holder)) = app.streams.sending_holder(path) else {
+            return;
+        };
+        let admitted = if holder.same_request(newcomer) {
+            Some(holder.same_key(newcomer))
+        } else {
+            holder.still_admitted(endpoint, RECHECK_LIMIT).await
+        };
+        if admitted == Some(false) && app.streams.revoke(&stream, generation) {
+            tracing::info!(
+                path = %stream.path.as_path(),
+                "the app no longer admits the live publisher's credentials; the next publisher may take over"
+            );
+        }
+    }
+
+    /// The peer was last heard at `at`, which times this publication's input
+    /// from now on instead of each push: SRT media is delivered up to its
+    /// latency after it arrives, and the takeover guard counts silence from
+    /// arrival. Ignored once another publisher holds the stream.
+    pub fn note_arrival(&mut self, at: Instant) {
+        self.arrival_clock = true;
+        let mut session = self.stream.session();
+        if self.owns(&session) {
+            session.note_input_at(at);
+        }
     }
 
     fn recorder_factory(
@@ -607,6 +690,9 @@ impl Publication {
         let mut session = self.stream.session();
         if !self.owns(&session) {
             return Err(PushError::Superseded);
+        }
+        if !self.arrival_clock {
+            session.note_input();
         }
         let mut discarded = false;
         let result = self.stream.apply(|source, now| {
@@ -1162,6 +1248,210 @@ mod publication_capacity_tests {
 
     fn request(id: &str) -> PublishRequest {
         PublishRequest::parse_rtmp("live", &format!("event-{id}")).expect("generated request")
+    }
+
+    #[tokio::test]
+    async fn a_publisher_sending_media_keeps_its_stage_until_it_goes_quiet() {
+        use std::time::Duration;
+        let mut fixture = loss_tests::Fixture::new();
+        Arc::get_mut(&mut fixture.app).expect("sole App").streams = Arc::new(
+            crate::stream::Registry::default().with_takeover_silence(Duration::from_secs(3)),
+        );
+        let from = "127.0.0.1".parse().expect("loopback");
+        let declare = |publication: &mut Publication| {
+            publication.push(|source, now| {
+                let Source::Flv(flv) = source else {
+                    panic!("FLV")
+                };
+                flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now)
+            })
+        };
+        let mut first = Publication::begin(&fixture.app, &request("a"), SourceKind::Flv, from)
+            .expect("first owner");
+        // Quiet for a while, then it sends: the clock starts again, so a
+        // second connection with the same credentials is refused.
+        first
+            .stream
+            .session()
+            .backdate_input(Duration::from_secs(10));
+        declare(&mut first).expect("declared audio");
+        assert!(matches!(
+            Publication::begin(&fixture.app, &request("a"), SourceKind::Flv, from),
+            Err(Refusal::AlreadyLive)
+        ));
+        assert!(
+            declare(&mut first).is_ok(),
+            "the first still owns its stage"
+        );
+        // Quiet past the silence, as after a network change: the reconnect
+        // takes over and the old connection's next push is refused.
+        first
+            .stream
+            .session()
+            .backdate_input(Duration::from_secs(4));
+        let second = Publication::begin(&fixture.app, &request("a"), SourceKind::Flv, from)
+            .expect("taken over after the silence");
+        assert!(matches!(declare(&mut first), Err(PushError::Superseded)));
+        second.end();
+        first.end();
+    }
+
+    /// An app (stub) answering `answer`, and a registry whose takeover
+    /// guard waits a minute: in these tests only revocation lets a newer
+    /// publisher take over a sending holder, never its silence.
+    async fn guarded_app(
+        answer: crate::publish_auth::stub::Answer,
+    ) -> (loss_tests::Fixture, crate::publish_auth::stub::Stub) {
+        let stub = crate::publish_auth::stub::start(answer).await;
+        let mut fixture = loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.publish_auth = Some(stub.endpoint.clone());
+        app.streams = Arc::new(
+            crate::stream::Registry::default()
+                .with_takeover_silence(std::time::Duration::from_secs(60)),
+        );
+        (fixture, stub)
+    }
+
+    fn keyed(key: &str) -> PublishRequest {
+        PublishRequest::parse_rtmp("live", &format!("event-a?pass={key}")).expect("request")
+    }
+
+    fn declare_audio(publication: &mut Publication) -> Result<(), PushError> {
+        publication.push(|source, now| {
+            let Source::Flv(flv) = source else {
+                panic!("FLV")
+            };
+            flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now)
+        })
+    }
+
+    /// The passwords the app was asked about, in order.
+    fn asked(stub: &crate::publish_auth::stub::Stub) -> Vec<String> {
+        stub.requests
+            .lock()
+            .expect("stub log")
+            .iter()
+            .map(|(_, body)| body["password"].as_str().unwrap_or("").to_owned())
+            .collect()
+    }
+
+    async fn rtmp(app: &Arc<App>, key: &str) -> Result<Publication, Refusal> {
+        let from = "127.0.0.1".parse().expect("loopback");
+        Publication::begin_authorised(app, &keyed(key), SourceKind::Flv, from).await
+    }
+
+    #[tokio::test]
+    async fn a_holder_whose_key_the_app_still_admits_keeps_its_stage() {
+        use crate::publish_auth::stub::Answer;
+        const KEY: &str = "gig-key-still-valid";
+        let (fixture, stub) = guarded_app(Answer::Password(KEY)).await;
+        let mut holder = rtmp(&fixture.app, KEY).await.expect("holder");
+        declare_audio(&mut holder).expect("sending");
+        // The same key again: the app has just admitted it, which is its
+        // answer about the holder too, so it is not asked a second time.
+        assert!(matches!(
+            rtmp(&fixture.app, KEY).await,
+            Err(Refusal::AlreadyLive)
+        ));
+        assert_eq!(asked(&stub), [KEY, KEY]);
+        // The same key from another address: an app may decide by address,
+        // so the holder is asked about with its own, and still admitted.
+        let elsewhere = "127.0.0.2".parse().expect("loopback");
+        assert!(matches!(
+            Publication::begin_authorised(&fixture.app, &keyed(KEY), SourceKind::Flv, elsewhere)
+                .await,
+            Err(Refusal::AlreadyLive)
+        ));
+        assert_eq!(asked(&stub), [KEY, KEY, KEY, KEY]);
+        assert_eq!(
+            stub.last()["ip"],
+            "127.0.0.1",
+            "asked with the holder's address"
+        );
+        assert!(fixture.app.streams.takeover_waits(&keyed(KEY).path));
+        assert!(
+            declare_audio(&mut holder).is_ok(),
+            "the holder still owns its stage"
+        );
+        holder.end();
+    }
+
+    #[tokio::test]
+    async fn a_second_key_the_app_also_admits_never_removes_the_holder() {
+        use crate::publish_auth::stub::{Answer, Else};
+        const KEY: &str = "gig-key-of-the-holder";
+        const SPARE: &str = "gig-key-of-a-backup-encoder";
+        let (fixture, stub) =
+            guarded_app(Answer::Passwords(&[KEY, SPARE], Else::Status(401))).await;
+        let mut holder = rtmp(&fixture.app, KEY).await.expect("holder");
+        declare_audio(&mut holder).expect("sending");
+        // A different key is no proof the holder's is stale: the app is
+        // asked about the holder's, still admits it, and the holder stays.
+        assert!(matches!(
+            rtmp(&fixture.app, SPARE).await,
+            Err(Refusal::AlreadyLive)
+        ));
+        assert_eq!(asked(&stub), [KEY, SPARE, KEY]);
+        assert!(fixture.app.streams.takeover_waits(&keyed(KEY).path));
+        assert!(declare_audio(&mut holder).is_ok());
+        holder.end();
+    }
+
+    #[tokio::test]
+    async fn an_app_that_cannot_answer_about_the_holder_changes_nothing() {
+        use crate::publish_auth::stub::{Answer, Else};
+        const OLD: &str = "gig-key-before-rotation";
+        const NEW: &str = "gig-key-after-rotation";
+        for otherwise in [Else::Status(429), Else::Status(500), Else::Silent] {
+            let (fixture, stub) = guarded_app(Answer::Password(OLD)).await;
+            let mut holder = rtmp(&fixture.app, OLD).await.expect("holder");
+            declare_audio(&mut holder).expect("sending");
+            // Throttling, failing or silent about the holder's key: nothing
+            // is revoked, and the new key is refused as already live.
+            stub.answer(Answer::Passwords(&[NEW], otherwise));
+            let started = Instant::now();
+            assert!(matches!(
+                rtmp(&fixture.app, NEW).await,
+                Err(Refusal::AlreadyLive)
+            ));
+            // Bounded by RECHECK_LIMIT, not the admission's own 3 s.
+            assert!(started.elapsed() < RECHECK_LIMIT + Duration::from_millis(1500));
+            assert_eq!(asked(&stub), [OLD, NEW, OLD]);
+            assert!(fixture.app.streams.takeover_waits(&keyed(OLD).path));
+            assert!(declare_audio(&mut holder).is_ok());
+            holder.end();
+        }
+    }
+
+    #[tokio::test]
+    async fn rotating_the_key_lets_the_new_one_take_over_a_sending_holder() {
+        use crate::publish_auth::stub::Answer;
+        const OLD: &str = "gig-key-before-rotation";
+        const NEW: &str = "gig-key-after-rotation";
+        let (fixture, stub) = guarded_app(Answer::Password(OLD)).await;
+        let mut holder = rtmp(&fixture.app, OLD).await.expect("holder");
+        declare_audio(&mut holder).expect("sending");
+        // The organiser makes a new stream URL: the app admits only the new
+        // key. The encoder's first connection with it takes the stage, so
+        // someone who read the new key off the network is too late.
+        stub.answer(Answer::Password(NEW));
+        let new = rtmp(&fixture.app, NEW)
+            .await
+            .expect("the new key takes over at once");
+        assert_eq!(
+            asked(&stub),
+            [OLD, NEW, OLD],
+            "the holder's key was asked about"
+        );
+        assert!(matches!(
+            declare_audio(&mut holder),
+            Err(PushError::Superseded)
+        ));
+        // The new owner is not revoked: a takeover waits for it again.
+        assert!(fixture.app.streams.takeover_waits(&keyed(NEW).path));
+        new.end();
+        holder.end();
     }
 
     #[tokio::test]

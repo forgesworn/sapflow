@@ -384,6 +384,13 @@ impl Receiver {
         self.stats
     }
 
+    /// When the last packet from the peer, data or control, arrived (the
+    /// caller's clock, in microseconds). Media is delivered up to the
+    /// latency after it arrives; this is when the peer was last heard.
+    pub fn last_received(&self) -> i64 {
+        self.last_received
+    }
+
     /// The round-trip time estimate.
     pub fn rtt(&self) -> &Rtt {
         &self.rtt

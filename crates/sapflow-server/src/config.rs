@@ -135,6 +135,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   RUST_LOG                 log filter (default info)
   SAPFLOW_RECONNECT_GRACE  seconds to retain a disconnected stream (default 90;
                            0 disables, maximum 3600)
+  SAPFLOW_TAKEOVER_SILENCE seconds a live publisher must have sent nothing
+                           before another with the same credentials may take
+                           its stream over (default 3; 0 takes over at once,
+                           maximum 3600)
   SAPFLOW_HEALTH_INTERVAL  seconds between health callbacks (default 30;
                            0 disables, maximum 3600)
 
@@ -228,6 +232,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_APP_KEYS",
     "SAPFLOW_SRT_REPLAY_STORE",
     "SAPFLOW_RECONNECT_GRACE",
+    "SAPFLOW_TAKEOVER_SILENCE",
     "SAPFLOW_HEALTH_INTERVAL",
     "SAPFLOW_WHIP_ADDR",
     "SAPFLOW_WHIP_PUBLIC_URL",
@@ -510,6 +515,9 @@ pub struct Config {
     /// epoch (`SAPFLOW_RECORDING_ROLL_*`).
     pub recording_roll: crate::roll_budget::RollLimit,
     pub reconnect_grace: Duration,
+    /// How long a live publisher must have sent nothing before another with
+    /// the same credentials may take its stream over (`SAPFLOW_TAKEOVER_SILENCE`).
+    pub takeover_silence: Duration,
     pub health_interval: Duration,
     /// WHIP ingest; `None` binds nothing.
     pub whip: Option<WhipConfig>,
@@ -848,6 +856,7 @@ impl Config {
             }
         };
         let reconnect_grace = seconds("SAPFLOW_RECONNECT_GRACE", 90)?;
+        let takeover_silence = seconds("SAPFLOW_TAKEOVER_SILENCE", 3)?;
         let recording_roll = crate::roll_budget::RollLimit {
             burst: match vals.get("SAPFLOW_RECORDING_ROLL_BURST") {
                 None => 8,
@@ -1018,6 +1027,7 @@ impl Config {
             },
             control,
             reconnect_grace,
+            takeover_silence,
             health_interval,
             srt_crypto,
             srt_allow_plaintext,
@@ -1651,14 +1661,24 @@ mod tests {
         let open = ("SAPFLOW_OPEN_PUBLISH", "1");
         let config = load(&[open], &[]).expect("valid bounded settings");
         assert_eq!(config.reconnect_grace, Duration::from_secs(90));
+        assert_eq!(config.takeover_silence, Duration::from_secs(3));
         assert_eq!(config.health_interval, Duration::from_secs(30));
-        let config = load(&[open], &["--reconnect-grace=0", "--health-interval=10"])
-            .expect("valid bounded settings");
+        let config = load(
+            &[open],
+            &[
+                "--reconnect-grace=0",
+                "--health-interval=10",
+                "--takeover-silence=0",
+            ],
+        )
+        .expect("valid bounded settings");
         assert_eq!(config.reconnect_grace, Duration::ZERO);
+        assert_eq!(config.takeover_silence, Duration::ZERO);
         assert_eq!(config.health_interval, Duration::from_secs(10));
         for invalid in ["-1", "3601", "1.5"] {
             assert!(load(&[open, ("SAPFLOW_RECONNECT_GRACE", invalid)], &[]).is_err());
             assert!(load(&[open, ("SAPFLOW_HEALTH_INTERVAL", invalid)], &[]).is_err());
+            assert!(load(&[open, ("SAPFLOW_TAKEOVER_SILENCE", invalid)], &[]).is_err());
         }
     }
 

@@ -185,9 +185,37 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
   equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. An encoder that
   changes network reconnects before its old connection has timed out: the
-  new connection with the same credentials takes the stream over at once,
-  as mediamtx's `overridePublisher` (its default) does, and the old one is
-  closed on its next packet without sending `unpublish`. Scoped publish
+  new connection with the same credentials takes the stream over once the
+  old one has sent nothing for `SAPFLOW_TAKEOVER_SILENCE` (default 3 s; `0`
+  takes over at once, as mediamtx's `overridePublisher` does), and the old
+  one is closed on its next packet without sending `unpublish`. Until then
+  the new connection is refused as already live (RTMP
+  `NetStream.Publish.BadName`, SRT `409`) and its encoder retries; that
+  refusal does not count against the address's failed-attempt throttle. So
+  a publisher still sending keeps its stage, even from someone else holding
+  its credentials (a plain RTMP stream key, say, read off a shared
+  network). For SRT, silence is counted from when the old connection's
+  packets last arrived, not from when their media is delivered (up to the
+  latency later). With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
+  the app admits for a stage whose publisher is still sending also settles
+  whether the app still admits the live publisher, before its claim. If it
+  sent the same user, password and protocol from the same address as the
+  live publisher, the app's answer to it is the answer; otherwise the live publisher's own
+  request is sent again, and sapflow waits up to 1 s for the reply. If the
+  app now refuses the live publisher's credentials (401 or 403), or hands
+  out an SRT passphrase other than the one it gave it (a new one, one where
+  there was none, or none where there was one), the live publisher is
+  revoked and this publisher takes the stage at once, on its first try. So
+  rotating a gig's stream key (v4v's new stream URL) hands the stage to the
+  encoder with the new key, even while the old one is still sending, before
+  anyone who reads the new key off the network can. Only the app's answer
+  about the live publisher revokes it: a different key the app also admits
+  (a backup encoder's) is refused as already live, and an app that is
+  down, throttling or slower than 1 s changes nothing, so the new key is
+  refused and its encoder's retry asks again. A WHIP publisher never takes
+  a stage over, so it asks nothing: recovering a stage needs an SRT or RTMP
+  encoder. Without an app there is nobody to ask: a publisher holding the
+  credentials keeps a stage it won in a gap until it stops. Scoped publish
   sessions keep one owner and refuse a second (`409`).
 
 What players should do at a break (Safari on macOS seen to carry on
