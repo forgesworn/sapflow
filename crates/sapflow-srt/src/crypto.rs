@@ -89,6 +89,13 @@ impl CryptoConfig {
             preannounce_packets: 4000,
         })
     }
+    /// Whether `other` holds the same passphrase, compared in constant time
+    /// for its length. Key length and refresh settings are not compared.
+    pub fn same_passphrase(&self, other: &Self) -> bool {
+        let (a, b) = (self.secret.as_slice(), other.secret.as_slice());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
     pub(crate) fn valid(&self) -> bool {
         self.refresh_packets <= MAX_PERIOD
             && self.preannounce_packets > 0
@@ -719,6 +726,19 @@ mod tests {
             before
         );
     }
+    #[test]
+    fn same_passphrase_compares_only_the_passphrase() {
+        let a = CryptoConfig::new(b"passphrase-one".to_vec(), KeySize::Aes128).expect("a");
+        let same = CryptoConfig::new(b"passphrase-one".to_vec(), KeySize::Aes256).expect("same");
+        let other = CryptoConfig::new(b"passphrase-two".to_vec(), KeySize::Aes128).expect("other");
+        let longer =
+            CryptoConfig::new(b"passphrase-one!".to_vec(), KeySize::Aes128).expect("longer");
+        assert!(a.same_passphrase(&same), "key length is not compared");
+        assert!(a.same_passphrase(&a.clone()));
+        assert!(!a.same_passphrase(&other));
+        assert!(!a.same_passphrase(&longer) && !longer.same_passphrase(&a));
+    }
+
     #[test]
     fn cached_schedules_match_per_packet_schedules_at_payload_and_sequence_boundaries() {
         for size in [KeySize::Aes128, KeySize::Aes256] {

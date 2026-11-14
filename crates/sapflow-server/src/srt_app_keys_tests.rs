@@ -182,11 +182,16 @@ impl Encoder {
         }
     }
 
-    /// Sends the whole fixture, a datagram at a time.
+    /// Sends the whole fixture, a datagram at a time, or until the
+    /// connection is closed.
     pub(crate) async fn send_media(&mut self) {
         for chunk in MEDIA.chunks(1316) {
-            while self.caller.enqueue(Instant::now(), chunk.to_vec()).is_err() {
-                self.pump(Duration::from_millis(2)).await;
+            loop {
+                match self.caller.enqueue(Instant::now(), chunk.to_vec()) {
+                    Ok(()) => break,
+                    Err(sapflow_srt::SendError::NotConnected) => return,
+                    Err(_) => self.pump(Duration::from_millis(2)).await,
+                }
             }
             self.pump(Duration::from_millis(1)).await;
         }
@@ -1334,6 +1339,97 @@ async fn without_app_keys_optional_still_admits_plaintext() {
     assert_eq!(stub.last().get("srtKey"), None, "no capability field");
     assert!(captured.text().contains("encryption=\"none\""));
     plain.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+/// The app-keys fixture with the takeover guard on.
+fn guarded(stub: &Stub) -> Fixture {
+    let mut fixture = fixture(stub, Duration::from_secs(30));
+    Arc::get_mut(&mut fixture.app).expect("sole App").streams =
+        Arc::new(crate::stream::Registry::default().with_takeover_silence(Duration::from_secs(3)));
+    fixture
+}
+
+fn stage_path() -> sapflow_core::StreamPath {
+    sapflow_core::StreamPath::parse("live/event-a").expect("path")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_keyed_holder_still_sending_keeps_its_stage_from_the_same_key() {
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = guarded(&stub);
+    let (addr, server) = origin(&fixture.app);
+    let mut holder = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
+    assert!(holder.connected, "{:?}", holder.closed);
+    holder.send_media().await;
+    wait_for(&mut fixture, &mut holder, "publish").await;
+    // Another caller with the gig's own passphrase while the holder sends:
+    // refused as already live, before its key material is remembered.
+    let second = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
+    assert_eq!(second.rejected(), Some(RejectCode::http(409).0));
+    // A resend after a lost refusal is refused the same way, not taken
+    // for a replay of admitted key material.
+    let resent = Encoder::call_dropping(addr, Some(key(KEY, KeySize::Aes128)), 1).await;
+    assert_eq!(resent.rejected(), Some(RejectCode::http(409).0));
+    // The app still hands out the same passphrase: the holder keeps it.
+    holder.send_media().await;
+    assert!(fixture.app.streams.takeover_waits(&stage_path()));
+    assert!(holder.closed.is_none(), "{:?}", holder.closed);
+    assert!(
+        uncharged(&fixture.app, "127.0.0.1"),
+        "already live is not a failed attempt"
+    );
+    holder.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = guarded(&stub);
+    let (addr, server) = origin(&fixture.app);
+    let mut holder = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
+    assert!(holder.connected, "{:?}", holder.closed);
+    holder.send_media().await;
+    wait_for(&mut fixture, &mut holder, "publish").await;
+    // The organiser makes a new stream URL: the app hands out a new
+    // passphrase, and only a caller with it gets past the key check.
+    stub.answer(Answer::Passphrase(&[WRONG]));
+    let first = Encoder::call(addr, Some(key(WRONG, KeySize::Aes128))).await;
+    assert_eq!(
+        first.rejected(),
+        Some(RejectCode::http(409).0),
+        "holder still sending"
+    );
+    // Asked again, the app no longer hands out the holder's passphrase: the
+    // holder is revoked and the new key's retry takes the stage at once.
+    let mut taken = None;
+    for _ in 0..40 {
+        // The holder keeps sending throughout: only the revocation lets the
+        // new key in, never the holder's silence.
+        holder.send_media().await;
+        let retry = Encoder::call(addr, Some(key(WRONG, KeySize::Aes128))).await;
+        if retry.connected {
+            taken = Some(retry);
+            break;
+        }
+        assert_eq!(retry.rejected(), Some(RejectCode::http(409).0));
+    }
+    let mut taken = taken.expect("the new key takes the stage over");
+    taken.send_media().await;
+    // The old holder's next media is refused: it no longer owns the stage,
+    // and the server closes its connection.
+    holder.send_media().await;
+    holder.run_until(|e| e.closed.is_some()).await;
+    assert!(holder.closed.is_some(), "the revoked holder is closed");
+    assert!(
+        fixture.app.streams.takeover_waits(&stage_path()),
+        "the new owner keeps it"
+    );
+    taken.stop().await;
+    holder.stop().await;
     server.abort();
     let _ = server.await;
 }

@@ -93,6 +93,65 @@ pub(crate) fn classify(outcome: Result<u16, Failure>) -> Verdict {
     }
 }
 
+/// What the app admitted a live publisher with, kept so the app can be asked
+/// again whether it still would. A newer publisher refused by the takeover
+/// guard (`Registry::with_takeover_silence`) asks for it: if the app now
+/// refuses these credentials, the holder may be taken over at once, so
+/// rotating a stream key removes whoever holds the old one. Holds the
+/// publisher's credentials; its `Debug` names the path and protocol only.
+pub(crate) struct Recheck {
+    req: PublishRequest,
+    protocol: Protocol,
+    from: IpAddr,
+    /// The SRT passphrase the app returned for this publisher, if it did.
+    srt_key: Option<CryptoConfig>,
+}
+
+impl std::fmt::Debug for Recheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recheck")
+            .field("path", &self.req.path.as_path())
+            .field("protocol", &self.protocol)
+            .field("srt_key", &self.srt_key.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Recheck {
+    pub(crate) fn new(
+        req: &PublishRequest,
+        protocol: Protocol,
+        from: IpAddr,
+        srt_key: Option<CryptoConfig>,
+    ) -> Self {
+        Self {
+            req: req.clone(),
+            protocol,
+            from,
+            srt_key,
+        }
+    }
+
+    /// Asks the app again, once: `Some(false)` when it now refuses these
+    /// credentials (401 or 403), or answers with a different SRT passphrase
+    /// or none; `Some(true)` when it still admits them; `None` when it could
+    /// not say (down, slow, throttling), which changes nothing.
+    pub(crate) async fn still_admitted(&self, endpoint: &Endpoint) -> Option<bool> {
+        let (verdict, key) = match (&self.srt_key, self.protocol) {
+            (Some(_), _) => ask_srt_key(endpoint, &self.req, self.from).await,
+            (None, protocol) => (ask(endpoint, &self.req, protocol, self.from).await, None),
+        };
+        match verdict {
+            Verdict::Admitted => Some(match &self.srt_key {
+                Some(held) => key.is_some_and(|now| now.same_passphrase(held)),
+                None => true,
+            }),
+            Verdict::Denied | Verdict::Forbidden => Some(false),
+            Verdict::Throttled | Verdict::Unavailable => None,
+        }
+    }
+}
+
 /// The request body. A missing user or password is sent empty, as mediamtx
 /// does. `query` is sent empty: sapflow does not keep the raw RTMP query or
 /// stream id, and the password already travels in `password`.
@@ -246,9 +305,14 @@ pub(crate) mod stub {
         SlowPassphrase(u64, &'static [&'static str]),
         /// Read the request, then never answer.
         Silent,
+        /// 200 when the request's password is this one, else 401: a gig
+        /// whose stream key is this.
+        Password(&'static str),
     }
 
     pub(crate) struct Stub {
+        /// What the stub answers next; [`Stub::answer`] changes it.
+        answer: Arc<Mutex<Answer>>,
         pub endpoint: Endpoint,
         /// The endpoint's URL, for a test's `SAPFLOW_PUBLISH_AUTH_URL`.
         pub url: String,
@@ -264,6 +328,10 @@ pub(crate) mod stub {
     }
 
     impl Stub {
+        /// Answers every later request with `answer`.
+        pub(crate) fn answer(&self, answer: Answer) {
+            *self.answer.lock().expect("stub answer") = answer;
+        }
         pub(crate) fn count(&self) -> usize {
             self.requests.lock().expect("stub log").len()
         }
@@ -295,12 +363,15 @@ pub(crate) mod stub {
         let port = listener.local_addr().expect("addr").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let log = requests.clone();
+        let answer = Arc::new(Mutex::new(answer));
+        let current = answer.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
                 let log = log.clone();
+                let answer = *current.lock().expect("stub answer");
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -325,7 +396,9 @@ pub(crate) mod stub {
                             break (head.to_owned(), body.to_owned());
                         }
                     };
-                    let json = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let json: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let password = json["password"].as_str().map(str::to_owned);
                     log.lock().expect("stub log").push((head, json));
                     match answer {
                         Answer::Status(status) => {
@@ -348,11 +421,23 @@ pub(crate) mod stub {
                         Answer::Silent => {
                             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                         }
+                        Answer::Password(expected) => {
+                            let status = if password.as_deref() == Some(expected) {
+                                200
+                            } else {
+                                401
+                            };
+                            let reply = format!(
+                                "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            );
+                            let _ = socket.write_all(reply.as_bytes()).await;
+                        }
                     }
                 });
             }
         });
         Stub {
+            answer,
             endpoint: Endpoint::parse(&url(port)).expect("stub URL"),
             url: url(port),
             requests,

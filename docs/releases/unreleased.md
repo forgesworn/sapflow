@@ -167,9 +167,21 @@ Notes for the release after 0.2.0-rc.1.
   network has. Until then it is refused as already live (RTMP
   `NetStream.Publish.BadName`, SRT `409`), which does not count against
   the failed-attempt throttle, and the encoder's retry gets in. A held
-  stage (its publisher gone) resumes at once as before. **Behaviour
-  change:** an encoder that reconnects faster than the silence is refused
-  once and joins on a retry; set 0 for the old behaviour.
+  stage (its publisher gone) resumes at once as before. For SRT the silence
+  counts from when the old connection's packets last arrived
+  (`Listener::last_received`), not from their delivery up to the latency
+  later. With `SAPFLOW_PUBLISH_AUTH_URL`, a refused publisher also makes
+  sapflow ask the app again (at most every 5 s per stream) whether it still
+  admits the live publisher's credentials; if the app now answers 401 or
+  403, or hands out a different SRT passphrase, the next publisher takes
+  over at once, so rotating a stream key removes whoever holds the old one.
+  Under SRT app keys, a takeover the guard would refuse is refused before
+  the replay guard remembers the caller's key material, so a refused
+  reconnect spends no admitted entry and a resend after a lost refusal is
+  not taken for a replay. **Behaviour change:** an encoder that reconnects
+  faster than the silence is refused once and joins on a retry; set 0 for
+  the old behaviour. Without an app, a publisher with the credentials who
+  wins a gap keeps the stage until it stops.
 - An SRT caller refused in the handshake for its encryption is now logged.
   Where encryption is required (`SAPFLOW_SRT_ENCRYPTION=required`, a
   `SAPFLOW_SRT_PASSPHRASE` without `optional`, or scoped control mode),
@@ -521,6 +533,12 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-srt
 
+- `Listener::last_received` (new): when the last packet, data or control,
+  arrived from an open connection's peer. Media is delivered up to the
+  latency later, so this is when the peer was last heard. Backed by
+  `Receiver::last_received` (new).
+- `CryptoConfig::same_passphrase` (new): whether two configurations hold
+  the same passphrase, compared in constant time for its length.
 - `ListenerStats::unsecure` (new) counts callers the listener itself
   refused in the handshake for their encryption, before any
   `Event::Connect`: no key material where encryption is required, or key

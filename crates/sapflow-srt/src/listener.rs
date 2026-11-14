@@ -378,6 +378,19 @@ impl<S: BuildHasher> Listener<S> {
         }
     }
 
+    /// When the last packet, data or control, arrived from an open
+    /// connection's peer; `None` for an unknown id or one still waiting.
+    /// Media is delivered up to the latency later, so this, not the
+    /// delivery of [`Event::Data`], is when the peer was last heard.
+    pub fn last_received(&self, id: ConnId) -> Option<Instant> {
+        match &self.conns.get(&id.0)?.state {
+            State::Open { rx, .. } => {
+                Some(self.epoch + Duration::from_micros(rx.last_received().max(0) as u64))
+            }
+            State::Pending(_) => None,
+        }
+    }
+
     /// The negotiated latency of an open connection.
     pub fn latency(&self, id: ConnId) -> Option<Duration> {
         match &self.conns.get(&id.0)?.state {

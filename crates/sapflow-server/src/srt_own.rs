@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::App;
-use crate::publish::{Admitted, Publication, PublicationLoss};
+use crate::publish::{Admitted, Publication, PublicationLoss, Refusal};
 use crate::publish_sessions::ScopedLease;
 use crate::recorder::IncompleteReason;
 use crate::srt::{Admission, IDLE, Refused, admit, feed_payload};
@@ -26,6 +26,9 @@ const QUEUE: usize = 16_384;
 struct Payload {
     bytes: Vec<u8>,
     received: Instant,
+    /// When the peer was last heard ([`Listener::last_received`]), which
+    /// times the takeover guard's silence; media is delivered later.
+    arrived: Instant,
     /// The SRT receiver gave up on data just before this payload.
     after_loss: bool,
 }
@@ -343,10 +346,13 @@ async fn run(
                     payload,
                     after_loss,
                 } => {
+                    let received = Instant::now();
+                    let arrived = listener.last_received(id).unwrap_or(received);
                     if let Some(publisher) = publishers.get(&id)
                         && !publisher.enqueue(Payload {
                             bytes: payload,
-                            received: Instant::now(),
+                            received,
+                            arrived,
                             after_loss,
                         })
                     {
@@ -589,7 +595,9 @@ fn refused_key(app: &Arc<App>, peer: SocketAddr) {
 /// [`claim_checked`] claims the path and accepts, with no await in between.
 /// The SRT loop does the same, but with a store it writes the store off the
 /// loop between the two.
-/// SRT claims take over a live path, so a caller refused for its key, or for
+/// An SRT claim can take over a live path (once its publisher has gone
+/// quiet, or the app has withdrawn its credentials), so a caller refused for
+/// its key, or for
 /// sending none, is refused before the claim, and a live or held stage, its
 /// recording and its callbacks are untouched. With the app's passphrase the
 /// caller must have used it; without one the listener's own settings decide,
@@ -683,6 +691,16 @@ fn check_pending(
         // As a wrong passphrase: the replayer learns nothing new.
         listener.reject(id, RejectCode::BADSECRET);
         app.log_refusal("srt", &"key material already admitted another connection");
+        return None;
+    }
+    // A takeover the guard would refuse: refused now, before its key
+    // material is remembered, so a reconnect refused while the live
+    // publisher still sends spends no admitted entry, and its resend after
+    // a lost refusal is not taken for a replay. The claim checks again.
+    if app.streams.takeover_waits(&req.path) {
+        Publication::recheck_holder(app, &req.path);
+        listener.reject(id, reject_code(Refused::Policy(Refusal::AlreadyLive)));
+        app.log_refusal("srt", &Refusal::AlreadyLive);
         return None;
     }
     // Remembered before the claim, so a copy is refused from now on; with a
@@ -904,6 +922,7 @@ async fn publish(
             result=tokio::time::timeout(IDLE,rx.recv())=>match result {
                 Ok(Some(data))=>{
                     if reject_stale(&publication, data.received, scope.is_some()){tracing::warn!("SRT scoped media queue exceeded one second");break}
+                    publication.note_arrival(data.arrived);
                     if let Err(error)=feed_payload(&mut publication,&data.bytes,data.after_loss){tracing::warn!(%error,"dropping SRT publisher");break}
                 }
                 Ok(None)=>break,
@@ -952,11 +971,13 @@ mod tests {
                     assert!(publisher.enqueue(Payload {
                         bytes: vec![0],
                         received: Instant::now(),
+                        arrived: Instant::now(),
                         after_loss: false,
                     }));
                     assert!(!publisher.enqueue(Payload {
                         bytes: vec![1],
                         received: Instant::now(),
+                        arrived: Instant::now(),
                         after_loss: false,
                     }));
                 }
@@ -965,6 +986,7 @@ mod tests {
                     assert!(!publisher.enqueue(Payload {
                         bytes: vec![0],
                         received: Instant::now(),
+                        arrived: Instant::now(),
                         after_loss: false,
                     }));
                 }

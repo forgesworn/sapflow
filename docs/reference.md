@@ -194,8 +194,17 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   refusal does not count against the address's failed-attempt throttle. So
   a publisher still sending keeps its stage, even from someone else holding
   its credentials (a plain RTMP stream key, say, read off a shared
-  network). Scoped publish sessions keep one owner and refuse a second
-  (`409`).
+  network). For SRT, silence is counted from when the old connection's
+  packets last arrived, not from when their media is delivered (up to the
+  latency later). With `SAPFLOW_PUBLISH_AUTH_URL`, a refused publisher also
+  makes sapflow ask the app again, at most every 5 s per stream, whether it
+  still admits the live publisher's credentials; if the app now refuses
+  them (401 or 403), or hands out a different SRT passphrase, the next
+  publisher takes over at once. So rotating a gig's stream key removes
+  whoever holds the old one, while it is sending. Without an app there is
+  nobody to ask: a publisher holding the credentials keeps a stage it won
+  in a gap until it stops. Scoped publish sessions keep one owner and
+  refuse a second (`409`).
 
 What players should do at a break (Safari on macOS seen to carry on
 through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by
