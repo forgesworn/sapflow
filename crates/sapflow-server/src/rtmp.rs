@@ -712,6 +712,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_publisher_is_not_taken_over_on_the_wire_until_it_goes_quiet() {
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.streams = Arc::new(
+            crate::stream::Registry::new(4)
+                .with_takeover_silence(std::time::Duration::from_secs(3)),
+        );
+        let from = "127.0.0.1".parse().expect("loopback");
+        let mut first = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut first, "event-first")
+                .await
+                .0
+                .is_ok()
+        );
+        // The same stream key again while the first is live: refused.
+        let mut second = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        let (result, wire, done) = negotiate_capacity_fixture(&mut second, "event-first").await;
+        assert!(
+            matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code)) if code == "NetStream.Publish.BadName")
+        );
+        assert!(done && second.publication.is_none());
+        assert!(
+            wire.windows(b"already live".len())
+                .any(|bytes| bytes == b"already live")
+        );
+        // Once the first has sent nothing for the silence, it is taken over.
+        fixture
+            .app
+            .streams
+            .get("event-first")
+            .expect("live stream")
+            .session()
+            .backdate_input(std::time::Duration::from_secs(4));
+        let mut third = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut third, "event-first")
+                .await
+                .0
+                .is_ok()
+        );
+        third.publication.take().expect("took over").end();
+        if let Some(publication) = first.publication.take() {
+            publication.end();
+        }
+    }
+
+    #[tokio::test]
     async fn resident_capacity_refusal_is_visible_on_the_actual_rtmp_wire() {
         let mut fixture = crate::publish::loss_tests::Fixture::new();
         let app = Arc::get_mut(&mut fixture.app).expect("sole App");

@@ -157,6 +157,19 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- A live publisher still sending keeps its stage. Without scoped
+  sessions, a second connection with the same credentials used to take a
+  live stream over at once, so anyone who read a stream key off the
+  network (plain RTMP sends it in clear) could take over a running show.
+  It now takes over only once the current publisher has sent nothing for
+  `SAPFLOW_TAKEOVER_SILENCE` (`--takeover-silence`; seconds, default 3, 0
+  takes over at once as before, maximum 3600), as an encoder that changed
+  network has. Until then it is refused as already live (RTMP
+  `NetStream.Publish.BadName`, SRT `409`), which does not count against
+  the failed-attempt throttle, and the encoder's retry gets in. A held
+  stage (its publisher gone) resumes at once as before. **Behaviour
+  change:** an encoder that reconnects faster than the silence is refused
+  once and joins on a retry; set 0 for the old behaviour.
 - An SRT caller refused in the handshake for its encryption is now logged.
   Where encryption is required (`SAPFLOW_SRT_ENCRYPTION=required`, a
   `SAPFLOW_SRT_PASSPHRASE` without `optional`, or scoped control mode),

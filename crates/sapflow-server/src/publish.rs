@@ -608,6 +608,7 @@ impl Publication {
         if !self.owns(&session) {
             return Err(PushError::Superseded);
         }
+        session.note_input();
         let mut discarded = false;
         let result = self.stream.apply(|source, now| {
             let before = source.dropped_packets();
@@ -1162,6 +1163,52 @@ mod publication_capacity_tests {
 
     fn request(id: &str) -> PublishRequest {
         PublishRequest::parse_rtmp("live", &format!("event-{id}")).expect("generated request")
+    }
+
+    #[tokio::test]
+    async fn a_publisher_sending_media_keeps_its_stage_until_it_goes_quiet() {
+        use std::time::Duration;
+        let mut fixture = loss_tests::Fixture::new();
+        Arc::get_mut(&mut fixture.app).expect("sole App").streams = Arc::new(
+            crate::stream::Registry::default().with_takeover_silence(Duration::from_secs(3)),
+        );
+        let from = "127.0.0.1".parse().expect("loopback");
+        let declare = |publication: &mut Publication| {
+            publication.push(|source, now| {
+                let Source::Flv(flv) = source else {
+                    panic!("FLV")
+                };
+                flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now)
+            })
+        };
+        let mut first = Publication::begin(&fixture.app, &request("a"), SourceKind::Flv, from)
+            .expect("first owner");
+        // Quiet for a while, then it sends: the clock starts again, so a
+        // second connection with the same credentials is refused.
+        first
+            .stream
+            .session()
+            .backdate_input(Duration::from_secs(10));
+        declare(&mut first).expect("declared audio");
+        assert!(matches!(
+            Publication::begin(&fixture.app, &request("a"), SourceKind::Flv, from),
+            Err(Refusal::AlreadyLive)
+        ));
+        assert!(
+            declare(&mut first).is_ok(),
+            "the first still owns its stage"
+        );
+        // Quiet past the silence, as after a network change: the reconnect
+        // takes over and the old connection's next push is refused.
+        first
+            .stream
+            .session()
+            .backdate_input(Duration::from_secs(4));
+        let second = Publication::begin(&fixture.app, &request("a"), SourceKind::Flv, from)
+            .expect("taken over after the silence");
+        assert!(matches!(declare(&mut first), Err(PushError::Superseded)));
+        second.end();
+        first.end();
     }
 
     #[tokio::test]

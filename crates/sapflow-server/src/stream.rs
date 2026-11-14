@@ -206,6 +206,9 @@ pub struct Session {
     /// from an earlier one changes nothing.
     generation: u64,
     attached: bool,
+    /// When the attached publisher last sent anything, or attached. A
+    /// takeover waits until this is [`Registry::with_takeover_silence`] old.
+    last_input: Instant,
     /// Credit belongs to this exact attached RTMP generation, not its TCP task.
     publication_permit: Option<PublicationPermit>,
     /// All completed parts below this floor belong to the previous connection.
@@ -255,6 +258,17 @@ impl Session {
 
     pub fn owns_connection(&self, generation: u64) -> bool {
         self.generation == generation && self.attached
+    }
+
+    /// The attached publisher sent something: a takeover waits again.
+    pub fn note_input(&mut self) {
+        self.last_input = Instant::now();
+    }
+
+    /// Pretend the attached publisher has been silent for `by`.
+    #[cfg(test)]
+    pub(crate) fn backdate_input(&mut self, by: Duration) {
+        self.last_input = Instant::now() - by;
     }
 
     /// Ignore delayed notices from an older connection after replacement.
@@ -390,6 +404,7 @@ impl LiveStream {
             session: Mutex::new(Session {
                 generation: 0,
                 attached: true,
+                last_input: Instant::now(),
                 publication_permit,
                 fresh_part_floor: 0,
                 recorder: None,
@@ -985,6 +1000,9 @@ pub struct Registry {
     retained: Arc<sapflow_core::fragment::FragmentQuota>,
     /// Set by [`Registry::stop_all`] with the map locked: no claim after it.
     stopping: AtomicBool,
+    /// How long a live publisher must have sent nothing before a takeover
+    /// may replace it; zero takes over at once.
+    takeover_silence: Duration,
 }
 
 /// What [`Registry::stop_all`] ended.
@@ -1037,7 +1055,19 @@ impl Registry {
             fragments: Arc::new(sapflow_core::fragment::FragmentQuota::new(fragment_bytes)),
             retained: Arc::new(sapflow_core::fragment::FragmentQuota::new(retained_bytes)),
             stopping: AtomicBool::new(false),
+            takeover_silence: Duration::ZERO,
         }
+    }
+
+    /// A takeover ([`Registry::claim_configured`] with `take_over`) replaces
+    /// a live publisher only once it has sent nothing for `silence`, as an
+    /// encoder that changed network has; until then the new connection is
+    /// refused as [`ClaimError::AlreadyLive`] and may retry. A publisher
+    /// still sending keeps its stage, so credentials read off the network
+    /// cannot take a show over while it is running. Zero takes over at once.
+    pub fn with_takeover_silence(mut self, silence: Duration) -> Self {
+        self.takeover_silence = silence;
+        self
     }
 
     /// How many more bytes the live fragment budget may hold before a new
@@ -1168,6 +1198,12 @@ impl Registry {
             if session.attached && !take_over {
                 return Err(ClaimError::AlreadyLive);
             }
+            // A live publisher still sending keeps its stage, whoever else
+            // holds its credentials; one that has gone quiet, as an encoder
+            // that changed network has, may be replaced.
+            if session.attached && session.last_input.elapsed() < self.takeover_silence {
+                return Err(ClaimError::AlreadyLive);
+            }
             // Admission precedes any terminal parsing, generation change or
             // recorder configuration. A refused cross-protocol takeover must
             // leave its current SRT owner completely unchanged.
@@ -1200,6 +1236,7 @@ impl Registry {
             } else {
                 session.generation += 1;
                 session.attached = true;
+                session.last_input = Instant::now();
                 session.publication_permit = publication_permit;
                 let mut st = stream.lock();
                 let muxer = st.ingest.take_muxer();
@@ -1528,6 +1565,54 @@ mod tests {
         assert!(again.session().owns_connection(g2));
     }
 
+    #[test]
+    fn a_live_publisher_still_sending_keeps_its_stage() {
+        let reg = Registry::default().with_takeover_silence(Duration::from_secs(3));
+        let p = StreamPath::parse("live/event-a").expect("path");
+        let take_over = || reg.claim_or_take_over(&p, MuxerConfig::default(), SourceKind::Ts);
+        let (first, g1, _) = claim(&reg, &p).expect("free");
+        // Just attached and then sending: a second connection with the same
+        // credentials is refused, and the first keeps its stage.
+        assert!(take_over().is_none(), "refused while the first attaches");
+        first.session().note_input();
+        assert!(take_over().is_none(), "refused while the first sends");
+        assert!(first.session().owns_connection(g1));
+        // Quiet just short of the silence: still refused.
+        first.session().backdate_input(Duration::from_millis(2_900));
+        assert!(take_over().is_none(), "refused before the silence is up");
+        // Quiet for longer, as an encoder that changed network is: the
+        // reconnect takes the stage over.
+        first.session().backdate_input(Duration::from_secs(4));
+        let (again, g2, c) = take_over().expect("taken over after the silence");
+        assert_eq!(c, Claim::Resumed);
+        assert!(Arc::ptr_eq(&first, &again) && g2 > g1);
+        assert!(!first.session().owns_connection(g1));
+        // The new owner has only just attached: it keeps the stage in turn.
+        assert!(
+            take_over().is_none(),
+            "the new owner is not taken over at once"
+        );
+        assert!(again.session().owns_connection(g2));
+        // A held stage, its publisher gone, resumes at once as before.
+        assert!(reg.detach(&again, g2, true));
+        let (resumed, g3, c) = take_over().expect("a held stage resumes");
+        assert_eq!(c, Claim::Resumed);
+        assert!(Arc::ptr_eq(&again, &resumed) && g3 > g2);
+    }
+
+    #[test]
+    fn zero_silence_takes_over_at_once_as_before() {
+        let reg = Registry::default().with_takeover_silence(Duration::ZERO);
+        let p = StreamPath::parse("live/event-a").expect("path");
+        let (first, g1, _) = claim(&reg, &p).expect("free");
+        first.session().note_input();
+        let (_, g2, c) = reg
+            .claim_or_take_over(&p, MuxerConfig::default(), SourceKind::Ts)
+            .expect("taken over at once");
+        assert_eq!(c, Claim::Resumed);
+        assert!(g2 > g1);
+    }
+
     #[tokio::test]
     async fn recorder_setup_is_atomic_with_admission_before_a_real_takeover() {
         use std::sync::mpsc;
@@ -1643,6 +1728,7 @@ mod grace_tests {
         let mut session = Session {
             generation: 0,
             attached: true,
+            last_input: Instant::now(),
             publication_permit: None,
             fresh_part_floor: 0,
             recorder: None,

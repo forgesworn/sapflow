@@ -185,10 +185,17 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
   equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. An encoder that
   changes network reconnects before its old connection has timed out: the
-  new connection with the same credentials takes the stream over at once,
-  as mediamtx's `overridePublisher` (its default) does, and the old one is
-  closed on its next packet without sending `unpublish`. Scoped publish
-  sessions keep one owner and refuse a second (`409`).
+  new connection with the same credentials takes the stream over once the
+  old one has sent nothing for `SAPFLOW_TAKEOVER_SILENCE` (default 3 s; `0`
+  takes over at once, as mediamtx's `overridePublisher` does), and the old
+  one is closed on its next packet without sending `unpublish`. Until then
+  the new connection is refused as already live (RTMP
+  `NetStream.Publish.BadName`, SRT `409`) and its encoder retries; that
+  refusal does not count against the address's failed-attempt throttle. So
+  a publisher still sending keeps its stage, even from someone else holding
+  its credentials (a plain RTMP stream key, say, read off a shared
+  network). Scoped publish sessions keep one owner and refuse a second
+  (`409`).
 
 What players should do at a break (Safari on macOS seen to carry on
 through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by
