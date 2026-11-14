@@ -981,6 +981,33 @@ pub enum Retirement {
     Held(Duration),
 }
 
+/// Whether a claim may take over a stream whose publisher is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeOver {
+    /// Refused as already live: scoped sessions and WHIP.
+    Never,
+    /// Once the attached publisher has sent nothing for
+    /// [`Registry::with_takeover_silence`], or the app has withdrawn its
+    /// credentials ([`Registry::revoke`]).
+    AfterSilence,
+    /// At once, even from a publisher still sending: a caller that proved
+    /// it holds the stream's own secret (an SRT passphrase the app holds
+    /// for this stream alone), so it is the stream's own encoder back on a
+    /// new connection, never someone who read a key off the network.
+    AtOnce,
+}
+
+impl From<bool> for TakeOver {
+    /// `true` is [`TakeOver::AfterSilence`], `false` [`TakeOver::Never`].
+    fn from(take_over: bool) -> Self {
+        if take_over {
+            Self::AfterSilence
+        } else {
+            Self::Never
+        }
+    }
+}
+
 /// A claim refused before ownership, media or recorder policy changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimError {
@@ -1215,10 +1242,11 @@ impl Registry {
         path: &StreamPath,
         cfg: MuxerConfig,
         kind: SourceKind,
-        take_over: bool,
+        take_over: impl Into<TakeOver>,
         max_rtmp_publishers: usize,
         configure: impl FnOnce(&mut Session, Claim),
     ) -> Result<(Arc<LiveStream>, u64, Claim), ClaimError> {
+        let take_over = take_over.into();
         let mut map = self.map();
         // Read under the map lock that stop_all sets it under.
         if self.stopping.load(Ordering::Acquire) {
@@ -1227,13 +1255,14 @@ impl Registry {
         let mut publication_permit = None;
         if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
-            if session.attached && !take_over {
+            if session.attached && take_over == TakeOver::Never {
                 return Err(ClaimError::AlreadyLive);
             }
             // A live publisher still sending keeps its stage, whoever else
             // holds its credentials; one that has gone quiet, as an encoder
-            // that changed network has, may be replaced.
-            if session.keeps_stage(self.takeover_silence) {
+            // that changed network has, may be replaced. A caller holding the
+            // stream's own secret is its encoder, and replaces it at once.
+            if take_over == TakeOver::AfterSilence && session.keeps_stage(self.takeover_silence) {
                 return Err(ClaimError::Sending);
             }
             // Admission precedes any terminal parsing, generation change or
@@ -1674,6 +1703,40 @@ mod tests {
         let (resumed, g3, c) = take_over().expect("a held stage resumes");
         assert_eq!(c, Claim::Resumed);
         assert!(Arc::ptr_eq(&again, &resumed) && g3 > g2);
+    }
+
+    #[test]
+    fn a_caller_holding_the_streams_own_secret_takes_over_at_once() {
+        let reg = Registry::default().with_takeover_silence(Duration::from_secs(3));
+        let p = StreamPath::parse("live/event-a").expect("path");
+        let (first, g1, _) = claim(&reg, &p).expect("free");
+        first.session().note_input();
+        let attempt = |take_over: TakeOver| {
+            reg.claim_configured(
+                &p,
+                MuxerConfig::default(),
+                SourceKind::Ts,
+                take_over,
+                16,
+                |_, _| {},
+            )
+        };
+        assert_eq!(
+            attempt(TakeOver::Never).err(),
+            Some(ClaimError::AlreadyLive)
+        );
+        assert_eq!(
+            attempt(TakeOver::AfterSilence).err(),
+            Some(ClaimError::Sending)
+        );
+        let (again, g2, c) = attempt(TakeOver::AtOnce).expect("taken over while sending");
+        assert_eq!(c, Claim::Resumed);
+        assert!(Arc::ptr_eq(&first, &again) && g2 > g1);
+        assert!(!first.session().owns_connection(g1));
+        assert!(
+            reg.takeover_waits(&p),
+            "the new owner keeps it from the rest"
+        );
     }
 
     #[test]

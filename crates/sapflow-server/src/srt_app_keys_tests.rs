@@ -1344,8 +1344,7 @@ async fn without_app_keys_optional_still_admits_plaintext() {
 }
 
 /// The app-keys fixture with a takeover guard that waits a minute: in these
-/// tests a sending holder is taken over only through revocation, never its
-/// silence.
+/// tests a sending holder is never taken over through its silence.
 fn guarded(stub: &Stub) -> Fixture {
     let mut fixture = fixture(stub, Duration::from_secs(30));
     Arc::get_mut(&mut fixture.app).expect("sole App").streams =
@@ -1367,22 +1366,44 @@ async fn sending_holder(fixture: &mut Fixture, addr: SocketAddr) -> Encoder {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_keyed_holder_still_sending_keeps_its_stage_from_the_same_key() {
+async fn a_reconnect_with_the_gigs_passphrase_takes_over_at_once() {
     let stub = stub::start(Answer::Passphrase(&[KEY])).await;
     let mut fixture = guarded(&stub);
     let (addr, server) = origin(&fixture.app);
     let mut holder = sending_holder(&mut fixture, addr).await;
     let asked = stub.count();
-    // Another caller with the gig's own passphrase while the holder sends:
-    // refused as already live, before its key material is remembered. The
-    // app's answer to it is its answer about the holder: no second request.
-    let second = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
-    assert_eq!(second.rejected(), Some(RejectCode::http(409).0));
+    // The encoder back on a new network while its old connection still
+    // counts as sending: the gig's own passphrase proves it is the gig's
+    // encoder, so it takes the stage at once, with no wait for the
+    // takeover silence and no second request to the app.
+    let mut back = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
+    assert!(back.connected, "{:?}", back.closed);
     assert_eq!(stub.count(), asked + 1);
-    // A resend after a lost refusal is refused the same way, not taken
-    // for a replay of admitted key material.
-    let resent = Encoder::call_dropping(addr, Some(key(KEY, KeySize::Aes128)), 1).await;
-    assert_eq!(resent.rejected(), Some(RejectCode::http(409).0));
+    back.send_media().await;
+    holder.send_media().await;
+    holder.run_until(|e| e.closed.is_some()).await;
+    assert!(holder.closed.is_some(), "the old connection is closed");
+    assert!(fixture.app.streams.takeover_waits(&stage_path()));
+    back.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_the_gigs_own_passphrase_a_sending_holder_keeps_its_stage() {
+    // App keys on, but this gig has no passphrase: a second caller with the
+    // gig's stream key proves nothing the network could not have shown, so
+    // it waits for the takeover silence as RTMP does, and is refused before
+    // anything is remembered for it.
+    let stub = stub::start(Answer::Status(200)).await;
+    let mut fixture = guarded(&stub);
+    let (addr, server) = origin(&fixture.app);
+    let mut holder = Encoder::call(addr, None).await;
+    assert!(holder.connected, "{:?}", holder.closed);
+    holder.send_media().await;
+    wait_for(&mut fixture, &mut holder, "publish").await;
+    let second = Encoder::call(addr, None).await;
+    assert_eq!(second.rejected(), Some(RejectCode::http(409).0));
     holder.send_media().await;
     assert!(fixture.app.streams.takeover_waits(&stage_path()));
     assert!(holder.closed.is_none(), "{:?}", holder.closed);
@@ -1418,20 +1439,12 @@ async fn the_gigs_stream_key_with_a_wrong_passphrase_never_removes_the_holder() 
 async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
     // The organiser makes a new stream URL: the app hands out a new
     // passphrase (`WRONG` here), for the same stream key or with a new one.
+    // Either way the new passphrase proves the caller is the gig's encoder,
+    // so the app is not asked about the holder.
     const ROTATED: &str = "publish:live/event-a:encoder:pw_live_rotated";
-    for (stream_id, rotated, requests) in [
-        // The same request as the holder's: the app's answer to it shows
-        // the holder's passphrase is stale, with no second request.
-        (STREAM_ID, Answer::Passphrase(&[WRONG]), 1),
-        // A new stream key: the holder's own request is sent again, and the
-        // app hands it the new passphrase...
-        (ROTATED, Answer::Passphrase(&[WRONG]), 2),
-        // ...or refuses its old stream key outright.
-        (
-            ROTATED,
-            Answer::PassphraseFor("pw_live_rotated", &[WRONG]),
-            2,
-        ),
+    for (stream_id, rotated) in [
+        (STREAM_ID, Answer::Passphrase(&[WRONG])),
+        (ROTATED, Answer::PassphraseFor("pw_live_rotated", &[WRONG])),
     ] {
         let stub = stub::start(Answer::Passphrase(&[KEY])).await;
         let mut fixture = guarded(&stub);
@@ -1443,7 +1456,7 @@ async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
         // while the holder is still sending.
         let mut taken = Encoder::call_as(addr, stream_id, Some(key(WRONG, KeySize::Aes128))).await;
         assert!(taken.connected, "{stream_id}: {:?}", taken.closed);
-        assert_eq!(stub.count(), asked + requests, "{stream_id}");
+        assert_eq!(stub.count(), asked + 1, "{stream_id}");
         taken.send_media().await;
         // The old holder's next media is refused: it no longer owns the
         // stage, and the server closes its connection.
@@ -1451,7 +1464,7 @@ async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
         holder.run_until(|e| e.closed.is_some()).await;
         assert!(
             holder.closed.is_some(),
-            "{stream_id}: the revoked holder is closed"
+            "{stream_id}: the old holder is closed"
         );
         assert!(
             fixture.app.streams.takeover_waits(&stage_path()),

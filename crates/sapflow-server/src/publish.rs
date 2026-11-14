@@ -51,8 +51,9 @@ pub enum Refusal {
 pub const RECHECK_LIMIT: Duration = Duration::from_secs(1);
 
 /// Proof that [`Publication::admit`] admitted a request; spent by
-/// [`Publication::claim_admitted`].
-#[derive(Debug)]
+/// [`Publication::claim_admitted`]. The default admits nothing of its own:
+/// what a scoped session's claim carries.
+#[derive(Debug, Default)]
 pub struct Admitted {
     /// The SRT passphrase the app holds for this stream, from
     /// [`Publication::admit_srt_key`]. Its `Debug` is redacted.
@@ -60,6 +61,10 @@ pub struct Admitted {
     /// What the app admitted this publisher with, kept with its stream so
     /// the app can be asked again later; `None` when no app admitted it.
     holder: Option<Arc<crate::publish_auth::Recheck>>,
+    /// The caller proved it holds the stream's own secret: its SRT key
+    /// material unwrapped with the passphrase the app holds for this stream
+    /// ([`Admitted::proved_stream_key`]).
+    holds_stream_key: bool,
 }
 
 impl Admitted {
@@ -68,6 +73,16 @@ impl Admitted {
     /// [`Publication::claim_admitted`], which refuses while it is still here.
     pub fn take_srt_key(&mut self) -> Option<sapflow_srt::crypto::CryptoConfig> {
         self.srt_key.take()
+    }
+
+    /// The caller's key material passed the check against the passphrase the
+    /// app returned for this stream ([`Admitted::take_srt_key`]). Only that
+    /// stream's own encoder holds it, since it never crosses the network, so
+    /// the claim takes the stream over at once, even from a publisher still
+    /// sending: an encoder back on a new network is not made to wait for the
+    /// takeover silence.
+    pub fn proved_stream_key(&mut self) {
+        self.holds_stream_key = true;
     }
 }
 
@@ -252,6 +267,7 @@ impl Publication {
         Ok(Admitted {
             srt_key: None,
             holder: None,
+            holds_stream_key: false,
         })
     }
 
@@ -272,7 +288,7 @@ impl Publication {
             req,
             kind,
             None,
-            admitted.holder,
+            admitted,
             app.config.max_publish_bps,
             app.config.reconnect_grace,
         )
@@ -366,13 +382,17 @@ impl Publication {
             offer_srt_key,
             srt_key.clone(),
         ));
-        // WHIP never takes a stage over, so it has no holder to check.
-        if !matches!(kind, SourceKind::Es) {
+        // WHIP never takes a stage over, so it has no holder to check. An SRT
+        // caller the app hands a passphrase to is decided by its own key
+        // check: one that passes takes over at once, and one that fails
+        // changes nothing.
+        if !matches!(kind, SourceKind::Es) && srt_key.is_none() {
             Self::recheck_holder(app, endpoint, &req.path, &holder).await;
         }
         Ok(Admitted {
             srt_key,
             holder: Some(holder),
+            holds_stream_key: false,
         })
     }
 
@@ -483,7 +503,7 @@ impl Publication {
                     req,
                     SourceKind::Ts,
                     Some(scope.clone()),
-                    None,
+                    Admitted::default(),
                     limits.max_publish_bps.min(app.config.max_publish_bps),
                     grace,
                 )
@@ -496,10 +516,15 @@ impl Publication {
         req: &PublishRequest,
         kind: SourceKind,
         scope: Option<ScopedLease>,
-        holder: Option<Arc<crate::publish_auth::Recheck>>,
+        admitted: Admitted,
         max_bps: u64,
         grace: Duration,
     ) -> Result<Self, Refusal> {
+        let Admitted {
+            holder,
+            holds_stream_key,
+            ..
+        } = admitted;
         let callbacks = scope.as_ref().map_or_else(
             || app.callbacks.clone(),
             |scope| app.callbacks.scoped(scope.scope()),
@@ -509,12 +534,19 @@ impl Publication {
             window: app.config.window,
             ..MuxerConfig::default()
         };
-        // Global-publisher mode: the one authorised publisher may replace its
-        // own stale connection. Scoped sessions keep their single owner, and
-        // so does a WHIP claim: a POST for a live path gets 409, whoever is
-        // publishing (docs/whip-ingest.md, Reconnects). Superseding a stalled
-        // WHIP session is not built yet.
-        let take_over = scope.is_none() && !matches!(kind, SourceKind::Es);
+        // Global-publisher and app-authorised mode: the authorised publisher
+        // may replace its own quiet connection, and one holding the stream's
+        // own passphrase may replace it at once. Scoped sessions keep their
+        // single owner, and so does a WHIP claim: a POST for a live path gets
+        // 409, whoever is publishing (docs/whip-ingest.md, Reconnects).
+        // Superseding a stalled WHIP session is not built yet.
+        let take_over = if scope.is_some() || matches!(kind, SourceKind::Es) {
+            crate::stream::TakeOver::Never
+        } else if holds_stream_key {
+            crate::stream::TakeOver::AtOnce
+        } else {
+            crate::stream::TakeOver::AfterSilence
+        };
         let recorder_factory = Self::recorder_factory(app, &req.path, &callbacks);
         let mut recording = false;
         let (stream, generation, claim) = app
