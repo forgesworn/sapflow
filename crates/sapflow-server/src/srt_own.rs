@@ -639,7 +639,11 @@ fn check_pending(
     peer: SocketAddr,
     pending: crate::srt::Pending,
 ) -> Option<Checked> {
-    let crate::srt::Pending { req, admitted, key } = pending;
+    let crate::srt::Pending {
+        req,
+        mut admitted,
+        key,
+    } = pending;
     let checked = match &key {
         Some(key) => match listener.check_key(id, key) {
             Ok(size) => Ok(Encryption::AppKey(size)),
@@ -654,7 +658,15 @@ fn check_pending(
         None => deployment_check(app, listener, id),
     };
     let encryption = match checked {
-        Ok(encryption) => encryption,
+        Ok(encryption) => {
+            // The stream's own passphrase, which never crosses the network:
+            // the claim waits only the short proven silence, so an encoder
+            // back on a new network does not wait the full takeover silence.
+            if matches!(encryption, Encryption::AppKey(_)) {
+                admitted.proved_stream_key();
+            }
+            encryption
+        }
         // Not answered within the accept timeout while the app was asked:
         // the caller is gone, and nothing was claimed for it.
         Err(None) => {
@@ -697,8 +709,14 @@ fn check_pending(
     // material is remembered, so a reconnect refused while the live
     // publisher still sends spends no admitted entry, and its resend after
     // a lost refusal is not taken for a replay. The admission has already
-    // asked the app about the holder; the claim checks again.
-    if app.streams.takeover_waits(&req.path) {
+    // asked the app about the holder; the claim checks again. A caller with
+    // the stream's own passphrase waits only the short proven silence.
+    let take_over = if matches!(encryption, Encryption::AppKey(_)) {
+        crate::stream::TakeOver::Proven
+    } else {
+        crate::stream::TakeOver::AfterSilence
+    };
+    if app.streams.takeover_waits_for(&req.path, take_over) {
         listener.reject(id, reject_code(Refused::Policy(Refusal::AlreadyLive)));
         app.log_refusal("srt", &Refusal::AlreadyLive);
         return None;

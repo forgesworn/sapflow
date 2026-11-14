@@ -1344,12 +1344,24 @@ async fn without_app_keys_optional_still_admits_plaintext() {
 }
 
 /// The app-keys fixture with a takeover guard that waits a minute: in these
-/// tests a sending holder is taken over only through revocation, never its
-/// silence.
+/// tests a sending holder is never taken over through its silence.
 fn guarded(stub: &Stub) -> Fixture {
     let mut fixture = fixture(stub, Duration::from_secs(30));
     Arc::get_mut(&mut fixture.app).expect("sole App").streams =
         Arc::new(crate::stream::Registry::default().with_takeover_silence(Duration::from_secs(60)));
+    fixture
+}
+
+/// [`guarded`] with a minute's proven silence too, so the holder counts as
+/// sending even to a caller with the gig's passphrase: only revocation lets
+/// anyone in.
+fn guarded_long(stub: &Stub) -> Fixture {
+    let mut fixture = guarded(stub);
+    Arc::get_mut(&mut fixture.app).expect("sole App").streams = Arc::new(
+        crate::stream::Registry::default()
+            .with_takeover_silence(Duration::from_secs(60))
+            .with_proven_silence(Duration::from_secs(60)),
+    );
     fixture
 }
 
@@ -1367,22 +1379,74 @@ async fn sending_holder(fixture: &mut Fixture, addr: SocketAddr) -> Encoder {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_keyed_holder_still_sending_keeps_its_stage_from_the_same_key() {
+async fn a_reconnect_with_the_gigs_passphrase_waits_only_a_short_silence() {
     let stub = stub::start(Answer::Passphrase(&[KEY])).await;
     let mut fixture = guarded(&stub);
     let (addr, server) = origin(&fixture.app);
     let mut holder = sending_holder(&mut fixture, addr).await;
     let asked = stub.count();
-    // Another caller with the gig's own passphrase while the holder sends:
-    // refused as already live, before its key material is remembered. The
-    // app's answer to it is its answer about the holder: no second request.
+    // The network goes: the old connection sends nothing more, not even
+    // keepalives. Well inside the minute's takeover silence, the encoder back
+    // on a new network takes the stage once the short proven silence has
+    // passed, with no second request to the app.
+    tokio::time::sleep(crate::stream::PROVEN_TAKEOVER_SILENCE + Duration::from_millis(300)).await;
+    let mut back = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
+    assert!(back.connected, "{:?}", back.closed);
+    assert_eq!(stub.count(), asked + 1);
+    back.send_media().await;
+    holder.send_media().await;
+    holder.run_until(|e| e.closed.is_some()).await;
+    assert!(holder.closed.is_some(), "the old connection is closed");
+    assert!(fixture.app.streams.takeover_waits(&stage_path()));
+    back.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_caller_with_the_gigs_passphrase_never_takes_a_sending_stage() {
+    // A replayed handshake the replay guard has forgotten, or a second
+    // encoder with the gig's address, passes the key check too: while the
+    // live publisher sends, it is refused as already live, uncharged, and
+    // the holder keeps its stage. (The proven silence is a minute here,
+    // so the holder counts as sending throughout.)
+    let stub = stub::start(Answer::Passphrase(&[KEY])).await;
+    let mut fixture = guarded_long(&stub);
+    let (addr, server) = origin(&fixture.app);
+    let mut holder = sending_holder(&mut fixture, addr).await;
     let second = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
     assert_eq!(second.rejected(), Some(RejectCode::http(409).0));
-    assert_eq!(stub.count(), asked + 1);
     // A resend after a lost refusal is refused the same way, not taken
     // for a replay of admitted key material.
     let resent = Encoder::call_dropping(addr, Some(key(KEY, KeySize::Aes128)), 1).await;
     assert_eq!(resent.rejected(), Some(RejectCode::http(409).0));
+    holder.send_media().await;
+    assert!(holder.closed.is_none(), "{:?}", holder.closed);
+    assert!(
+        uncharged(&fixture.app, "127.0.0.1"),
+        "already live is not a failed attempt"
+    );
+    holder.stop().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_the_gigs_own_passphrase_a_sending_holder_keeps_its_stage() {
+    // App keys on, but this gig has no passphrase: a second caller with the
+    // gig's stream key proves nothing the network could not have shown, so
+    // it waits for the full takeover silence as RTMP does, not the short
+    // proven one, and is refused before anything is remembered for it.
+    let stub = stub::start(Answer::Status(200)).await;
+    let mut fixture = guarded(&stub);
+    let (addr, server) = origin(&fixture.app);
+    let mut holder = Encoder::call(addr, None).await;
+    assert!(holder.connected, "{:?}", holder.closed);
+    holder.send_media().await;
+    wait_for(&mut fixture, &mut holder, "publish").await;
+    tokio::time::sleep(crate::stream::PROVEN_TAKEOVER_SILENCE + Duration::from_millis(300)).await;
+    let second = Encoder::call(addr, None).await;
+    assert_eq!(second.rejected(), Some(RejectCode::http(409).0));
     holder.send_media().await;
     assert!(fixture.app.streams.takeover_waits(&stage_path()));
     assert!(holder.closed.is_none(), "{:?}", holder.closed);
@@ -1418,6 +1482,8 @@ async fn the_gigs_stream_key_with_a_wrong_passphrase_never_removes_the_holder() 
 async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
     // The organiser makes a new stream URL: the app hands out a new
     // passphrase (`WRONG` here), for the same stream key or with a new one.
+    // The holder is still sending throughout: only its revocation lets the
+    // new key in.
     const ROTATED: &str = "publish:live/event-a:encoder:pw_live_rotated";
     for (stream_id, rotated, requests) in [
         // The same request as the holder's: the app's answer to it shows
@@ -1434,7 +1500,7 @@ async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
         ),
     ] {
         let stub = stub::start(Answer::Passphrase(&[KEY])).await;
-        let mut fixture = guarded(&stub);
+        let mut fixture = guarded_long(&stub);
         let (addr, server) = origin(&fixture.app);
         let mut holder = sending_holder(&mut fixture, addr).await;
         stub.answer(rotated);
@@ -1451,7 +1517,7 @@ async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
         holder.run_until(|e| e.closed.is_some()).await;
         assert!(
             holder.closed.is_some(),
-            "{stream_id}: the revoked holder is closed"
+            "{stream_id}: the old holder is closed"
         );
         assert!(
             fixture.app.streams.takeover_waits(&stage_path()),

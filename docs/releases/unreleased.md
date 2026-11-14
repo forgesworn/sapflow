@@ -188,6 +188,15 @@ Notes for the release after 0.2.0-rc.1.
   faster than the silence is refused once and joins on a retry; set 0 for
   the old behaviour. Without an app, a publisher with the credentials who
   wins a gap keeps the stage until it stops.
+- An SRT caller whose key material unwraps with the passphrase the app
+  holds for its stream (`SAPFLOW_SRT_APP_KEYS`) takes the stream over
+  after 300 ms of silence instead of `SAPFLOW_TAKEOVER_SILENCE`, so an
+  encoder back on a new network no longer waits about 3 s (our Android app
+  retries after 0.5 s, then 1 s, then 2 s, and each try was refused until
+  the old connection had been quiet that long). A publisher still sending
+  keeps its stage even from such a caller, since a replayed handshake
+  passes the key check too. Plain RTMP, RTMPS, SRT without a passphrase
+  and SRT with the deployment's shared passphrase keep the full silence.
 - An SRT caller refused in the handshake for its encryption is now logged.
   Where encryption is required (`SAPFLOW_SRT_ENCRYPTION=required`, a
   `SAPFLOW_SRT_PASSPHRASE` without `optional`, or scoped control mode),

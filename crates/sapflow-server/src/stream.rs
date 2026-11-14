@@ -981,6 +981,48 @@ pub enum Retirement {
     Held(Duration),
 }
 
+/// Whether a claim may take over a stream whose publisher is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeOver {
+    /// Refused as already live: scoped sessions and WHIP.
+    Never,
+    /// Once the attached publisher has sent nothing for
+    /// [`Registry::with_takeover_silence`], or the app has withdrawn its
+    /// credentials ([`Registry::revoke`]).
+    AfterSilence,
+    /// Once the attached publisher has sent nothing for the much shorter
+    /// [`Registry::with_proven_silence`] (or was revoked): a caller whose SRT
+    /// key material unwrapped with the passphrase the app holds for this
+    /// stream alone. Its encoder, back on a new network, finds the old
+    /// connection already quiet, so it is not made to wait; but the check
+    /// proves only that the key material was made with the passphrase, so a
+    /// replayed handshake the replay guard has forgotten would pass it too,
+    /// and a second encoder with the same address would take the stage in
+    /// turn. Both are refused while the publisher is still sending.
+    Proven,
+}
+
+/// [`Registry::with_proven_silence`]'s default: shorter than any real
+/// reconnect (the old connection falls silent when the network goes, and
+/// an encoder notices and retries after that, our Android app after a
+/// further 0.5 s), and longer than the gaps between a sending encoder's data
+/// at video bitrates. Only data moves a publisher's clock, so a very
+/// low-bitrate audio-only stream (about 32 kbit/s, a payload every 330 ms)
+/// or a stalled uplink can leave a gap this long, in which another caller
+/// with the stream's passphrase (a backup encoder, a replay) may take over.
+pub const PROVEN_TAKEOVER_SILENCE: Duration = Duration::from_millis(300);
+
+impl From<bool> for TakeOver {
+    /// `true` is [`TakeOver::AfterSilence`], `false` [`TakeOver::Never`].
+    fn from(take_over: bool) -> Self {
+        if take_over {
+            Self::AfterSilence
+        } else {
+            Self::Never
+        }
+    }
+}
+
 /// A claim refused before ownership, media or recorder policy changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimError {
@@ -1032,6 +1074,9 @@ pub struct Registry {
     /// How long a live publisher must have sent nothing before a takeover
     /// may replace it; zero takes over at once.
     takeover_silence: Duration,
+    /// The same for a [`TakeOver::Proven`] caller, at most
+    /// `takeover_silence`.
+    proven_silence: Duration,
 }
 
 /// What [`Registry::stop_all`] ended.
@@ -1085,6 +1130,7 @@ impl Registry {
             retained: Arc::new(sapflow_core::fragment::FragmentQuota::new(retained_bytes)),
             stopping: AtomicBool::new(false),
             takeover_silence: Duration::ZERO,
+            proven_silence: PROVEN_TAKEOVER_SILENCE,
         }
     }
 
@@ -1098,6 +1144,24 @@ impl Registry {
     pub fn with_takeover_silence(mut self, silence: Duration) -> Self {
         self.takeover_silence = silence;
         self
+    }
+
+    /// The silence a [`TakeOver::Proven`] caller waits for instead
+    /// ([`PROVEN_TAKEOVER_SILENCE`] by default), never longer than
+    /// [`Registry::with_takeover_silence`]'s.
+    pub fn with_proven_silence(mut self, silence: Duration) -> Self {
+        self.proven_silence = silence;
+        self
+    }
+
+    /// How long the live publisher must have been quiet for a takeover of
+    /// this kind; `None` when it never takes over.
+    fn silence_for(&self, take_over: TakeOver) -> Option<Duration> {
+        match take_over {
+            TakeOver::Never => None,
+            TakeOver::AfterSilence => Some(self.takeover_silence),
+            TakeOver::Proven => Some(self.proven_silence.min(self.takeover_silence)),
+        }
     }
 
     /// How many more bytes the live fragment budget may hold before a new
@@ -1215,10 +1279,11 @@ impl Registry {
         path: &StreamPath,
         cfg: MuxerConfig,
         kind: SourceKind,
-        take_over: bool,
+        take_over: impl Into<TakeOver>,
         max_rtmp_publishers: usize,
         configure: impl FnOnce(&mut Session, Claim),
     ) -> Result<(Arc<LiveStream>, u64, Claim), ClaimError> {
+        let take_over = take_over.into();
         let mut map = self.map();
         // Read under the map lock that stop_all sets it under.
         if self.stopping.load(Ordering::Acquire) {
@@ -1227,14 +1292,16 @@ impl Registry {
         let mut publication_permit = None;
         if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
-            if session.attached && !take_over {
-                return Err(ClaimError::AlreadyLive);
-            }
             // A live publisher still sending keeps its stage, whoever else
             // holds its credentials; one that has gone quiet, as an encoder
-            // that changed network has, may be replaced.
-            if session.keeps_stage(self.takeover_silence) {
-                return Err(ClaimError::Sending);
+            // that changed network has, may be replaced, after a much shorter
+            // silence for a caller holding the stream's own passphrase.
+            match self.silence_for(take_over) {
+                None if session.attached => return Err(ClaimError::AlreadyLive),
+                Some(silence) if session.keeps_stage(silence) => {
+                    return Err(ClaimError::Sending);
+                }
+                _ => {}
             }
             // Admission precedes any terminal parsing, generation change or
             // recorder configuration. A refused cross-protocol takeover must
@@ -1318,25 +1385,35 @@ impl Registry {
     /// Whether a takeover of `path` would be refused now because its live
     /// publisher is still sending. Read only; a claim checks again.
     pub fn takeover_waits(&self, path: &StreamPath) -> bool {
-        let map = self.map();
-        map.get(path.event_id())
-            .is_some_and(|stream| stream.session().keeps_stage(self.takeover_silence))
+        self.takeover_waits_for(path, TakeOver::AfterSilence)
     }
 
-    /// The admission of `path`'s live publisher while a takeover would be
-    /// refused for it ([`Registry::takeover_waits`]), to ask the app whether
-    /// it still admits it: `None` when the stage would be taken over anyway,
-    /// or no app admitted its publisher. Read only.
+    /// [`Registry::takeover_waits`] for a takeover of this kind.
+    pub fn takeover_waits_for(&self, path: &StreamPath, take_over: TakeOver) -> bool {
+        let Some(silence) = self.silence_for(take_over) else {
+            return false;
+        };
+        let map = self.map();
+        map.get(path.event_id())
+            .is_some_and(|stream| stream.session().keeps_stage(silence))
+    }
+
+    /// The admission of `path`'s live publisher while a takeover of this
+    /// kind would be refused for it ([`Registry::takeover_waits_for`]), to ask
+    /// the app whether it still admits it: `None` when the stage would be
+    /// taken over anyway, or no app admitted its publisher. Read only.
     pub(crate) fn sending_holder(
         &self,
         path: &StreamPath,
+        take_over: TakeOver,
     ) -> Option<(Arc<LiveStream>, u64, Arc<crate::publish_auth::Recheck>)> {
+        let silence = self.silence_for(take_over)?;
         let map = self.map();
         let stream = map.get(path.event_id())?.clone();
         drop(map);
         let (generation, holder) = {
             let session = stream.session();
-            if !session.keeps_stage(self.takeover_silence) {
+            if !session.keeps_stage(silence) {
                 return None;
             }
             (session.generation, session.holder.clone()?)
@@ -1677,6 +1754,54 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_holding_the_streams_own_secret_waits_only_a_short_silence() {
+        let reg = Registry::default().with_takeover_silence(Duration::from_secs(3));
+        let p = StreamPath::parse("live/event-a").expect("path");
+        let (first, g1, _) = claim(&reg, &p).expect("free");
+        first.session().note_input();
+        let attempt = |take_over: TakeOver| {
+            reg.claim_configured(
+                &p,
+                MuxerConfig::default(),
+                SourceKind::Ts,
+                take_over,
+                16,
+                |_, _| {},
+            )
+        };
+        // Still sending: refused to everyone, a proven caller included.
+        assert_eq!(
+            attempt(TakeOver::Never).err(),
+            Some(ClaimError::AlreadyLive)
+        );
+        assert_eq!(
+            attempt(TakeOver::AfterSilence).err(),
+            Some(ClaimError::Sending)
+        );
+        assert_eq!(attempt(TakeOver::Proven).err(), Some(ClaimError::Sending));
+        assert!(reg.takeover_waits_for(&p, TakeOver::Proven));
+        // Quiet for longer than the proven silence, well short of the other.
+        first
+            .session()
+            .backdate_input(PROVEN_TAKEOVER_SILENCE + Duration::from_millis(200));
+        assert!(!reg.takeover_waits_for(&p, TakeOver::Proven));
+        assert!(reg.takeover_waits(&p));
+        assert_eq!(
+            attempt(TakeOver::AfterSilence).err(),
+            Some(ClaimError::Sending)
+        );
+        let (again, g2, c) = attempt(TakeOver::Proven).expect("taken over after the short silence");
+        assert_eq!(c, Claim::Resumed);
+        assert!(Arc::ptr_eq(&first, &again) && g2 > g1);
+        assert!(!first.session().owns_connection(g1));
+        // Never longer than the takeover silence: with none, at once.
+        let open = Registry::default().with_proven_silence(Duration::from_secs(60));
+        let (live, _, _) = claim(&open, &p).expect("free");
+        live.session().note_input();
+        assert!(!open.takeover_waits_for(&p, TakeOver::Proven));
+    }
+
+    #[test]
     fn a_revoked_holder_is_taken_over_at_once() {
         let reg = Registry::default().with_takeover_silence(Duration::from_secs(3));
         let p = StreamPath::parse("live/event-a").expect("path");
@@ -1684,7 +1809,7 @@ mod tests {
         first.session().note_input();
         assert!(reg.takeover_waits(&p));
         assert!(
-            reg.sending_holder(&p).is_none(),
+            reg.sending_holder(&p, TakeOver::AfterSilence).is_none(),
             "no app admitted it, so there is nothing to ask"
         );
         assert!(!reg.revoke(&first, g1 + 1), "not the holder's generation");

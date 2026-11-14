@@ -60,6 +60,9 @@ pub struct Admitted {
     /// What the app admitted this publisher with, kept with its stream so
     /// the app can be asked again later; `None` when no app admitted it.
     holder: Option<Arc<crate::publish_auth::Recheck>>,
+    /// The caller's SRT key material unwrapped with the passphrase the app
+    /// holds for this stream ([`Admitted::proved_stream_key`]).
+    holds_stream_key: bool,
 }
 
 impl Admitted {
@@ -68,6 +71,26 @@ impl Admitted {
     /// [`Publication::claim_admitted`], which refuses while it is still here.
     pub fn take_srt_key(&mut self) -> Option<sapflow_srt::crypto::CryptoConfig> {
         self.srt_key.take()
+    }
+
+    /// What a scoped session's claim carries: its session admitted it, and
+    /// it never takes a stream over.
+    fn scoped() -> Self {
+        Self {
+            srt_key: None,
+            holder: None,
+            holds_stream_key: false,
+        }
+    }
+
+    /// The caller's key material passed the check against the passphrase the
+    /// app returned for this stream ([`Admitted::take_srt_key`]), which never
+    /// crosses the network. Its claim waits only for the short
+    /// [`crate::stream::TakeOver::Proven`] silence, so the stream's encoder,
+    /// back on a new network, is not made to wait for the full takeover
+    /// silence; a publisher still sending keeps its stage even from it.
+    pub fn proved_stream_key(&mut self) {
+        self.holds_stream_key = true;
     }
 }
 
@@ -252,6 +275,7 @@ impl Publication {
         Ok(Admitted {
             srt_key: None,
             holder: None,
+            holds_stream_key: false,
         })
     }
 
@@ -272,7 +296,7 @@ impl Publication {
             req,
             kind,
             None,
-            admitted.holder,
+            admitted,
             app.config.max_publish_bps,
             app.config.reconnect_grace,
         )
@@ -366,13 +390,24 @@ impl Publication {
             offer_srt_key,
             srt_key.clone(),
         ));
-        // WHIP never takes a stage over, so it has no holder to check.
+        // WHIP never takes a stage over, so it has no holder to check. An
+        // SRT caller the app hands a passphrase to will claim as
+        // `TakeOver::Proven` if its key check passes, so the holder is asked
+        // about only while that claim would be refused: still sending, as an
+        // old encoder after a key rotation is, not quiet, as the same
+        // encoder's old connection is when it comes back from a new network.
         if !matches!(kind, SourceKind::Es) {
-            Self::recheck_holder(app, endpoint, &req.path, &holder).await;
+            let take_over = if srt_key.is_some() {
+                crate::stream::TakeOver::Proven
+            } else {
+                crate::stream::TakeOver::AfterSilence
+            };
+            Self::recheck_holder(app, endpoint, &req.path, take_over, &holder).await;
         }
         Ok(Admitted {
             srt_key,
             holder: Some(holder),
+            holds_stream_key: false,
         })
     }
 
@@ -483,7 +518,7 @@ impl Publication {
                     req,
                     SourceKind::Ts,
                     Some(scope.clone()),
-                    None,
+                    Admitted::scoped(),
                     limits.max_publish_bps.min(app.config.max_publish_bps),
                     grace,
                 )
@@ -496,10 +531,15 @@ impl Publication {
         req: &PublishRequest,
         kind: SourceKind,
         scope: Option<ScopedLease>,
-        holder: Option<Arc<crate::publish_auth::Recheck>>,
+        admitted: Admitted,
         max_bps: u64,
         grace: Duration,
     ) -> Result<Self, Refusal> {
+        let Admitted {
+            holder,
+            holds_stream_key,
+            ..
+        } = admitted;
         let callbacks = scope.as_ref().map_or_else(
             || app.callbacks.clone(),
             |scope| app.callbacks.scoped(scope.scope()),
@@ -509,12 +549,19 @@ impl Publication {
             window: app.config.window,
             ..MuxerConfig::default()
         };
-        // Global-publisher mode: the one authorised publisher may replace its
-        // own stale connection. Scoped sessions keep their single owner, and
-        // so does a WHIP claim: a POST for a live path gets 409, whoever is
-        // publishing (docs/whip-ingest.md, Reconnects). Superseding a stalled
-        // WHIP session is not built yet.
-        let take_over = scope.is_none() && !matches!(kind, SourceKind::Es);
+        // Global-publisher and app-authorised mode: the authorised publisher
+        // may replace its own quiet connection, and one holding the stream's
+        // own passphrase after a much shorter silence. Scoped sessions keep their
+        // single owner, and so does a WHIP claim: a POST for a live path gets
+        // 409, whoever is publishing (docs/whip-ingest.md, Reconnects).
+        // Superseding a stalled WHIP session is not built yet.
+        let take_over = if scope.is_some() || matches!(kind, SourceKind::Es) {
+            crate::stream::TakeOver::Never
+        } else if holds_stream_key {
+            crate::stream::TakeOver::Proven
+        } else {
+            crate::stream::TakeOver::AfterSilence
+        };
         let recorder_factory = Self::recorder_factory(app, &req.path, &callbacks);
         let mut recording = false;
         let (stream, generation, claim) = app
@@ -590,9 +637,10 @@ impl Publication {
         app: &Arc<App>,
         endpoint: &crate::http_lite::Endpoint,
         path: &sapflow_core::StreamPath,
+        take_over: crate::stream::TakeOver,
         newcomer: &crate::publish_auth::Recheck,
     ) {
-        let Some((stream, generation, holder)) = app.streams.sending_holder(path) else {
+        let Some((stream, generation, holder)) = app.streams.sending_holder(path, take_over) else {
             return;
         };
         let admitted = if holder.same_request(newcomer) {
@@ -1451,6 +1499,52 @@ mod publication_capacity_tests {
         // The new owner is not revoked: a takeover waits for it again.
         assert!(fixture.app.streams.takeover_waits(&keyed(NEW).path));
         new.end();
+        holder.end();
+    }
+
+    #[tokio::test]
+    async fn a_proven_caller_from_a_new_address_asks_about_the_holder_only_while_it_sends() {
+        use crate::publish_auth::stub::Answer;
+        const PASSPHRASE: &str = "pw_srt_00112233445566778899aabbccddeeff";
+        let (fixture, stub) = guarded_app(Answer::Passphrase(&[PASSPHRASE])).await;
+        let req = PublishRequest::parse_srt_stream_id("publish:live/event-a:encoder:pw_live_gig")
+            .expect("request");
+        let here = "127.0.0.1".parse().expect("loopback");
+        let there = "127.0.0.2".parse().expect("loopback");
+        // As the SRT loop does once the caller's key check has passed.
+        let proven = |mut admitted: Admitted| {
+            assert!(admitted.take_srt_key().is_some(), "the app's passphrase");
+            admitted.proved_stream_key();
+            admitted
+        };
+        let admit = |from| Publication::admit_srt_key(&fixture.app, &req, from);
+        let holder = Publication::claim_admitted(
+            &fixture.app,
+            &req,
+            SourceKind::Ts,
+            proven(admit(here).await.expect("admitted")),
+        )
+        .expect("holder");
+        let stream = fixture.app.streams.get("event-a").expect("stage");
+        // Still sending: a caller from another address makes the app be asked
+        // about the holder, which it still admits, so the caller waits.
+        let admitted = admit(there).await.expect("admitted");
+        assert_eq!(stub.count(), 3, "the holder was asked about");
+        assert!(matches!(
+            Publication::claim_admitted(&fixture.app, &req, SourceKind::Ts, proven(admitted)),
+            Err(Refusal::AlreadyLive)
+        ));
+        // The network gone, the old connection is quiet: the same encoder
+        // back from a new address is not held up by a request about it.
+        stream
+            .session()
+            .backdate_input(crate::stream::PROVEN_TAKEOVER_SILENCE + Duration::from_millis(200));
+        let admitted = admit(there).await.expect("admitted");
+        assert_eq!(stub.count(), 4, "no request about the holder");
+        let back =
+            Publication::claim_admitted(&fixture.app, &req, SourceKind::Ts, proven(admitted))
+                .expect("taken over");
+        back.end();
         holder.end();
     }
 

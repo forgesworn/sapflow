@@ -196,7 +196,18 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   its credentials (a plain RTMP stream key, say, read off a shared
   network). For SRT, silence is counted from when the old connection's
   packets last arrived, not from when their media is delivered (up to the
-  latency later). With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
+  latency later). An SRT caller whose key material unwraps with the
+  passphrase the app holds for that stream (`SAPFLOW_SRT_APP_KEYS`) waits
+  only 300 ms of silence instead: that passphrase never crosses the
+  network, and an encoder back on a new network finds its old connection
+  already that quiet, so it is not made to wait the full silence. It still
+  never takes a stage from a publisher that is sending: the key check
+  proves the key material was made with the passphrase, not that the
+  caller knows it, so a replayed handshake the replay guard has forgotten
+  passes it too, and a second encoder with the same address would
+  otherwise take the stage in turn. The deployment's shared
+  `SAPFLOW_SRT_PASSPHRASE` proves no stream's identity and does not
+  count. With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
   the app admits for a stage whose publisher is still sending also settles
   whether the app still admits the live publisher, before its claim. If it
   sent the same user, password and protocol from the same address as the
