@@ -8,6 +8,7 @@
 //
 //   node scripts/obs-ingest.js --bin <sapflow> --out <dir> --protocol srt|rtmp
 //        [--seconds 60] [--obs-keyint 1] [--bitrate 2500] [--restart-at <s>]
+//        [--obs-rtmp-port <port>]
 //        [--base 47400] [--obs /Applications/OBS.app]
 //   node scripts/obs-ingest.js --bin <sapflow> --out <dir> --protocol srt --app-key
 //        [--app-key-wrong] [--seconds 60] [--restart-at <s>] ...
@@ -99,6 +100,9 @@ const port = { hls: base, srt: base + 1, rtmp: base + 2, hook: base + 8, websock
 // Where OBS sends SRT; another port puts a relay in between (for example to
 // record its handshakes). The app-key mode only.
 const obsSrtPort = +opt('obs-srt-port', port.srt);
+// The same for RTMP: a relay there can drop OBS's side of a connection while
+// leaving sapflow's open and silent, as a venue network that goes does.
+const obsRtmpPort = +opt('obs-rtmp-port', port.rtmp);
 const EVENT = 'event-obs';
 const USER = 'obs', PASS = crypto.randomBytes(12).toString('hex');
 const PASSPHRASE = 'obs-' + crypto.randomBytes(12).toString('hex');
@@ -198,7 +202,7 @@ function service() {
     const q = `streamid=publish:live/${EVENT}:${USER}:${PASS}&latency=2000000&passphrase=${PASSPHRASE}&pbkeylen=32`;
     return { server: `srt://127.0.0.1:${port.srt}?${q}`, key: '' };
   }
-  return { server: `rtmp://127.0.0.1:${port.rtmp}/live`, key: `${EVENT}?user=${USER}&pass=${PASS}` };
+  return { server: `rtmp://127.0.0.1:${obsRtmpPort}/live`, key: `${EVENT}?user=${USER}&pass=${PASS}` };
 }
 
 function writeProfile(source) {
