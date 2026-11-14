@@ -357,6 +357,7 @@ async fn the_right_key_publishes_at_either_length_and_is_logged_as_an_app_key() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn required_encryption_refuses_plaintext_before_the_app_is_asked() {
+    let captured = crate::log_capture::Capture::start();
     let stub = stub::start(Answer::Passphrase(&[KEY])).await;
     let mut fixture = fixture(&stub, Duration::ZERO);
     Arc::get_mut(&mut fixture.app)
@@ -367,12 +368,20 @@ async fn required_encryption_refuses_plaintext_before_the_app_is_asked() {
     let plain = Encoder::call(addr, None).await;
     assert_eq!(plain.rejected(), Some(RejectCode::UNSECURE.0));
     assert_eq!(stub.count(), 0);
+    // Refused by the listener before any event, yet still logged.
+    let text = captured.text();
+    assert!(
+        text.contains("publish refused")
+            && text.contains("no key material, and encryption is required"),
+        "{text}"
+    );
     let mut keyed = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
     assert!(keyed.connected, "{:?}", keyed.closed);
     assert_eq!(stub.count(), 1);
     keyed.stop().await;
     server.abort();
     let _ = server.await;
+    drop(captured);
 }
 
 #[tokio::test(flavor = "current_thread")]

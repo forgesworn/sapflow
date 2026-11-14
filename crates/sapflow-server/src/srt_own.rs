@@ -175,6 +175,29 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     run(app, socket, pending, recv_buffer, want).await
 }
 
+/// The app key check's reason for a caller with no key material where
+/// encryption is required; the listener's own refusals are logged the same.
+const NO_KEY_MATERIAL: &str = "no key material, and encryption is required";
+/// The reason for a caller with key material and no passphrase to check it.
+const KEY_MATERIAL_UNCHECKED: &str =
+    "key material, but neither the app nor the server has a passphrase";
+
+/// Why the listener refuses a caller in the handshake for its encryption,
+/// in the words the application's own key check uses. With a passphrase,
+/// app keys or encryption required, that is a caller with no key material;
+/// otherwise the listener is plaintext only and refuses key material.
+fn unsecure_refusal_reason(config: &crate::config::Config) -> &'static str {
+    if config.control.is_some()
+        || config.srt_require_encryption
+        || config.srt_app_keys
+        || config.srt_crypto.is_some()
+    {
+        NO_KEY_MATERIAL
+    } else {
+        KEY_MATERIAL_UNCHECKED
+    }
+}
+
 async fn run(
     app: Arc<App>,
     socket: UdpSocket,
@@ -212,6 +235,10 @@ async fn run(
     let timer = tokio::time::sleep(std::time::Duration::ZERO);
     tokio::pin!(timer);
     let mut armed = None;
+    // The listener turns away a caller whose encryption it cannot take
+    // before any event reaches us; count them in to the refusal log.
+    let unsecure_reason = unsecure_refusal_reason(&app.config);
+    let mut unsecure_seen = 0u64;
     loop {
         let Engine {
             listener,
@@ -252,6 +279,11 @@ async fn run(
         {
             service_due_timers(listener, &pending, &mut buf, Instant::now);
             armed = None;
+        }
+        let unsecure = listener.stats().unsecure;
+        while unsecure_seen < unsecure {
+            unsecure_seen += 1;
+            app.log_refusal("srt", &unsecure_reason);
         }
         while let Some(event) = listener.poll_event() {
             match event {
@@ -744,16 +776,10 @@ fn deployment_check(
             if plaintext {
                 Ok(Encryption::None)
             } else {
-                refuse(
-                    RejectCode::UNSECURE,
-                    "no key material, and encryption is required",
-                )
+                refuse(RejectCode::UNSECURE, NO_KEY_MATERIAL)
             }
         }
-        (Some(true), None) => refuse(
-            RejectCode::UNSECURE,
-            "key material, but neither the app nor the server has a passphrase",
-        ),
+        (Some(true), None) => refuse(RejectCode::UNSECURE, KEY_MATERIAL_UNCHECKED),
         (Some(true), Some(global)) => match listener.check_key(id, global) {
             Ok(size) if size == global.key_size => Ok(Encryption::DeploymentKey(size)),
             Ok(_) => refuse(
@@ -1023,6 +1049,35 @@ mod tests {
             .closed(Some(CloseReason::Shutdown), dropped);
             publication.end();
             fixture.completion(state).await;
+        }
+    }
+
+    #[test]
+    fn handshake_refusals_for_encryption_are_named_as_the_key_check_names_them() {
+        let load = |vals: &[(&str, &str)]| {
+            let vals: Vec<(String, String)> = vals
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            crate::config::Config::load(
+                move |key| vals.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
+                [],
+            )
+            .expect("config")
+        };
+        assert_eq!(
+            unsecure_refusal_reason(&load(&[("SAPFLOW_OPEN_PUBLISH", "1")])),
+            KEY_MATERIAL_UNCHECKED
+        );
+        for encryption in ["required", "optional"] {
+            assert_eq!(
+                unsecure_refusal_reason(&load(&[
+                    ("SAPFLOW_OPEN_PUBLISH", "1"),
+                    ("SAPFLOW_SRT_PASSPHRASE", "transport test secret"),
+                    ("SAPFLOW_SRT_ENCRYPTION", encryption),
+                ])),
+                NO_KEY_MATERIAL
+            );
         }
     }
 

@@ -157,6 +157,19 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- An SRT caller refused in the handshake for its encryption is now logged.
+  Where encryption is required (`SAPFLOW_SRT_ENCRYPTION=required`, a
+  `SAPFLOW_SRT_PASSPHRASE` without `optional`, or scoped control mode),
+  the listener turns away a caller that sends no key material before the
+  app is asked, which is right, but nothing was logged, so an encoder
+  missing its passphrase failed with no trace on the server. It is now
+  logged in the app key check's own words (`publish refused
+  protocol="srt" reason="no key material, and encryption is
+  required"`), rate-limited with the other refusals. A plaintext-only
+  server likewise logs a caller that sends key material ("key material,
+  but neither the app nor the server has a passphrase"). An encoder that
+  gives up at induction, when the listener advertises a key length, never
+  reaches this check and is still not logged.
 - A stop on SIGTERM or ctrl-c, as at every `docker compose up` redeploy or
   Docker restart, told the app nothing: a file open at the stop never had
   its `recordSegmentComplete`, and a stage still live never had its
@@ -495,6 +508,11 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-srt
 
+- `ListenerStats::unsecure` (new) counts callers the listener itself
+  refused in the handshake for their encryption, before any
+  `Event::Connect`: no key material where encryption is required, or key
+  material with no passphrase to check it. They are also counted in
+  `rejected`. A struct literal of `ListenerStats` needs the new field.
 - The receiver splits a NAK that would not fit one datagram. A batch of
   loss ranges (up to 256 a tick; 8 bytes each unless a single number) could
   reach 2,064 bytes with the SRT header, over a 1,500-byte path, so under
