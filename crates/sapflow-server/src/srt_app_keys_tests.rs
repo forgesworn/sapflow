@@ -1352,15 +1352,15 @@ fn guarded(stub: &Stub) -> Fixture {
     fixture
 }
 
-/// [`guarded`] with a proven silence of a few seconds too, so a holder that
-/// sent media just now counts as sending even to a caller with the gig's
-/// passphrase: only revocation lets anyone in.
+/// [`guarded`] with a minute's proven silence too, so the holder counts as
+/// sending even to a caller with the gig's passphrase: only revocation lets
+/// anyone in.
 fn guarded_long(stub: &Stub) -> Fixture {
     let mut fixture = guarded(stub);
     Arc::get_mut(&mut fixture.app).expect("sole App").streams = Arc::new(
         crate::stream::Registry::default()
             .with_takeover_silence(Duration::from_secs(60))
-            .with_proven_silence(Duration::from_secs(5)),
+            .with_proven_silence(Duration::from_secs(60)),
     );
     fixture
 }
@@ -1408,7 +1408,7 @@ async fn a_second_caller_with_the_gigs_passphrase_never_takes_a_sending_stage() 
     // A replayed handshake the replay guard has forgotten, or a second
     // encoder with the gig's address, passes the key check too: while the
     // live publisher sends, it is refused as already live, uncharged, and
-    // the holder keeps its stage. (The proven silence is a few seconds here,
+    // the holder keeps its stage. (The proven silence is a minute here,
     // so the holder counts as sending throughout.)
     let stub = stub::start(Answer::Passphrase(&[KEY])).await;
     let mut fixture = guarded_long(&stub);

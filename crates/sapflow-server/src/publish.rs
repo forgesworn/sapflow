@@ -390,9 +390,19 @@ impl Publication {
             offer_srt_key,
             srt_key.clone(),
         ));
-        // WHIP never takes a stage over, so it has no holder to check.
+        // WHIP never takes a stage over, so it has no holder to check. An
+        // SRT caller the app hands a passphrase to will claim as
+        // `TakeOver::Proven` if its key check passes, so the holder is asked
+        // about only while that claim would be refused: still sending, as an
+        // old encoder after a key rotation is, not quiet, as the same
+        // encoder's old connection is when it comes back from a new network.
         if !matches!(kind, SourceKind::Es) {
-            Self::recheck_holder(app, endpoint, &req.path, &holder).await;
+            let take_over = if srt_key.is_some() {
+                crate::stream::TakeOver::Proven
+            } else {
+                crate::stream::TakeOver::AfterSilence
+            };
+            Self::recheck_holder(app, endpoint, &req.path, take_over, &holder).await;
         }
         Ok(Admitted {
             srt_key,
@@ -627,9 +637,10 @@ impl Publication {
         app: &Arc<App>,
         endpoint: &crate::http_lite::Endpoint,
         path: &sapflow_core::StreamPath,
+        take_over: crate::stream::TakeOver,
         newcomer: &crate::publish_auth::Recheck,
     ) {
-        let Some((stream, generation, holder)) = app.streams.sending_holder(path) else {
+        let Some((stream, generation, holder)) = app.streams.sending_holder(path, take_over) else {
             return;
         };
         let admitted = if holder.same_request(newcomer) {
@@ -1488,6 +1499,52 @@ mod publication_capacity_tests {
         // The new owner is not revoked: a takeover waits for it again.
         assert!(fixture.app.streams.takeover_waits(&keyed(NEW).path));
         new.end();
+        holder.end();
+    }
+
+    #[tokio::test]
+    async fn a_proven_caller_from_a_new_address_asks_about_the_holder_only_while_it_sends() {
+        use crate::publish_auth::stub::Answer;
+        const PASSPHRASE: &str = "pw_srt_00112233445566778899aabbccddeeff";
+        let (fixture, stub) = guarded_app(Answer::Passphrase(&[PASSPHRASE])).await;
+        let req = PublishRequest::parse_srt_stream_id("publish:live/event-a:encoder:pw_live_gig")
+            .expect("request");
+        let here = "127.0.0.1".parse().expect("loopback");
+        let there = "127.0.0.2".parse().expect("loopback");
+        // As the SRT loop does once the caller's key check has passed.
+        let proven = |mut admitted: Admitted| {
+            assert!(admitted.take_srt_key().is_some(), "the app's passphrase");
+            admitted.proved_stream_key();
+            admitted
+        };
+        let admit = |from| Publication::admit_srt_key(&fixture.app, &req, from);
+        let holder = Publication::claim_admitted(
+            &fixture.app,
+            &req,
+            SourceKind::Ts,
+            proven(admit(here).await.expect("admitted")),
+        )
+        .expect("holder");
+        let stream = fixture.app.streams.get("event-a").expect("stage");
+        // Still sending: a caller from another address makes the app be asked
+        // about the holder, which it still admits, so the caller waits.
+        let admitted = admit(there).await.expect("admitted");
+        assert_eq!(stub.count(), 3, "the holder was asked about");
+        assert!(matches!(
+            Publication::claim_admitted(&fixture.app, &req, SourceKind::Ts, proven(admitted)),
+            Err(Refusal::AlreadyLive)
+        ));
+        // The network gone, the old connection is quiet: the same encoder
+        // back from a new address is not held up by a request about it.
+        stream
+            .session()
+            .backdate_input(crate::stream::PROVEN_TAKEOVER_SILENCE + Duration::from_millis(200));
+        let admitted = admit(there).await.expect("admitted");
+        assert_eq!(stub.count(), 4, "no request about the holder");
+        let back =
+            Publication::claim_admitted(&fixture.app, &req, SourceKind::Ts, proven(admitted))
+                .expect("taken over");
+        back.end();
         holder.end();
     }
 

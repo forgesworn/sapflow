@@ -1005,7 +1005,11 @@ pub enum TakeOver {
 /// [`Registry::with_proven_silence`]'s default: shorter than any real
 /// reconnect (the old connection falls silent when the network goes, and
 /// an encoder notices and retries after that, our Android app after a
-/// further 0.5 s), longer than the gaps between a sending encoder's packets.
+/// further 0.5 s), and longer than the gaps between a sending encoder's data
+/// at video bitrates. Only data moves a publisher's clock, so a very
+/// low-bitrate audio-only stream (about 32 kbit/s, a payload every 330 ms)
+/// or a stalled uplink can leave a gap this long, in which another caller
+/// with the stream's passphrase (a backup encoder, a replay) may take over.
 pub const PROVEN_TAKEOVER_SILENCE: Duration = Duration::from_millis(300);
 
 impl From<bool> for TakeOver {
@@ -1394,20 +1398,22 @@ impl Registry {
             .is_some_and(|stream| stream.session().keeps_stage(silence))
     }
 
-    /// The admission of `path`'s live publisher while a takeover would be
-    /// refused for it ([`Registry::takeover_waits`]), to ask the app whether
-    /// it still admits it: `None` when the stage would be taken over anyway,
-    /// or no app admitted its publisher. Read only.
+    /// The admission of `path`'s live publisher while a takeover of this
+    /// kind would be refused for it ([`Registry::takeover_waits_for`]), to ask
+    /// the app whether it still admits it: `None` when the stage would be
+    /// taken over anyway, or no app admitted its publisher. Read only.
     pub(crate) fn sending_holder(
         &self,
         path: &StreamPath,
+        take_over: TakeOver,
     ) -> Option<(Arc<LiveStream>, u64, Arc<crate::publish_auth::Recheck>)> {
+        let silence = self.silence_for(take_over)?;
         let map = self.map();
         let stream = map.get(path.event_id())?.clone();
         drop(map);
         let (generation, holder) = {
             let session = stream.session();
-            if !session.keeps_stage(self.takeover_silence) {
+            if !session.keeps_stage(silence) {
                 return None;
             }
             (session.generation, session.holder.clone()?)
@@ -1803,7 +1809,7 @@ mod tests {
         first.session().note_input();
         assert!(reg.takeover_waits(&p));
         assert!(
-            reg.sending_holder(&p).is_none(),
+            reg.sending_holder(&p, TakeOver::AfterSilence).is_none(),
             "no app admitted it, so there is nothing to ask"
         );
         assert!(!reg.revoke(&first, g1 + 1), "not the holder's generation");
