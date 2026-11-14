@@ -175,6 +175,13 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     run(app, socket, pending, recv_buffer, want).await
 }
 
+/// The app key check's reason for a caller with no key material where
+/// encryption is required; the listener's own refusals are logged the same.
+const NO_KEY_MATERIAL: &str = "no key material, and encryption is required";
+/// The reason for a caller with key material and no passphrase to check it.
+const KEY_MATERIAL_UNCHECKED: &str =
+    "key material, but neither the app nor the server has a passphrase";
+
 /// Why the listener refuses a caller in the handshake for its encryption,
 /// in the words the application's own key check uses. With a passphrase,
 /// app keys or encryption required, that is a caller with no key material;
@@ -185,9 +192,9 @@ fn unsecure_refusal_reason(config: &crate::config::Config) -> &'static str {
         || config.srt_app_keys
         || config.srt_crypto.is_some()
     {
-        "no key material, and encryption is required"
+        NO_KEY_MATERIAL
     } else {
-        "key material, but neither the app nor the server has a passphrase"
+        KEY_MATERIAL_UNCHECKED
     }
 }
 
@@ -769,16 +776,10 @@ fn deployment_check(
             if plaintext {
                 Ok(Encryption::None)
             } else {
-                refuse(
-                    RejectCode::UNSECURE,
-                    "no key material, and encryption is required",
-                )
+                refuse(RejectCode::UNSECURE, NO_KEY_MATERIAL)
             }
         }
-        (Some(true), None) => refuse(
-            RejectCode::UNSECURE,
-            "key material, but neither the app nor the server has a passphrase",
-        ),
+        (Some(true), None) => refuse(RejectCode::UNSECURE, KEY_MATERIAL_UNCHECKED),
         (Some(true), Some(global)) => match listener.check_key(id, global) {
             Ok(size) if size == global.key_size => Ok(Encryption::DeploymentKey(size)),
             Ok(_) => refuse(
@@ -1066,7 +1067,7 @@ mod tests {
         };
         assert_eq!(
             unsecure_refusal_reason(&load(&[("SAPFLOW_OPEN_PUBLISH", "1")])),
-            "key material, but neither the app nor the server has a passphrase"
+            KEY_MATERIAL_UNCHECKED
         );
         for encryption in ["required", "optional"] {
             assert_eq!(
@@ -1075,7 +1076,7 @@ mod tests {
                     ("SAPFLOW_SRT_PASSPHRASE", "transport test secret"),
                     ("SAPFLOW_SRT_ENCRYPTION", encryption),
                 ])),
-                "no key material, and encryption is required"
+                NO_KEY_MATERIAL
             );
         }
     }
