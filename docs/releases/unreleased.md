@@ -173,7 +173,7 @@ Notes for the release after 0.2.0-rc.1.
   later. With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher the app
   admits while the live one still sends also settles, before its claim,
   whether the app still admits the live publisher: from the app's answer
-  to it when it sent the same credentials, otherwise by sending the live
+  to it when it sent the same credentials from the same address, otherwise by sending the live
   publisher's request again (waiting up to 1 s). If the app now answers
   401 or 403 for it, or hands out an SRT passphrase other than the one it
   gave it, the live publisher is revoked and the new one takes the stage

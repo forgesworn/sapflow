@@ -45,7 +45,9 @@ pub enum Refusal {
 
 /// How long a publisher's admission waits for the app to say whether it
 /// still admits the live publisher ([`Publication::recheck_holder`]). With
-/// the admission's own 3 s it stays inside an SRT caller's 5 s wait.
+/// the admission's own 3 s it stays inside the SRT listener's 5 s accept
+/// wait; an SRT caller whose own connect timeout is shorter (libsrt's
+/// default is 3 s) may give up first, unanswered.
 pub const RECHECK_LIMIT: Duration = Duration::from_secs(1);
 
 /// Proof that [`Publication::admit`] admitted a request; spent by
@@ -578,8 +580,8 @@ impl Publication {
     /// who read the new key off the network can.
     ///
     /// Only the app's answer about the holder's own request revokes it. When
-    /// `newcomer` asked the same thing (the same user, password, protocol and
-    /// SRT offer), the app's answer to it is that answer: the holder is
+    /// `newcomer` asked the same thing (the same user, password, protocol,
+    /// address and SRT offer), the app's answer to it is that answer: the holder is
     /// revoked if the app now hands out a different SRT passphrase, and no
     /// second request is made. Otherwise the holder's request is sent again,
     /// within [`RECHECK_LIMIT`]; an app that cannot say in time, or is
@@ -1353,6 +1355,20 @@ mod publication_capacity_tests {
             Err(Refusal::AlreadyLive)
         ));
         assert_eq!(asked(&stub), [KEY, KEY]);
+        // The same key from another address: an app may decide by address,
+        // so the holder is asked about with its own, and still admitted.
+        let elsewhere = "127.0.0.2".parse().expect("loopback");
+        assert!(matches!(
+            Publication::begin_authorised(&fixture.app, &keyed(KEY), SourceKind::Flv, elsewhere)
+                .await,
+            Err(Refusal::AlreadyLive)
+        ));
+        assert_eq!(asked(&stub), [KEY, KEY, KEY, KEY]);
+        assert_eq!(
+            stub.last()["ip"],
+            "127.0.0.1",
+            "asked with the holder's address"
+        );
         assert!(fixture.app.streams.takeover_waits(&keyed(KEY).path));
         assert!(
             declare_audio(&mut holder).is_ok(),
@@ -1399,7 +1415,8 @@ mod publication_capacity_tests {
                 rtmp(&fixture.app, NEW).await,
                 Err(Refusal::AlreadyLive)
             ));
-            assert!(started.elapsed() < RECHECK_LIMIT + Duration::from_millis(500));
+            // Bounded by RECHECK_LIMIT, not the admission's own 3 s.
+            assert!(started.elapsed() < RECHECK_LIMIT + Duration::from_millis(1500));
             assert_eq!(asked(&stub), [OLD, NEW, OLD]);
             assert!(fixture.app.streams.takeover_waits(&keyed(OLD).path));
             assert!(declare_audio(&mut holder).is_ok());

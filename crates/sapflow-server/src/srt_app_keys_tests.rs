@@ -1418,18 +1418,26 @@ async fn the_gigs_stream_key_with_a_wrong_passphrase_never_removes_the_holder() 
 async fn rotating_the_passphrase_lets_the_new_key_take_over_a_sending_holder() {
     // The organiser makes a new stream URL: the app hands out a new
     // passphrase (`WRONG` here), for the same stream key or with a new one.
-    for (stream_id, requests) in [
+    const ROTATED: &str = "publish:live/event-a:encoder:pw_live_rotated";
+    for (stream_id, rotated, requests) in [
         // The same request as the holder's: the app's answer to it shows
         // the holder's passphrase is stale, with no second request.
-        (STREAM_ID, 1),
-        // A new stream key: the holder's own request is sent again.
-        ("publish:live/event-a:encoder:pw_live_rotated", 2),
+        (STREAM_ID, Answer::Passphrase(&[WRONG]), 1),
+        // A new stream key: the holder's own request is sent again, and the
+        // app hands it the new passphrase...
+        (ROTATED, Answer::Passphrase(&[WRONG]), 2),
+        // ...or refuses its old stream key outright.
+        (
+            ROTATED,
+            Answer::PassphraseFor("pw_live_rotated", &[WRONG]),
+            2,
+        ),
     ] {
         let stub = stub::start(Answer::Passphrase(&[KEY])).await;
         let mut fixture = guarded(&stub);
         let (addr, server) = origin(&fixture.app);
         let mut holder = sending_holder(&mut fixture, addr).await;
-        stub.answer(Answer::Passphrase(&[WRONG]));
+        stub.answer(rotated);
         let asked = stub.count();
         // The encoder's first connection with the new key takes the stage
         // while the holder is still sending.

@@ -139,13 +139,14 @@ impl Recheck {
         }
     }
 
-    /// Whether `other` asked the app the same thing: the same user, password
-    /// and protocol, and the same offer of an SRT passphrase. The app's
-    /// answer to one is then its answer to the other; only the address
-    /// differs.
+    /// Whether `other` asked the app the same thing: the same user, password,
+    /// protocol and address, and the same offer of an SRT passphrase. The
+    /// app's answer to one is then its answer to the other, even for an app
+    /// that decides by address.
     pub(crate) fn same_request(&self, other: &Self) -> bool {
         self.protocol == other.protocol
             && self.offered == other.offered
+            && self.from == other.from
             && self.req.user == other.req.user
             && self.req.pass == other.req.pass
     }
@@ -349,6 +350,9 @@ pub(crate) mod stub {
         Password(&'static str),
         /// 200 when the request's password is one of these, else `Else`.
         Passwords(&'static [&'static str], Else),
+        /// As `Passphrase` when the request's password is the first value,
+        /// else 401: a gig whose stream key and passphrase are these.
+        PassphraseFor(&'static str, &'static [&'static str]),
     }
 
     /// What [`Answer::Passwords`] does with any other password.
@@ -455,7 +459,16 @@ pub(crate) mod stub {
                             );
                             let _ = socket.write_all(reply.as_bytes()).await;
                         }
-                        Answer::Passphrase(values) | Answer::SlowPassphrase(_, values) => {
+                        Answer::PassphraseFor(expected, _)
+                            if password.as_deref() != Some(expected) =>
+                        {
+                            let reply =
+                                "HTTP/1.1 401 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                            let _ = socket.write_all(reply.as_bytes()).await;
+                        }
+                        Answer::Passphrase(values)
+                        | Answer::SlowPassphrase(_, values)
+                        | Answer::PassphraseFor(_, values) => {
                             if let Answer::SlowPassphrase(ms, _) = answer {
                                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                             }

@@ -199,8 +199,8 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   latency later). With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
   the app admits for a stage whose publisher is still sending also settles
   whether the app still admits the live publisher, before its claim. If it
-  sent the same user, password and protocol as the live publisher, the
-  app's answer to it is the answer; otherwise the live publisher's own
+  sent the same user, password and protocol from the same address as the
+  live publisher, the app's answer to it is the answer; otherwise the live publisher's own
   request is sent again, and sapflow waits up to 1 s for the reply. If the
   app now refuses the live publisher's credentials (401 or 403), or hands
   out an SRT passphrase other than the one it gave it (a new one, one where
