@@ -210,13 +210,12 @@ pub struct Session {
     /// takeover waits until this is [`Registry::with_takeover_silence`] old.
     last_input: Instant,
     /// What the app admitted the attached publisher with, to ask it again
-    /// ([`Registry::recheck_due`]); `None` when no app admitted it.
+    /// ([`Registry::sending_holder`]); `None` when no app admitted it.
     holder: Option<Arc<crate::publish_auth::Recheck>>,
     /// The app no longer admits the attached publisher's credentials: the
-    /// next claim may take over at once ([`Registry::revoke`]).
+    /// next claim may take over at once ([`Registry::revoke`]). Cleared only
+    /// when another publisher attaches.
     revoked: bool,
-    /// When the app was last asked about the attached publisher.
-    rechecked: Option<Instant>,
     /// Credit belongs to this exact attached RTMP generation, not its TCP task.
     publication_permit: Option<PublicationPermit>,
     /// All completed parts below this floor belong to the previous connection.
@@ -432,7 +431,6 @@ impl LiveStream {
                 last_input: Instant::now(),
                 holder: None,
                 revoked: false,
-                rechecked: None,
                 publication_permit,
                 fresh_part_floor: 0,
                 recorder: None,
@@ -988,8 +986,7 @@ pub enum Retirement {
 pub enum ClaimError {
     AlreadyLive,
     /// A takeover refused because the live publisher is still sending
-    /// ([`Registry::with_takeover_silence`]). Refused as already live; the
-    /// caller may ask the app about the holder ([`Registry::recheck_due`]).
+    /// ([`Registry::with_takeover_silence`]). Refused as already live.
     Sending,
     PublisherLimit,
     PresentationLimit,
@@ -1274,7 +1271,6 @@ impl Registry {
                 session.last_input = Instant::now();
                 session.holder = None;
                 session.revoked = false;
-                session.rechecked = None;
                 session.publication_permit = publication_permit;
                 let mut st = stream.lock();
                 let muxer = st.ingest.take_muxer();
@@ -1327,28 +1323,23 @@ impl Registry {
             .is_some_and(|stream| stream.session().keeps_stage(self.takeover_silence))
     }
 
-    /// The live publisher's admission, to ask the app again whether it still
-    /// admits it: `None` when nobody is attached, no app admitted it, it is
-    /// already revoked, or it was asked about within `every`. Marks it asked.
-    pub(crate) fn recheck_due(
+    /// The admission of `path`'s live publisher while a takeover would be
+    /// refused for it ([`Registry::takeover_waits`]), to ask the app whether
+    /// it still admits it: `None` when the stage would be taken over anyway,
+    /// or no app admitted its publisher. Read only.
+    pub(crate) fn sending_holder(
         &self,
         path: &StreamPath,
-        every: Duration,
     ) -> Option<(Arc<LiveStream>, u64, Arc<crate::publish_auth::Recheck>)> {
         let map = self.map();
         let stream = map.get(path.event_id())?.clone();
         drop(map);
         let (generation, holder) = {
-            let mut session = stream.session();
-            if !session.attached || session.revoked {
+            let session = stream.session();
+            if !session.keeps_stage(self.takeover_silence) {
                 return None;
             }
-            let holder = session.holder.clone()?;
-            if session.rechecked.is_some_and(|at| at.elapsed() < every) {
-                return None;
-            }
-            session.rechecked = Some(Instant::now());
-            (session.generation, holder)
+            (session.generation, session.holder.clone()?)
         };
         Some((stream, generation, holder))
     }
@@ -1693,7 +1684,7 @@ mod tests {
         first.session().note_input();
         assert!(reg.takeover_waits(&p));
         assert!(
-            reg.recheck_due(&p, Duration::from_secs(5)).is_none(),
+            reg.sending_holder(&p).is_none(),
             "no app admitted it, so there is nothing to ask"
         );
         assert!(!reg.revoke(&first, g1 + 1), "not the holder's generation");
@@ -1842,7 +1833,6 @@ mod grace_tests {
             last_input: Instant::now(),
             holder: None,
             revoked: false,
-            rechecked: None,
             publication_permit: None,
             fresh_part_floor: 0,
             recorder: None,

@@ -94,15 +94,19 @@ pub(crate) fn classify(outcome: Result<u16, Failure>) -> Verdict {
 }
 
 /// What the app admitted a live publisher with, kept so the app can be asked
-/// again whether it still would. A newer publisher refused by the takeover
-/// guard (`Registry::with_takeover_silence`) asks for it: if the app now
-/// refuses these credentials, the holder may be taken over at once, so
+/// again whether it still would. A newer publisher the takeover guard would
+/// refuse (`Registry::with_takeover_silence`) has it checked during its own
+/// admission ([`crate::publish::Publication::admit`]): if the app no longer
+/// admits these credentials, the holder may be taken over at once, so
 /// rotating a stream key removes whoever holds the old one. Holds the
 /// publisher's credentials; its `Debug` names the path and protocol only.
 pub(crate) struct Recheck {
     req: PublishRequest,
     protocol: Protocol,
     from: IpAddr,
+    /// Whether the admission offered to check an SRT passphrase
+    /// ([`SRT_KEY_FIELD`]).
+    offered: bool,
     /// The SRT passphrase the app returned for this publisher, if it did.
     srt_key: Option<CryptoConfig>,
 }
@@ -112,6 +116,7 @@ impl std::fmt::Debug for Recheck {
         f.debug_struct("Recheck")
             .field("path", &self.req.path.as_path())
             .field("protocol", &self.protocol)
+            .field("offered", &self.offered)
             .field("srt_key", &self.srt_key.is_some())
             .finish_non_exhaustive()
     }
@@ -122,33 +127,67 @@ impl Recheck {
         req: &PublishRequest,
         protocol: Protocol,
         from: IpAddr,
+        offered: bool,
         srt_key: Option<CryptoConfig>,
     ) -> Self {
         Self {
             req: req.clone(),
             protocol,
             from,
+            offered,
             srt_key,
         }
     }
 
-    /// Asks the app again, once: `Some(false)` when it now refuses these
-    /// credentials (401 or 403), or answers with a different SRT passphrase
-    /// or none; `Some(true)` when it still admits them; `None` when it could
-    /// not say (down, slow, throttling), which changes nothing.
-    pub(crate) async fn still_admitted(&self, endpoint: &Endpoint) -> Option<bool> {
-        let (verdict, key) = match (&self.srt_key, self.protocol) {
-            (Some(_), _) => ask_srt_key(endpoint, &self.req, self.from).await,
-            (None, protocol) => (ask(endpoint, &self.req, protocol, self.from).await, None),
+    /// Whether `other` asked the app the same thing: the same user, password
+    /// and protocol, and the same offer of an SRT passphrase. The app's
+    /// answer to one is then its answer to the other; only the address
+    /// differs.
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.offered == other.offered
+            && self.req.user == other.req.user
+            && self.req.pass == other.req.pass
+    }
+
+    /// Whether the app handed `other` what it handed this one: the same SRT
+    /// passphrase, or none to either.
+    pub(crate) fn same_key(&self, other: &Self) -> bool {
+        same_srt_key(&self.srt_key, &other.srt_key)
+    }
+
+    /// Asks the app again, once, within `limit`: `Some(false)` when it now
+    /// refuses these credentials (401 or 403), or answers 2xx with an SRT
+    /// passphrase other than the one it gave before (a different one, or one
+    /// where there was none, or none where there was one); `Some(true)` when
+    /// it still admits them as before; `None` when it could not say (down,
+    /// slow, throttling), which changes nothing.
+    pub(crate) async fn still_admitted(
+        &self,
+        endpoint: &Endpoint,
+        limit: Duration,
+    ) -> Option<bool> {
+        let (verdict, srt_key) = if self.offered {
+            ask_srt_key_within(endpoint, &self.req, self.from, limit).await
+        } else {
+            (
+                ask_within(endpoint, &self.req, self.protocol, self.from, limit).await,
+                None,
+            )
         };
         match verdict {
-            Verdict::Admitted => Some(match &self.srt_key {
-                Some(held) => key.is_some_and(|now| now.same_passphrase(held)),
-                None => true,
-            }),
+            Verdict::Admitted => Some(same_srt_key(&self.srt_key, &srt_key)),
             Verdict::Denied | Verdict::Forbidden => Some(false),
             Verdict::Throttled | Verdict::Unavailable => None,
         }
+    }
+}
+
+fn same_srt_key(held: &Option<CryptoConfig>, now: &Option<CryptoConfig>) -> bool {
+    match (held, now) {
+        (None, None) => true,
+        (Some(held), Some(now)) => held.same_passphrase(now),
+        _ => false,
     }
 }
 
@@ -308,6 +347,15 @@ pub(crate) mod stub {
         /// 200 when the request's password is this one, else 401: a gig
         /// whose stream key is this.
         Password(&'static str),
+        /// 200 when the request's password is one of these, else `Else`.
+        Passwords(&'static [&'static str], Else),
+    }
+
+    /// What [`Answer::Passwords`] does with any other password.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Else {
+        Status(u16),
+        Silent,
     }
 
     pub(crate) struct Stub {
@@ -421,11 +469,24 @@ pub(crate) mod stub {
                         Answer::Silent => {
                             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                         }
-                        Answer::Password(expected) => {
-                            let status = if password.as_deref() == Some(expected) {
-                                200
-                            } else {
-                                401
+                        Answer::Password(_) | Answer::Passwords(..) => {
+                            let given = password.as_deref();
+                            let (known, otherwise) = match answer {
+                                Answer::Passwords(admitted, otherwise) => {
+                                    (given.is_some_and(|p| admitted.contains(&p)), otherwise)
+                                }
+                                Answer::Password(expected) => {
+                                    (given == Some(expected), Else::Status(401))
+                                }
+                                _ => unreachable!(),
+                            };
+                            let status = match (known, otherwise) {
+                                (true, _) => 200,
+                                (false, Else::Status(status)) => status,
+                                (false, Else::Silent) => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                                    return;
+                                }
                             };
                             let reply = format!(
                                 "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"

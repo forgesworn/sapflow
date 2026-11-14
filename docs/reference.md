@@ -196,15 +196,27 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   its credentials (a plain RTMP stream key, say, read off a shared
   network). For SRT, silence is counted from when the old connection's
   packets last arrived, not from when their media is delivered (up to the
-  latency later). With `SAPFLOW_PUBLISH_AUTH_URL`, a refused publisher also
-  makes sapflow ask the app again, at most every 5 s per stream, whether it
-  still admits the live publisher's credentials; if the app now refuses
-  them (401 or 403), or hands out a different SRT passphrase, the next
-  publisher takes over at once. So rotating a gig's stream key removes
-  whoever holds the old one, while it is sending. Without an app there is
-  nobody to ask: a publisher holding the credentials keeps a stage it won
-  in a gap until it stops. Scoped publish sessions keep one owner and
-  refuse a second (`409`).
+  latency later). With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
+  the app admits for a stage whose publisher is still sending also settles
+  whether the app still admits the live publisher, before its claim. If it
+  sent the same user, password and protocol as the live publisher, the
+  app's answer to it is the answer; otherwise the live publisher's own
+  request is sent again, and sapflow waits up to 1 s for the reply. If the
+  app now refuses the live publisher's credentials (401 or 403), or hands
+  out an SRT passphrase other than the one it gave it (a new one, one where
+  there was none, or none where there was one), the live publisher is
+  revoked and this publisher takes the stage at once, on its first try. So
+  rotating a gig's stream key (v4v's new stream URL) hands the stage to the
+  encoder with the new key, even while the old one is still sending, before
+  anyone who reads the new key off the network can. Only the app's answer
+  about the live publisher revokes it: a different key the app also admits
+  (a backup encoder's) is refused as already live, and an app that is
+  down, throttling or slower than 1 s changes nothing, so the new key is
+  refused and its encoder's retry asks again. A WHIP publisher never takes
+  a stage over, so it asks nothing: recovering a stage needs an SRT or RTMP
+  encoder. Without an app there is nobody to ask: a publisher holding the
+  credentials keeps a stage it won in a gap until it stops. Scoped publish
+  sessions keep one owner and refuse a second (`409`).
 
 What players should do at a break (Safari on macOS seen to carry on
 through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by

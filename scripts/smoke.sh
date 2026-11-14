@@ -218,8 +218,8 @@ rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 && fail "RTMP took ov
 grep -q 'publish refused protocol="rtmp" reason=AlreadyLive' "$WORK/sapflow.log" \
   || fail "no already-live refusal for a publisher still sending"
 kill -STOP "$first"; sleep 1.5
-rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 || { kill -CONT "$first"; fail "RTMP takeover refused after the silence"; }
-kill -CONT "$first"
+rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 || { kill -CONT "$first" 2> /dev/null; fail "RTMP takeover refused after the silence"; }
+kill -CONT "$first" 2> /dev/null || true
 grep -q 'publisher replaced by a new connection path=live/event-norec' "$WORK/sapflow.log" \
   || fail "second RTMP connection did not take the stream over"
 for _ in $(seq 1 40); do grep -q '"unpublish","path":"live/event-norec"' "$WORK/cb.log" && break; sleep 0.5; done
@@ -270,12 +270,19 @@ publish "publish:live/event-take:pub:secret" 2 18906 > /dev/null 2>&1 || true
 grep -q 'publish refused protocol="srt" reason=AlreadyLive' "$WORK/sapflow.log" \
   || fail "no already-live refusal for an SRT publisher still sending"
 # Silence the first sender (srt-live-transmit, the publisher's child), as a
-# network change would: no packets at all, not even keepalives.
-pkill -STOP -P "$first" -x srt-live-transmit; sleep 1.5
+# network change would: no packets at all, not even keepalives. Found by its
+# command line: Linux matches process names on their first 15 characters.
+sender=$(pgrep -P "$first" -f srt-live-transmit || true)
+[ -n "$sender" ] || fail "no SRT sender to pause"
+kill -STOP $sender; sleep 1.5
 publish "publish:live/event-take:pub:secret" 3 18906 > /dev/null 2>&1 || true
-pkill -CONT -P "$first" -x srt-live-transmit
+# The publisher may already have killed its paused sender.
+kill -CONT $sender 2> /dev/null || true
 grep -q 'path=live/event-take.*publisher replaced by a new connection\|publisher replaced by a new connection path=live/event-take' "$WORK/sapflow.log" \
   || fail "second connection did not take the stream over"
+for _ in $(seq 1 40); do
+  grep -q 'replaced publisher closed path=live/event-take' "$WORK/sapflow.log" && break; sleep 0.25
+done
 grep -q 'replaced publisher closed path=live/event-take' "$WORK/sapflow.log" \
   || fail "the replaced connection was not closed"
 echo "ok   the same publisher reconnecting takes its stream over"

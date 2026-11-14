@@ -170,11 +170,17 @@ Notes for the release after 0.2.0-rc.1.
   stage (its publisher gone) resumes at once as before. For SRT the silence
   counts from when the old connection's packets last arrived
   (`Listener::last_received`), not from their delivery up to the latency
-  later. With `SAPFLOW_PUBLISH_AUTH_URL`, a refused publisher also makes
-  sapflow ask the app again (at most every 5 s per stream) whether it still
-  admits the live publisher's credentials; if the app now answers 401 or
-  403, or hands out a different SRT passphrase, the next publisher takes
-  over at once, so rotating a stream key removes whoever holds the old one.
+  later. With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher the app
+  admits while the live one still sends also settles, before its claim,
+  whether the app still admits the live publisher: from the app's answer
+  to it when it sent the same credentials, otherwise by sending the live
+  publisher's request again (waiting up to 1 s). If the app now answers
+  401 or 403 for it, or hands out an SRT passphrase other than the one it
+  gave it, the live publisher is revoked and the new one takes the stage
+  on its first try, so rotating a stream key hands the stage to the
+  encoder with the new key before anyone who reads it off the network can.
+  A different key the app also admits, or an app that cannot answer in
+  time, changes nothing. WHIP never takes over, so it asks nothing.
   Under SRT app keys, a takeover the guard would refuse is refused before
   the replay guard remembers the caller's key material, so a refused
   reconnect spends no admitted entry and a resend after a lost refusal is
@@ -538,7 +544,8 @@ Notes for the release after 0.2.0-rc.1.
   latency later, so this is when the peer was last heard. Backed by
   `Receiver::last_received` (new).
 - `CryptoConfig::same_passphrase` (new): whether two configurations hold
-  the same passphrase, compared in constant time for its length.
+  the same passphrase. Not constant time: it compares passphrases the
+  caller already holds.
 - `ListenerStats::unsecure` (new) counts callers the listener itself
   refused in the handshake for their encryption, before any
   `Event::Connect`: no key material where encryption is required, or key

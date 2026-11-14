@@ -696,9 +696,9 @@ fn check_pending(
     // A takeover the guard would refuse: refused now, before its key
     // material is remembered, so a reconnect refused while the live
     // publisher still sends spends no admitted entry, and its resend after
-    // a lost refusal is not taken for a replay. The claim checks again.
+    // a lost refusal is not taken for a replay. The admission has already
+    // asked the app about the holder; the claim checks again.
     if app.streams.takeover_waits(&req.path) {
-        Publication::recheck_holder(app, &req.path);
         listener.reject(id, reject_code(Refused::Policy(Refusal::AlreadyLive)));
         app.log_refusal("srt", &Refusal::AlreadyLive);
         return None;

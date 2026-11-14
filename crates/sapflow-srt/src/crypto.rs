@@ -89,11 +89,11 @@ impl CryptoConfig {
             preannounce_packets: 4000,
         })
     }
-    /// Whether `other` holds the same passphrase, compared in constant time
-    /// for its length. Key length and refresh settings are not compared.
+    /// Whether `other` holds the same passphrase. Key length and refresh
+    /// settings are not compared. Not constant time: it is meant for two
+    /// passphrases the caller already holds, not for checking a guess.
     pub fn same_passphrase(&self, other: &Self) -> bool {
-        let (a, b) = (self.secret.as_slice(), other.secret.as_slice());
-        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        self.secret.as_slice() == other.secret.as_slice()
     }
 
     pub(crate) fn valid(&self) -> bool {
