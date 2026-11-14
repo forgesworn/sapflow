@@ -197,16 +197,19 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   network). For SRT, silence is counted from when the old connection's
   packets last arrived, not from when their media is delivered (up to the
   latency later). An SRT caller whose key material unwraps with the
-  passphrase the app holds for that stream (`SAPFLOW_SRT_APP_KEYS`) takes
-  over at once, even from a publisher still sending: only that stream's
-  encoder holds the passphrase, which never crosses the network, so the
-  wait would protect nothing and only lengthen its reconnect after a
-  network change. The deployment's shared `SAPFLOW_SRT_PASSPHRASE` proves
-  no stream's identity and does not count. With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
+  passphrase the app holds for that stream (`SAPFLOW_SRT_APP_KEYS`) waits
+  only 300 ms of silence instead: that passphrase never crosses the
+  network, and an encoder back on a new network finds its old connection
+  already that quiet, so it is not made to wait the full silence. It still
+  never takes a stage from a publisher that is sending: the key check
+  proves the key material was made with the passphrase, not that the
+  caller knows it, so a replayed handshake the replay guard has forgotten
+  passes it too, and a second encoder with the same address would
+  otherwise take the stage in turn. The deployment's shared
+  `SAPFLOW_SRT_PASSPHRASE` proves no stream's identity and does not
+  count. With `SAPFLOW_PUBLISH_AUTH_URL`, an SRT or RTMP publisher
   the app admits for a stage whose publisher is still sending also settles
-  whether the app still admits the live publisher, before its claim (an
-  SRT caller the app hands a passphrase to is decided by its own key check
-  instead). If it
+  whether the app still admits the live publisher, before its claim. If it
   sent the same user, password and protocol from the same address as the
   live publisher, the app's answer to it is the answer; otherwise the live publisher's own
   request is sent again, and sapflow waits up to 1 s for the reply. If the

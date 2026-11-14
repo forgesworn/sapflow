@@ -51,9 +51,8 @@ pub enum Refusal {
 pub const RECHECK_LIMIT: Duration = Duration::from_secs(1);
 
 /// Proof that [`Publication::admit`] admitted a request; spent by
-/// [`Publication::claim_admitted`]. The default admits nothing of its own:
-/// what a scoped session's claim carries.
-#[derive(Debug, Default)]
+/// [`Publication::claim_admitted`].
+#[derive(Debug)]
 pub struct Admitted {
     /// The SRT passphrase the app holds for this stream, from
     /// [`Publication::admit_srt_key`]. Its `Debug` is redacted.
@@ -61,9 +60,8 @@ pub struct Admitted {
     /// What the app admitted this publisher with, kept with its stream so
     /// the app can be asked again later; `None` when no app admitted it.
     holder: Option<Arc<crate::publish_auth::Recheck>>,
-    /// The caller proved it holds the stream's own secret: its SRT key
-    /// material unwrapped with the passphrase the app holds for this stream
-    /// ([`Admitted::proved_stream_key`]).
+    /// The caller's SRT key material unwrapped with the passphrase the app
+    /// holds for this stream ([`Admitted::proved_stream_key`]).
     holds_stream_key: bool,
 }
 
@@ -75,12 +73,22 @@ impl Admitted {
         self.srt_key.take()
     }
 
+    /// What a scoped session's claim carries: its session admitted it, and
+    /// it never takes a stream over.
+    fn scoped() -> Self {
+        Self {
+            srt_key: None,
+            holder: None,
+            holds_stream_key: false,
+        }
+    }
+
     /// The caller's key material passed the check against the passphrase the
-    /// app returned for this stream ([`Admitted::take_srt_key`]). Only that
-    /// stream's own encoder holds it, since it never crosses the network, so
-    /// the claim takes the stream over at once, even from a publisher still
-    /// sending: an encoder back on a new network is not made to wait for the
-    /// takeover silence.
+    /// app returned for this stream ([`Admitted::take_srt_key`]), which never
+    /// crosses the network. Its claim waits only for the short
+    /// [`crate::stream::TakeOver::Proven`] silence, so the stream's encoder,
+    /// back on a new network, is not made to wait for the full takeover
+    /// silence; a publisher still sending keeps its stage even from it.
     pub fn proved_stream_key(&mut self) {
         self.holds_stream_key = true;
     }
@@ -382,11 +390,8 @@ impl Publication {
             offer_srt_key,
             srt_key.clone(),
         ));
-        // WHIP never takes a stage over, so it has no holder to check. An SRT
-        // caller the app hands a passphrase to is decided by its own key
-        // check: one that passes takes over at once, and one that fails
-        // changes nothing.
-        if !matches!(kind, SourceKind::Es) && srt_key.is_none() {
+        // WHIP never takes a stage over, so it has no holder to check.
+        if !matches!(kind, SourceKind::Es) {
             Self::recheck_holder(app, endpoint, &req.path, &holder).await;
         }
         Ok(Admitted {
@@ -503,7 +508,7 @@ impl Publication {
                     req,
                     SourceKind::Ts,
                     Some(scope.clone()),
-                    Admitted::default(),
+                    Admitted::scoped(),
                     limits.max_publish_bps.min(app.config.max_publish_bps),
                     grace,
                 )
@@ -536,14 +541,14 @@ impl Publication {
         };
         // Global-publisher and app-authorised mode: the authorised publisher
         // may replace its own quiet connection, and one holding the stream's
-        // own passphrase may replace it at once. Scoped sessions keep their
+        // own passphrase after a much shorter silence. Scoped sessions keep their
         // single owner, and so does a WHIP claim: a POST for a live path gets
         // 409, whoever is publishing (docs/whip-ingest.md, Reconnects).
         // Superseding a stalled WHIP session is not built yet.
         let take_over = if scope.is_some() || matches!(kind, SourceKind::Es) {
             crate::stream::TakeOver::Never
         } else if holds_stream_key {
-            crate::stream::TakeOver::AtOnce
+            crate::stream::TakeOver::Proven
         } else {
             crate::stream::TakeOver::AfterSilence
         };

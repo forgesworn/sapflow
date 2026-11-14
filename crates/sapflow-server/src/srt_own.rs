@@ -659,9 +659,9 @@ fn check_pending(
     };
     let encryption = match checked {
         Ok(encryption) => {
-            // The stream's own passphrase, which only its encoder holds: it
-            // takes the stream over at once, even from a publisher still
-            // sending, so an encoder back on a new network does not wait.
+            // The stream's own passphrase, which never crosses the network:
+            // the claim waits only the short proven silence, so an encoder
+            // back on a new network does not wait the full takeover silence.
             if matches!(encryption, Encryption::AppKey(_)) {
                 admitted.proved_stream_key();
             }
@@ -710,8 +710,13 @@ fn check_pending(
     // publisher still sends spends no admitted entry, and its resend after
     // a lost refusal is not taken for a replay. The admission has already
     // asked the app about the holder; the claim checks again. A caller with
-    // the stream's own passphrase is never refused here.
-    if !matches!(encryption, Encryption::AppKey(_)) && app.streams.takeover_waits(&req.path) {
+    // the stream's own passphrase waits only the short proven silence.
+    let take_over = if matches!(encryption, Encryption::AppKey(_)) {
+        crate::stream::TakeOver::Proven
+    } else {
+        crate::stream::TakeOver::AfterSilence
+    };
+    if app.streams.takeover_waits_for(&req.path, take_over) {
         listener.reject(id, reject_code(Refused::Policy(Refusal::AlreadyLive)));
         app.log_refusal("srt", &Refusal::AlreadyLive);
         return None;
