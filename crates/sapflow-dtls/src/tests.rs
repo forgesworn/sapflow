@@ -1898,3 +1898,194 @@ fn fragments_helper_is_consistent() {
     assert_eq!(f[0].seq, 3);
     assert_eq!((f[0].offset, f[0].length, f[0].data), (2, 10, &b"abc"[..]));
 }
+
+/// A4.4 review, round 4 (finding 7): two forged fragments over the boundary
+/// between the genuine Certificate's two fragments, each genuine but for one
+/// byte. One disagrees with the second genuine fragment and the other with
+/// the first, so each genuine fragment joins the candidate it agrees with
+/// and neither candidate completes. Before, every retransmission was then a
+/// duplicate for one of them and started no candidate, which held the
+/// handshake until the deadline. Now a fragment that only repeats what
+/// stalled candidates hold, while another candidate disagrees with it,
+/// starts a fresh one, and the client's next retransmission completes it.
+/// Nothing is overwritten (finding 5).
+#[test]
+fn complementary_forged_candidates_give_way_to_a_retransmission() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let (cert, rest) = certificate_in_pieces(&recs);
+    let n = cert.len() as u32;
+    assert!(n > 101);
+    // Agrees with [0, 100), disagrees with [100, n); then the reverse.
+    let against_second = [cert[99], cert[100] ^ 1];
+    let against_first = [cert[99] ^ 1, cert[100]];
+    for (i, data) in [against_second, against_first].iter().enumerate() {
+        let d = fragment_record(message::CERTIFICATE, 1, n, 99, data, 60 + i as u64);
+        assert_eq!(d.len(), 27);
+        p.feed(&[d]).expect("forged");
+    }
+    let genuine = |rseq: u64| {
+        [(0, &cert[..100]), (100, &cert[100..])]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (offset, data))| {
+                fragment_record(message::CERTIFICATE, 1, n, offset, data, rseq + i as u64)
+            })
+            .collect::<Vec<_>>()
+    };
+    p.feed(&genuine(62)).expect("genuine");
+    p.feed(&rest).expect("rest");
+    assert_eq!(p.server.state(), State::Handshaking, "held up");
+    assert!(p.server.poll_event().is_none());
+    // The attacker stops; the client retransmits after our timer fires.
+    advance_past_the_timer(&mut p);
+    p.feed(&genuine(64)).expect("retransmitted");
+    completes(&mut p, &rest);
+    crypto_once(&p);
+}
+
+/// A4.4 review, round 4 (finding 8): a CertificateVerify whose signature is
+/// not a valid DER ECDSA P-256 signature, queued ahead: one byte (30 bytes
+/// on the wire), an `r` of zero, and an `s` above the group order. Before,
+/// each passed the message parser, was counted as the one verification,
+/// failed to decode and ended the handshake. Now each is refused like any
+/// other malformed epoch 0 message, without spending the verification, and
+/// the genuine one completes the handshake. (A well-formed but wrong
+/// signature still spends it: an accepted residual.)
+#[test]
+fn a_certificate_verify_that_is_not_der_does_not_spend_the_verification() {
+    let mut above_order = vec![0x30, 38, 2, 1, 1, 2, 33, 0];
+    above_order.extend_from_slice(&[0xff; 32]);
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("one byte", vec![0xff]),
+        ("r of zero", vec![0x30, 6, 2, 1, 0, 2, 1, 1]),
+        ("s above the order", above_order),
+    ];
+    for (name, signature) in cases {
+        let mut body = message::ECDSA_P256_SHA256.to_be_bytes().to_vec();
+        body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+        body.extend_from_slice(&signature);
+        let mut p = pair(Options::default());
+        let recs = flight5(&mut p);
+        let d = fragment_record(
+            message::CERTIFICATE_VERIFY,
+            3,
+            body.len() as u32,
+            0,
+            &body,
+            60,
+        );
+        if name == "one byte" {
+            assert_eq!(d.len(), 30);
+        }
+        assert_eq!(p.feed(&[d]), Ok(()), "{name}");
+        assert!(p.drain().is_empty(), "{name}: no alert");
+        completes(&mut p, &recs);
+        crypto_once(&p);
+        assert_eq!(
+            message::certificate_verify(&body),
+            Err(Error::Decode),
+            "{name}"
+        );
+    }
+}
+
+/// A4.4 review, round 4 (finding 9): complete forged ClientKeyExchange and
+/// CertificateVerify messages for later seqs are kept until their seq comes,
+/// and nothing reclaims a complete candidate. Admission bounds them: four
+/// candidates each of at most 66 and 76 bytes, 568 in all. With
+/// `max_buffered` at 512 they left too little room for the expected
+/// Certificate, and the handshake waited until the deadline. `max_buffered`
+/// must now be at least `max_message_len` plus those 568 bytes, so a 512
+/// buffer is refused, and at that floor the genuine flight completes at
+/// once with every later slot held by a forgery.
+#[test]
+fn the_buffer_always_has_room_for_the_expected_message() {
+    let small = Config {
+        max_message_len: 512,
+        max_buffered: 512,
+        ..Config::default()
+    };
+    assert_eq!(small.validate().map_err(|e| e.0), Err("max_buffered"));
+    let just_under = Config {
+        max_buffered: 512 + 567,
+        ..small
+    };
+    assert_eq!(just_under.validate().map_err(|e| e.0), Err("max_buffered"));
+    let config = Config {
+        max_message_len: 512,
+        max_buffered: 512 + 568,
+        ..Config::default()
+    };
+    assert_eq!(config.validate(), Ok(()));
+    let mut p = pair_with(Options::default(), config, None);
+    let recs = flight5(&mut p);
+    let (cert, _) = certificate_in_pieces(&recs);
+    assert!(cert.len() <= 512);
+    let mut rseq = 60;
+    for k in 0..4u8 {
+        // A point that is not on the curve, and a signature under another
+        // scheme: each is refused when its seq comes.
+        let mut key_exchange = vec![65, 4];
+        key_exchange.extend_from_slice(&[k; 64]);
+        let mut verify = vec![5, 3, 0, 72];
+        verify.extend_from_slice(&[k; 72]);
+        for (msg_type, seq, body) in [
+            (message::CLIENT_KEY_EXCHANGE, 2, key_exchange),
+            (message::CERTIFICATE_VERIFY, 3, verify),
+        ] {
+            let d = fragment_record(msg_type, seq, body.len() as u32, 0, &body, rseq);
+            rseq += 1;
+            p.feed(&[d]).expect("forged");
+        }
+    }
+    assert_eq!(p.server.buffered(), 568, "every later slot is held");
+    completes(&mut p, &recs);
+    crypto_once(&p);
+}
+
+/// A4.4 review, round 4 (finding 10): our first record mirrors the hello's
+/// record sequence number, as RFC 6347 section 4.2.1 requires, so a hello
+/// at the top of the 48-bit space left no room for flight 4. The server
+/// signed, then failed with `Limit::Sequence`. Such a hello is now refused
+/// before anything is signed or sent (a conforming client starts each epoch
+/// at 0), and a later hello is answered. A hello just inside the reserve is
+/// still answered, mirrored, and the handshake completes.
+#[test]
+fn a_hello_too_near_the_end_of_the_sequence_space_is_refused_unsigned() {
+    let at = |hello: &mut Vec<Vec<u8>>, seq: u64| {
+        assert_eq!(hello.len(), 1);
+        hello[0][5..11].copy_from_slice(&seq.to_be_bytes()[2..]);
+    };
+    let mut p = pair(Options::default());
+    let mut hello = p.client.start();
+    at(&mut hello, record::MAX_SEQUENCE);
+    assert_eq!(p.feed(&hello), Ok(()));
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    assert_eq!(p.server.refused(), Some(Error::Limit(Limit::Sequence)));
+    assert!(p.drain().is_empty(), "nothing sent");
+    assert_eq!(p.server.stats().signatures, 0, "nothing signed");
+    p.run().expect("handshake");
+    p.connected();
+
+    let edge = record::MAX_SEQUENCE - crate::server::SEQUENCE_RESERVE;
+    let mut p = pair(Options::default());
+    let mut hello = p.client.start();
+    at(&mut hello, edge);
+    p.feed(&hello).expect("hello");
+    let flight = p.drain();
+    assert_eq!(
+        record::records(&flight[0]).next().expect("record").seq,
+        edge
+    );
+    let mut back = Vec::new();
+    for d in &flight {
+        back.extend(p.client.handle(d).expect("client"));
+    }
+    completes(&mut p, &back);
+    let mut p = pair(Options::default());
+    let mut hello = p.client.start();
+    at(&mut hello, edge + 1);
+    assert_eq!(p.feed(&hello), Ok(()));
+    assert_eq!(p.server.stats().signatures, 0, "just past the reserve");
+}

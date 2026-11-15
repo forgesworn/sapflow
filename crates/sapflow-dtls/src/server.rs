@@ -26,8 +26,8 @@ use crate::error::alert;
 use crate::flight::{self, Flight, OutMessage, Sequences};
 use crate::identity::{self, Fingerprint, Identity};
 use crate::message::{self, ClientHello, Negotiated, SrtpProfile};
-use crate::reassembly::{Limits, Message, Push, Reassembler};
-use crate::record::{self, DTLS_1_2, Protection, Record, ReplayWindow};
+use crate::reassembly::{Limits, MAX_VARIANTS, Message, Push, Reassembler};
+use crate::record::{self, DTLS_1_2, MAX_SEQUENCE, Protection, Record, ReplayWindow};
 use crate::{ConfigError, Error, Limit};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
@@ -65,6 +65,20 @@ const KEY_EXCHANGE_MAX: usize = 1 + 65;
 const VERIFY_MAX: usize = 2 + 2 + 72;
 /// Finished's `verify_data`.
 const FINISHED_LEN: usize = 12;
+/// The most bytes complete candidates for later seqs can hold while the
+/// expected message is still missing: admission lets only ClientKeyExchange
+/// and CertificateVerify in ahead at epoch 0, each with at most
+/// [`MAX_VARIANTS`] candidates. Nothing reclaims a complete candidate, so
+/// [`Config::max_buffered`] keeps this much over `max_message_len`.
+const LATER_COMPLETE_MAX: usize = MAX_VARIANTS * (KEY_EXCHANGE_MAX + VERIFY_MAX);
+/// Epoch 0 record sequence numbers kept free above a hello whose number our
+/// first record mirrors. Everything we can send at epoch 0 in one
+/// association fits well inside it: at most 32 HelloVerifyRequest flights of
+/// one record, each sent at most 32 times; flight 4 (under 2 KB, so at most
+/// 14 records at the smallest MTU) sent at most 32 times; the final
+/// flight's ChangeCipherSpec at most 32 times; and a few alerts. That is
+/// under 2048 records at the largest settings.
+pub(crate) const SEQUENCE_RESERVE: u64 = 1 << 16;
 /// The TLS 1.3 downgrade sentinels (RFC 8446 section 4.1.3), which a DTLS
 /// 1.2 server must not send by chance either.
 const DOWNGRADE: [&[u8; 8]; 2] = [b"DOWNGRD\x01", b"DOWNGRD\x00"];
@@ -109,7 +123,11 @@ pub struct Config {
     /// count). 1 to 1024; default 32.
     pub max_fragments: usize,
     /// Most bytes held by messages being reassembled. At least
-    /// `max_message_len`, at most 1 MiB; default 16384.
+    /// `max_message_len` plus 568, at most 1 MiB; default 16384. The 568
+    /// bytes are what complete forged messages for later seqs can hold (four
+    /// candidates each for ClientKeyExchange and CertificateVerify), so the
+    /// expected message always has room once incomplete candidates are
+    /// reclaimed.
     pub max_buffered: usize,
 }
 
@@ -153,7 +171,8 @@ impl Config {
         )?;
         check((1..=1024).contains(&self.max_fragments), "max_fragments")?;
         check(
-            self.max_buffered >= self.max_message_len && self.max_buffered <= 1 << 20,
+            self.max_buffered >= self.max_message_len + LATER_COMPLETE_MAX
+                && self.max_buffered <= 1 << 20,
             "max_buffered",
         )?;
         Ok(())
@@ -465,8 +484,10 @@ impl Server {
     /// An unauthenticated (epoch 0) message that fails its checks before any
     /// ECDH or signature verification is refused this way rather than with
     /// a fatal alert, since anyone who can spoof the peer's address could
-    /// have sent it: a hello outside the profile, a certificate that does
-    /// not match the offer, a bad key share, another verify scheme. If the
+    /// have sent it: a hello outside the profile or too near the end of the
+    /// record sequence space, a certificate that does not match the offer,
+    /// a bad key share, a signature that does not decode or another verify
+    /// scheme. If the
     /// handshake then times out, this is the likely reason.
     pub fn refused(&self) -> Option<Error> {
         self.refused
@@ -945,7 +966,14 @@ impl Server {
         };
         if !self.sent_any {
             // Our first record reuses the ClientHello's record sequence
-            // number (RFC 6347 section 4.2.1); later ones count up.
+            // number (RFC 6347 section 4.2.1 requires it for the
+            // HelloVerifyRequest and for the first ServerHello); later ones
+            // count up. A hello so near the end of the 48-bit space that our
+            // flights could not follow is refused here, before anything is
+            // signed or sent: a conforming client starts each epoch at 0.
+            if record_seq > MAX_SEQUENCE - SEQUENCE_RESERVE {
+                return Ok(Taken::Refused(Error::Limit(Limit::Sequence)));
+            }
             self.seqs.epoch0 = record_seq;
         }
         if self.config.hello_verify {
@@ -1147,7 +1175,9 @@ impl Server {
                 };
                 let key = hs.peer.as_ref().ok_or(Error::Internal)?;
                 // The one verification: once it has failed, the handshake
-                // cannot complete, so the failure is final.
+                // cannot complete, so the failure is final. A signature that
+                // does not decode was refused above without spending it, so
+                // only a well-formed one that does not verify gets here.
                 self.stats.verifications += 1;
                 identity::verify_der(key, hash, signature)?;
                 hs.transcript.update(whole(&m)?);

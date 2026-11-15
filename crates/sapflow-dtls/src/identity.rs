@@ -259,6 +259,14 @@ pub(crate) fn sign_der(key: &SigningKey, digest: &[u8; 32]) -> Result<Vec<u8>, E
     Ok(sig.as_bytes().to_vec())
 }
 
+/// A DER ECDSA P-256 signature, decoded: valid DER, and `r` and `s` each
+/// from 1 to below the group order. Anything else is `Decode`. This is the
+/// only decoder, so a signature the message parser accepts is one
+/// [`verify_der`] can check.
+pub(crate) fn signature(der_sig: &[u8]) -> Result<p256::ecdsa::Signature, Error> {
+    p256::ecdsa::Signature::from_der(der_sig).map_err(|_| Error::Decode)
+}
+
 /// Verifies a DER ECDSA signature over a SHA-256 digest.
 pub(crate) fn verify_der(
     key: &VerifyingKey,
@@ -266,7 +274,7 @@ pub(crate) fn verify_der(
     der_sig: &[u8],
 ) -> Result<(), Error> {
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
-    let sig = p256::ecdsa::DerSignature::from_bytes(der_sig).map_err(|_| Error::Decode)?;
+    let sig = signature(der_sig)?;
     key.verify_prehash(digest, &sig)
         .map_err(|_| Error::BadSignature)
 }

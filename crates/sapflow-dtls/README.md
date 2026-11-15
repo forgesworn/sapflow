@@ -92,7 +92,13 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 | `hello_verify` | off | |
 | `max_message_len` | 8192 | 512 to 65536 |
 | `max_fragments` (per message) | 32 | 1 to 1024 |
-| `max_buffered` (all reassembly) | 16384 | `max_message_len` to 1 MiB |
+| `max_buffered` (all reassembly) | 16384 | `max_message_len` + 568 to 1 MiB |
+
+The 568 bytes over `max_message_len` are the most that complete forged
+messages for later seqs can hold (four candidates each for
+ClientKeyExchange, at most 66 bytes, and CertificateVerify, at most 76).
+Nothing reclaims a complete candidate, so this floor keeps room for the
+expected message.
 
 Fixed: at most 4 messages buffered ahead, 4 certificates in the peer's
 chain, 16 datagrams queued for sending. One input datagram produces at most
@@ -163,8 +169,8 @@ message that a forged byte has split between two candidates completes on
 the client's next retransmission. In the worst case found (the slots full,
 replacement spent, and a forged byte inside a later fragment's range) that
 is two of the client's retransmissions. Round 4 of the A4.4 review found
-cases where a finite burst still holds the flight until the deadline; they
-are listed under "Open" below.
+cases where a finite burst still held the flight until the deadline; they
+are fixed, awaiting round 5 review, as listed below.
 
 These still end the handshake, with one fatal alert where `Error::alert`
 names one:
@@ -195,29 +201,35 @@ November 2026 (A4.4):
   refilling the slots and the buffer, or keep winning the race above.
   Reclaiming bounds a finite burst, not a sustained one.
 
-Open: round 4 of the A4.4 review (12 November 2026) found four more ways
-forged epoch 0 input can end or hold a handshake. They are not fixed yet:
+Fixed, awaiting round 5 review: round 4 of the A4.4 review (12 November
+2026) found four more ways forged epoch 0 input could end or hold a
+handshake. Each is fixed, with a test that failed before the fix:
 
 - Two complementary forged candidates, each disagreeing with a different
-  genuine fragment, can absorb every genuine retransmission. Stalled
-  candidates are reclaimed only when a new candidate does not fit, and a
-  fragment that agrees with a candidate never starts one, so neither is
-  reclaimed. About 200 forged bytes hold the handshake until the deadline.
-- A CertificateVerify whose signature is not valid DER is accepted by the
-  message parser, counted as the one verification and then fails
-  decoding, which ends the handshake at once. 30 bytes queued ahead do it,
-  and so can a buggy peer.
-- With a smaller `max_buffered` than the default (for example 512 bytes),
-  complete forged messages at a later seq can leave too little room for the
-  expected Certificate. Nothing reclaims complete candidates, so the
-  handshake waits until the deadline. The default 16 KiB is not affected.
+  genuine fragment, absorbed every genuine retransmission, since a
+  fragment that agrees with a candidate never started one. Now a fragment
+  that only repeats what stalled candidates hold, while another candidate
+  disagrees with it, starts a fresh candidate, and the genuine message
+  completes within two of the client's retransmissions (one in the case
+  the review sent).
+- A CertificateVerify whose signature is not valid DER was counted as the
+  one verification and then failed decoding, ending the handshake. The
+  message parser now decodes the signature (valid DER, `r` and `s` in
+  range), so such a message is refused without spending the verification.
+  A well-formed but wrong signature still spends it (above).
+- With `max_buffered` below the default (for example 512 bytes), complete
+  forged messages at a later seq left too little room for the expected
+  Certificate. `max_buffered` must now be at least `max_message_len` plus
+  568 bytes, the most such messages can hold (Bounds and defaults, above).
 - The first outgoing record mirrors the ClientHello's record sequence
-  number. A ClientHello at the top of the sequence space leaves no room for
-  the server's flights, and the handshake fails after the server has
-  signed. A buggy peer can do this too.
+  number, as RFC 6347 section 4.2.1 requires, so a ClientHello at the top
+  of the sequence space left no room for the server's flights, and the
+  handshake failed after the server had signed. A first hello within 65536
+  of the top is now refused before anything is signed or sent.
 
-Behind ICE, only an attacker who can spoof the selected address pair can
-send any of this, apart from the two cases a buggy peer can trigger.
+Behind ICE, only an attacker who could spoof the selected address pair
+could send any of this, apart from the two cases a buggy peer could
+trigger.
 
 ## Dependencies
 
