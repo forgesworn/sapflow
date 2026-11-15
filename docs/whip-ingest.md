@@ -1316,10 +1316,13 @@ resolution either, so that is not proof that it prevents one.
 ### Loss
 
 - Gaps trigger NACKs, repeated within a bounded wait (`SAPFLOW_WHIP_JITTER`,
-  proposed 200 ms). Retransmissions arrive on the RTX stream and are
-  unwrapped. A sender that negotiated no RTX, such as OBS, resends on the
-  original SSRC and sequence number. The reorder buffer takes either. Round-trip time is estimated from NACK to retransmission, with
-  100 ms assumed until measured.
+  400 ms by default, the owner's A4.1 decision of 15 November 2026; 200 ms
+  before). Packets that arrive in order are not held for it: only what
+  follows a gap waits, up to 400 ms, about 200 ms more than before.
+  Retransmissions arrive on the RTX stream and are unwrapped. A sender that
+  negotiated no RTX, such as OBS, resends on the original SSRC and sequence
+  number. The reorder buffer takes either. Round-trip time is estimated
+  from NACK to retransmission, with 100 ms assumed until measured.
 - A frame still incomplete after the wait is dropped, along with every frame
   until the next keyframe. A PLI is sent at once. The loss is reported through
   the existing `PublicationLoss` path, so recordings are marked incomplete as
@@ -1328,11 +1331,24 @@ resolution either, so that is not proof that it prevents one.
   Nothing else is concealed, since sapflow does not decode.
 - **SRTP replay window (implementation note).** RFC 3711 requires a window
   of at least 64 packets. A sender without RTX, such as OBS, resends a NACKed
-  packet on its original SSRC and index, up to the 200 ms wait later; at
-  5 Mbit/s that is a hundred or more packets back. So `sapflow-rtp` keeps a
-  configurable window per SSRC, 1024 packets by default. An index never
-  received inside the window is accepted; a duplicate of a received index is
-  refused.
+  packet on its original SSRC and index, up to the 400 ms wait later; at
+  5 Mbit/s that is two hundred or more packets back. So `sapflow-rtp` keeps a
+  configurable window per SSRC, 1024 packets by default, which covers the
+  400 ms wait up to about 24 Mbit/s of 1200-byte packets (about 49 Mbit/s
+  at the old 200 ms). An index never received inside the window is
+  accepted; a duplicate of a received index is refused.
+- **What the 400 ms wait changes (implementation note).** The reorder
+  buffer's caps (1024 packets, 1 536 000 bytes a stream) are unchanged, so
+  its bound per stream does not grow; what it holds behind a gap can be up to twice what it held at 200 ms
+  (about 125 KB at 2.5 Mbit/s, against 62.5 KB), and the byte cap now
+  covers the whole wait up to about 30 Mbit/s rather than 61. Opus fill's
+  jitter allowance follows the default wait (400 ms, 19 200 samples), so a
+  loss gap ended by a late retransmission is filled rather than read as a
+  discontinuity; it is a fixed default and does not follow a non-default
+  `SAPFLOW_WHIP_JITTER`. A frame completed by a retransmission up to
+  400 ms late is that far behind arrival time, inside the timeline's
+  500 ms bound (`max_lead`) but with about 100 ms of margin rather than
+  300.
 
 ### Which recording a loss marks
 
@@ -1583,21 +1599,22 @@ address; `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` other than `v2`, or `v2` without
 `SAPFLOW_WHIP_TCP_ADDR` or `SAPFLOW_WHIP_TRUSTED_PROXY`. The UDP socket is
 bound even when only `tcp` candidates are advertised.
 
-**Experimental, for A4.1's retest only.** Two settings let the loss wait and
-the NACK repeat be chosen at start, so that the owner's decision 5 of 15
-November 2026 could be measured. They are not recommended settings, and
-their defaults are the receiver's own, unchanged:
+**Loss wait and NACK repeat.** Two settings, added for A4.1's retest, let
+the loss wait and the NACK repeat be chosen at start:
 
 - `SAPFLOW_WHIP_JITTER`: the longest wait for a missing packet, in
-  milliseconds, 20 to 1000. Unset: 200 ms.
-- `SAPFLOW_WHIP_NACK_REPEAT`: a fixed time between NACKs for one packet, in
+  milliseconds, 20 to 1000. Unset: 400 ms, the owner's decision of
+  15 November 2026 on [the A4.1 retest](whip-evidence/whip-a41-retest-2026-11-15.md)
+  (200 ms before). Other values were not qualified; 200 ms was measured
+  and left more frames unrecovered than SRT at 5% loss.
+- `SAPFLOW_WHIP_NACK_REPEAT`: **experimental**, for measuring A4.1 only,
+  not a recommended setting: a fixed time between NACKs for one packet, in
   milliseconds, 5 to 1000, in place of the RTT and a quarter. The cap of 4
   NACKs a packet and the 64 kbit/s NACK ceiling still apply. Unset: the RTT
-  and a quarter, at least 5 ms.
+  and a quarter, at least 5 ms, unchanged.
 
 Anything else (a unit, a fraction, a value out of range) is refused at
-start. The server logs the effective values with `WHIP listening`. The
-default `SAPFLOW_WHIP_JITTER` is still A4.1's open decision.
+start. The server logs the effective values with `WHIP listening`.
 
 | Variable | Meaning |
 |---|---|
@@ -1610,7 +1627,7 @@ default `SAPFLOW_WHIP_JITTER` is still A4.1's open decision.
 | `SAPFLOW_WHIP_TRUSTED_PROXY` | Address whose `X-Forwarded-For` and PROXY headers are believed |
 | `SAPFLOW_WHIP_ALLOW_ORIGINS` | Origins allowed by CORS for browser publishing |
 | `SAPFLOW_WHIP_KEYFRAME_INTERVAL` | Keyframe request cadence, proposed 2 s |
-| `SAPFLOW_WHIP_JITTER` | Experimental: longest wait for a lost packet, ms, default 200 |
+| `SAPFLOW_WHIP_JITTER` | Longest wait for a lost packet, ms, 20 to 1000, default 400 |
 | `SAPFLOW_WHIP_NACK_REPEAT` | Experimental: fixed time between NACKs for one packet, ms; default the RTT and a quarter |
 | `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, default 2 s |
 | `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | `maxaveragebitrate` offered for Opus |
@@ -1625,7 +1642,7 @@ SRT and RTMP. W4 measures the WHIP rows on the same method as
 |---|---|---|
 | Capture and encode | The sender | Unmeasured |
 | Network to the ingest | The path | Unmeasured |
-| Reorder and loss wait | `SAPFLOW_WHIP_JITTER` | A setting; W4 measures the effect |
+| Reorder and loss wait | `SAPFLOW_WHIP_JITTER` | Up to 400 ms behind a gap by default (200 ms before 15 November 2026); in-order packets are not held. End-to-end effect unmeasured |
 | Packaging | One LL-HLS part | Unchanged from SRT and RTMP |
 | Viewer | The player's hold-back and fetches | Unchanged; measured for SRT and RTMP in [benchmarks.md](benchmarks.md) |
 
@@ -2658,7 +2675,7 @@ host (Apple M4, macOS 26.6.2), headless Chrome 157, OBS 32.0.4 and FFmpeg 8.1.
 | A3.9: `scripts/smoke.sh` covers WHIP alongside SRT and RTMP | `scripts/smoke.sh` (`whip_smoke`): FFmpeg's WHIP muxer publishes; 401 for a missing and a wrong token, the token not logged; LL-HLS with H.264 and Opus decodes; publish callback; `DELETE` ends the session, unpublish callback, the recording decodes. CI installs a pinned static FFmpeg 8.1.3 for it (`SMOKE_WHIP_FFMPEG`) | **Met**, locally and in CI (PR #81, merged as `9a6092c`: the pinned FFmpeg passed its SHA-256 check and the three WHIP checks passed) |
 | A3.10: whether OBS answers PLI with a keyframe | `scripts/whip-obs.js`, a dedicated OBS profile restored after each run; keyframe requests and arrivals from the server's debug log; OBS's own interval set to 10 s (7 s once), PLI every 2 s or none (control) | Recorded: **no**. OBS's keyframes followed its own interval (9.95 to 10.04 s apart, or 7.0) in every run, whether asked every 2 s or not. It answers NACKs, resending on the original SSRC (1495 repeats at 5% loss), so it does read Sapflow's RTCP. With 10 s keyframes and 5% loss, a frame NACKs could not repair cost up to 10 s of video |
 | A3.10: whether OBS changes its sending rate on REMB or receiver reports | `scripts/whip-obs.js` with a server built `--features test-feedback` and armed by `SAPFLOW_TEST_WHIP_FEEDBACK`: reports claiming 25% loss, or REMB at 500 kbit/s (answering `goog-remb`), from 20 s; headless Chrome (`scripts/whip-rate.js`) as the control | Recorded: **no** on either. OBS stayed at 2.50 to 2.53 Mbit/s; the same stimuli took Chrome's target to 30 and to 416 kbit/s within 2 s |
-| A4.1: no more frames unrecovered than SRT at the same wait and latency, on the same loss | `scripts/whip-loss.py` through `srt-loss-proxy` (the owner's decision): 1%, 5% and 10% random loss, 0 to 20 ms jitter, 30 ms each way, five seeds; SRT latency and WHIP's wait both 200 ms; Chrome 157 as the WHIP publisher, since FFmpeg's WHIP muxer does not retransmit | **Not met** at 5%: 83.0 frames unrecovered against SRT's 6.8 (t 9.73). At 1%, 9.4 against 2.0 (t 1.28, no difference worth claiming); at 10%, 50.8 against 130.8 by count but 19.8% against 14.5% of the frames each sent (Chrome cut its frame rate). WHIP was left with 3 to 9 packets its NACKs did not repair at 5%, SRT with 0 or 1. Not the jitter: without it, 48.0 against 6.0 (t 7.35), and with jitter that keeps order, 165.0 against 42.0 (t 8.34); the jitter's reordering is what made libsrt's 6700 retransmissions. Parked by the owner on 15 November 2026: NACK repeats sooner than every 1.25 round trips at the same wait, and a 400 ms wait, are to be measured at 5% loss before WHIP faces users. Measured in [the A4.1 retest](whip-evidence/whip-a41-retest-2026-11-15.md); decision still the owner's |
+| A4.1: no more frames unrecovered than SRT at the same wait and latency, on the same loss | `scripts/whip-loss.py` through `srt-loss-proxy` (the owner's decision): 1%, 5% and 10% random loss, 0 to 20 ms jitter, 30 ms each way, five seeds; SRT latency and WHIP's wait both 200 ms; Chrome 157 as the WHIP publisher, since FFmpeg's WHIP muxer does not retransmit | **Not met** at 5%: 83.0 frames unrecovered against SRT's 6.8 (t 9.73). At 1%, 9.4 against 2.0 (t 1.28, no difference worth claiming); at 10%, 50.8 against 130.8 by count but 19.8% against 14.5% of the frames each sent (Chrome cut its frame rate). WHIP was left with 3 to 9 packets its NACKs did not repair at 5%, SRT with 0 or 1. Not the jitter: without it, 48.0 against 6.0 (t 7.35), and with jitter that keeps order, 165.0 against 42.0 (t 8.34); the jitter's reordering is what made libsrt's 6700 retransmissions. Parked by the owner on 15 November 2026: NACK repeats sooner than every 1.25 round trips at the same wait, and a 400 ms wait, are to be measured at 5% loss before WHIP faces users. Measured in [the A4.1 retest](whip-evidence/whip-a41-retest-2026-11-15.md): with a 400 ms wait, 1.4 frames unrecovered against SRT's 27.0 at the 5% headline profile (t -2.72), and no difference worth claiming on the other two 5% profiles. **Accepted by the owner** on that evidence on 15 November 2026 ("Default 400 ms"), and the default is now 400 ms. Not a pass by the rule: SRT stayed at 200 ms latency, so WHIP had twice SRT's wait, and SRT at 400 ms was not measured. The cost is up to about 200 ms more ingest latency behind a gap |
 | A4.2: CPU and memory per WHIP publisher no higher than SRT's | `scripts/whip-cost.py` (benchmarks.md section B for SRT, RTMP and WHIP; 1, 10 and 50 publishers, three rounds; the verdict rule fixed before the numbers), on macOS, then again in a Linux container (`scripts/whip-cost-linux.sh`) | Memory: the owner accepts WHIP's (about 1 MB a stream over SRT) in writing, 12 November 2026. CPU, in a Linux container (27 of 27 runs, none skipped): WHIP/SRT per stream 0.74 to 0.84 at 1 stream and 0.83 to 0.96 at 50, so **met** there; at 10 streams 0.75, 0.83 and 1.11, so the rounds disagree; the owner accepted it on 15 November 2026. WHIP was below SRT in 8 of 9 rounds |
 
 ### W5: documentation
@@ -2673,7 +2690,7 @@ they describe what ships.
 |---|---|
 | `transport-cc` in v1 | Provisionally yes from desktop Chrome; A0.4 on the other targets |
 | Whether ICE-TCP is worth carrying | A0.3 against a public address on 443 |
-| Default `SAPFLOW_WHIP_JITTER` | A4.1: at 200 ms WHIP leaves more frames unrecovered than SRT at 5% loss. Parked by the owner on 15 November 2026: NACK repeats sooner at 200 ms, and a 400 ms wait, are to be measured before WHIP faces users. 200 ms until then. Retest results: [whip-a41-retest-2026-11-15.md](whip-evidence/whip-a41-retest-2026-11-15.md) |
+| Default `SAPFLOW_WHIP_JITTER` | **Decided** by the owner on 15 November 2026: "Default 400 ms", on [the A4.1 retest](whip-evidence/whip-a41-retest-2026-11-15.md) (at 200 ms WHIP left more frames unrecovered than SRT at 5% loss). SRT's latency stayed 200 ms in the comparison, and the wait adds up to about 200 ms of ingest latency behind a gap. The 30 ms NACK repeat stays an experimental setting; the default repeat (RTT and a quarter, at least 5 ms) is unchanged |
 | RustCrypto or `ring` | A4.2, measured 12 November 2026 (CPU met at 1 and 50 streams in a Linux container and accepted by the owner at 10 on 15 November 2026; memory accepted). Not decided here |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
 | Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |

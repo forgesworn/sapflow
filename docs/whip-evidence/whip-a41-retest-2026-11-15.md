@@ -1,5 +1,10 @@
 # WHIP A4.1 retest: faster NACK repeats and a 400 ms wait
 
+**Owner's decision, 15 November 2026: "Default 400 ms".** On this evidence
+the default `SAPFLOW_WHIP_JITTER` is now 400 ms and A4.1 is accepted by the
+owner (decision 9 in [the second qualification round](whip-qualification-2-2026-11-12.md));
+the text below is as written before it.
+
 Status: evidence, 15 November 2026, on `perf/whip-a41-retest`, cut from
 `fix/dtls-round4-findings` at `5ef36b0`. It answers the owner's decision 5
 of 15 November 2026 in
