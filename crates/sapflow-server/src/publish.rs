@@ -1384,6 +1384,17 @@ mod publication_capacity_tests {
             .collect()
     }
 
+    /// For each request the stub saw, whether it was marked as a holder's
+    /// request sent again.
+    fn rechecks(stub: &crate::publish_auth::stub::Stub) -> Vec<bool> {
+        stub.requests
+            .lock()
+            .expect("stub log")
+            .iter()
+            .map(|(_, body)| body["recheck"] == "holder")
+            .collect()
+    }
+
     async fn rtmp(app: &Arc<App>, key: &str) -> Result<Publication, Refusal> {
         let from = "127.0.0.1".parse().expect("loopback");
         Publication::begin_authorised(app, &keyed(key), SourceKind::Flv, from).await
@@ -1491,6 +1502,11 @@ mod publication_capacity_tests {
             asked(&stub),
             [OLD, NEW, OLD],
             "the holder's key was asked about"
+        );
+        assert_eq!(
+            rechecks(&stub),
+            [false, false, true],
+            "and only that marked"
         );
         assert!(matches!(
             declare_audio(&mut holder),

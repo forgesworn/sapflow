@@ -157,6 +157,14 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- The live publisher's request that sapflow sends the app again, when a
+  newer publisher's claim would be refused while it sends, now carries
+  `"recheck":"holder"`, and no other request does. An app can then answer
+  it without rate-limiting it, counting its refusal against the address or
+  reporting a failed attempt to the broadcaster, since its credentials are
+  ones the app admitted before. Without it, an app that reports refusals
+  to its broadcasters reported one for the old encoder at every key
+  rotation, though nobody had tried a wrong key.
 - A live publisher still sending keeps its stage. Without scoped
   sessions, a second connection with the same credentials used to take a
   live stream over at once, so anyone who read a stream key off the
