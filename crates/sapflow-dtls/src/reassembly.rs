@@ -12,6 +12,12 @@
 //!   and, by arriving first, does not hold the seq. (Where it splits a
 //!   genuine message between two candidates, the retransmission completes
 //!   it.)
+//! - A fragment that only repeats bytes that stalled candidates hold (each
+//!   unauthenticated, incomplete and started at least `expire_after` ago),
+//!   while another candidate for its seq disagrees with it, starts a fresh
+//!   candidate as well. Otherwise two forged candidates, each disagreeing
+//!   with a different genuine fragment, would absorb every genuine
+//!   retransmission between them.
 //! - Each seq has at most [`MAX_VARIANTS`] candidates. Every fragment that
 //!   adds coverage counts towards its candidate's fragment cap, while
 //!   duplicates are dropped without counting; a candidate over the cap is
@@ -108,6 +114,13 @@ impl Partial {
 
     fn unauthenticated(&self) -> bool {
         self.epoch == 0
+    }
+
+    /// Unauthenticated, still incomplete, and started at least `after` ago.
+    fn stalled(&self, after: Option<Duration>, now: Instant) -> bool {
+        self.unauthenticated()
+            && !self.complete()
+            && after.is_some_and(|after| now.saturating_duration_since(self.started) >= after)
     }
 
     /// Whether `data` at `start` has the value this candidate already holds
@@ -233,20 +246,30 @@ impl Reassembler {
             return Ok(Push::Dropped);
         }
         let max_fragments = self.limits.max_fragments;
+        let expire_after = self.limits.expire_after;
         // Every candidate for this message that agrees with the fragment
         // takes what it adds.
         let (mut agreed, mut stored, mut over) = (false, false, false);
+        // Whether a candidate it agrees with is not stalled, and whether one
+        // for the same message disagrees with it.
+        let (mut live, mut disagreed) = (false, false);
         let mut i = 0;
         while let Some(p) = self.partials.get_mut(i) {
             let same = p.seq == f.seq
                 && p.msg_type == f.msg_type
                 && p.body.len() == length
                 && p.epoch == epoch;
-            if !same || !p.agrees(start, f.data) {
+            if !same {
+                i += 1;
+                continue;
+            }
+            if !p.agrees(start, f.data) {
+                disagreed = true;
                 i += 1;
                 continue;
             }
             agreed = true;
+            live |= !p.stalled(expire_after, now);
             if p.covers(start, end) {
                 // A duplicate for this one: no new bytes, so it neither
                 // counts nor stores.
@@ -287,7 +310,12 @@ impl Reassembler {
                 Push::Over(Limit::Fragments)
             });
         }
-        if agreed {
+        // A duplicate is dropped, unless it only repeats what stalled
+        // candidates hold and another disagrees with it: the stalled ones
+        // may each hold a forged byte where the other genuine fragments
+        // differ, so a retransmission could never complete any of them. A
+        // fresh candidate lets it.
+        if agreed && (live || !disagreed) {
             return Ok(Push::Dropped);
         }
         self.start(epoch, f, length, now)
@@ -345,13 +373,8 @@ impl Reassembler {
         // Stalled: started a retransmission interval ago and still
         // incomplete. A genuine message's retransmission brings all of its
         // fragments again, so it loses nothing by this.
-        if let Some(after) = self.limits.expire_after {
-            self.remove_where(|p| {
-                p.unauthenticated()
-                    && !p.complete()
-                    && now.saturating_duration_since(p.started) >= after
-            });
-        }
+        let after = self.limits.expire_after;
+        self.remove_where(|p| p.stalled(after, now));
         let authenticated = epoch != 0;
         if !authenticated {
             let Some(every) = self.limits.reclaim_every else {
@@ -817,6 +840,38 @@ mod tests {
             r.push(1, &frag(0, 100, 4, b"x"), t),
             Ok(Push::Over(Limit::Fragments))
         );
+    }
+
+    #[test]
+    fn a_repeat_for_stalled_candidates_starts_a_fresh_one() {
+        let t = base();
+        let mut r = Reassembler::new(RECLAIMING);
+        // Genuine "abcdef" in [0, 3) and [3, 6); forgeries over [2, 4), one
+        // wrong at byte 3 and one wrong at byte 2.
+        r.push(0, &frag(0, 6, 2, b"cX"), t)
+            .expect("against the second");
+        r.push(0, &frag(0, 6, 2, b"Yd"), t)
+            .expect("against the first");
+        assert_eq!(r.push(0, &frag(0, 6, 0, b"abc"), t), Ok(Push::Stored));
+        assert_eq!(r.push(0, &frag(0, 6, 3, b"def"), t), Ok(Push::Stored));
+        assert_eq!(r.pop(), None, "each genuine fragment joined one forgery");
+        // Within the interval a repeat is a duplicate, as before.
+        let soon = t + Duration::from_millis(999);
+        assert_eq!(r.push(0, &frag(0, 6, 0, b"abc"), soon), Ok(Push::Dropped));
+        // Once they have stalled, the retransmission completes.
+        let later = t + Duration::from_secs(1);
+        assert_eq!(r.push(0, &frag(0, 6, 0, b"abc"), later), Ok(Push::Stored));
+        assert_eq!(r.push(0, &frag(0, 6, 3, b"def"), later), Ok(Push::Stored));
+        assert_eq!(r.pop().expect("complete").body, b"abcdef");
+        assert_eq!(r.buffered(), 0);
+        // With no disagreeing candidate, a repeat for a stalled one is still
+        // a duplicate: a lossy genuine message keeps what it has.
+        let mut r = Reassembler::new(RECLAIMING);
+        r.push(0, &frag(0, 6, 0, b"abc"), t).expect("first");
+        assert_eq!(r.push(0, &frag(0, 6, 0, b"abc"), later), Ok(Push::Dropped));
+        assert_eq!(r.buffered(), 6);
+        assert_eq!(r.push(0, &frag(0, 6, 3, b"def"), later), Ok(Push::Stored));
+        assert_eq!(r.pop().expect("complete").body, b"abcdef");
     }
 
     #[test]

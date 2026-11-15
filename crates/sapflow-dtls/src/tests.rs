@@ -1898,3 +1898,48 @@ fn fragments_helper_is_consistent() {
     assert_eq!(f[0].seq, 3);
     assert_eq!((f[0].offset, f[0].length, f[0].data), (2, 10, &b"abc"[..]));
 }
+
+/// A4.4 review, round 4 (finding 7): two forged fragments over the boundary
+/// between the genuine Certificate's two fragments, each genuine but for one
+/// byte. One disagrees with the second genuine fragment and the other with
+/// the first, so each genuine fragment joins the candidate it agrees with
+/// and neither candidate completes. Before, every retransmission was then a
+/// duplicate for one of them and started no candidate, which held the
+/// handshake until the deadline. Now a fragment that only repeats what
+/// stalled candidates hold, while another candidate disagrees with it,
+/// starts a fresh one, and the client's next retransmission completes it.
+/// Nothing is overwritten (finding 5).
+#[test]
+fn complementary_forged_candidates_give_way_to_a_retransmission() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let (cert, rest) = certificate_in_pieces(&recs);
+    let n = cert.len() as u32;
+    assert!(n > 101);
+    // Agrees with [0, 100), disagrees with [100, n); then the reverse.
+    let against_second = [cert[99], cert[100] ^ 1];
+    let against_first = [cert[99] ^ 1, cert[100]];
+    for (i, data) in [against_second, against_first].iter().enumerate() {
+        let d = fragment_record(message::CERTIFICATE, 1, n, 99, data, 60 + i as u64);
+        assert_eq!(d.len(), 27);
+        p.feed(&[d]).expect("forged");
+    }
+    let genuine = |rseq: u64| {
+        [(0, &cert[..100]), (100, &cert[100..])]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (offset, data))| {
+                fragment_record(message::CERTIFICATE, 1, n, offset, data, rseq + i as u64)
+            })
+            .collect::<Vec<_>>()
+    };
+    p.feed(&genuine(62)).expect("genuine");
+    p.feed(&rest).expect("rest");
+    assert_eq!(p.server.state(), State::Handshaking, "held up");
+    assert!(p.server.poll_event().is_none());
+    // The attacker stops; the client retransmits after our timer fires.
+    advance_past_the_timer(&mut p);
+    p.feed(&genuine(64)).expect("retransmitted");
+    completes(&mut p, &rest);
+    crypto_once(&p);
+}
