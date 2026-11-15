@@ -2043,3 +2043,49 @@ fn the_buffer_always_has_room_for_the_expected_message() {
     completes(&mut p, &recs);
     crypto_once(&p);
 }
+
+/// A4.4 review, round 4 (finding 10): our first record mirrors the hello's
+/// record sequence number, as RFC 6347 section 4.2.1 requires, so a hello
+/// at the top of the 48-bit space left no room for flight 4. The server
+/// signed, then failed with `Limit::Sequence`. Such a hello is now refused
+/// before anything is signed or sent (a conforming client starts each epoch
+/// at 0), and a later hello is answered. A hello just inside the reserve is
+/// still answered, mirrored, and the handshake completes.
+#[test]
+fn a_hello_too_near_the_end_of_the_sequence_space_is_refused_unsigned() {
+    let at = |hello: &mut Vec<Vec<u8>>, seq: u64| {
+        assert_eq!(hello.len(), 1);
+        hello[0][5..11].copy_from_slice(&seq.to_be_bytes()[2..]);
+    };
+    let mut p = pair(Options::default());
+    let mut hello = p.client.start();
+    at(&mut hello, record::MAX_SEQUENCE);
+    assert_eq!(p.feed(&hello), Ok(()));
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    assert_eq!(p.server.refused(), Some(Error::Limit(Limit::Sequence)));
+    assert!(p.drain().is_empty(), "nothing sent");
+    assert_eq!(p.server.stats().signatures, 0, "nothing signed");
+    p.run().expect("handshake");
+    p.connected();
+
+    let edge = record::MAX_SEQUENCE - crate::server::SEQUENCE_RESERVE;
+    let mut p = pair(Options::default());
+    let mut hello = p.client.start();
+    at(&mut hello, edge);
+    p.feed(&hello).expect("hello");
+    let flight = p.drain();
+    assert_eq!(
+        record::records(&flight[0]).next().expect("record").seq,
+        edge
+    );
+    let mut back = Vec::new();
+    for d in &flight {
+        back.extend(p.client.handle(d).expect("client"));
+    }
+    completes(&mut p, &back);
+    let mut p = pair(Options::default());
+    let mut hello = p.client.start();
+    at(&mut hello, edge + 1);
+    assert_eq!(p.feed(&hello), Ok(()));
+    assert_eq!(p.server.stats().signatures, 0, "just past the reserve");
+}
