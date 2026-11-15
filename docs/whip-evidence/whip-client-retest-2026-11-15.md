@@ -17,9 +17,9 @@ default.
 
 | Item | Value |
 |---|---|
-| Host | The test host, an Apple silicon Mac, shared with other sessions. Its default route is a VPN tunnel, as in W0. Its screen was locked throughout (`CGSSessionScreenIsLocked`) |
+| Host | The test host, an Apple silicon Mac, shared with other sessions. Its default route is a VPN tunnel, as in W0. Its screen was locked when checked, twice, during the Safari runs (`CGSSessionScreenIsLocked`) |
 | Build | Release build of `705220f` for `aarch64-apple-darwin` (`sapflow`, `srt-loss-proxy`), built once on the host |
-| Scripts | `scripts/whip-e2e.js` with a new `--browser chrome\|firefox\|safari` (`cef24e6`), `scripts/whip-obs.js` unchanged, `scripts/whip-loss.py` with per-arm SRT latency (`c120d28`) |
+| Scripts | `scripts/whip-e2e.js` with a new `--browser chrome\|firefox\|safari` (`cef24e6`; the Chrome, Firefox and first Safari runs used an earlier state of that change without the progress beacon and the Safari cleanup, and Chrome was then rerun on `cef24e6`, below), `scripts/whip-obs.js` unchanged, `scripts/whip-loss.py` with per-arm SRT latency (`c120d28`) |
 | Chrome | 157.0.8103.52, headless, temporary profile |
 | Firefox | 160.0, from Mozilla's release download, installed unprivileged in the user's Applications folder. `codesign --verify --deep --strict` passed; `spctl -a -vv` gave "accepted, source=Notarized Developer ID", authority "Developer ID Application: Mozilla Corporation (43AQ936H96)". The image's SHA-256 was `08e2a87f6eb4c33163e4d8ccb0cf3c0336dae99747683760d154dc7d409d3813`. Headless, temporary profile, fake media prefs from `scripts/whip-w0/browser.js` |
 | Safari | 26.6.2 through `safaridriver`, run as a LaunchAgent in the GUI session (`W0_SAFARI_AGENT=1`), default `webkit:WebRTC` capabilities (`DisableICECandidateFiltering` false), synthetic media (a 640x360 canvas and a WebAudio tone) |
@@ -61,7 +61,10 @@ reports, one
 recording per served codec epoch, decoded whole, the session ended by
 `DELETE` with nothing lost, and no token, offer address, port or publisher
 address in the trace log (20 and 26 literals checked). Loads were 18.8 at
-the start and 25.4 at the end of the pair.
+the start and 25.4 at the end of the pair. Rerun on the committed script
+(`cef24e6`) after the loss runs, at loads of 6.3: 22 of 22 and 24 of 24
+checks passed again (205 and 207 frames decoded, 0 dropped; 250 and 245
+H.264 frames recorded, 0 decode errors).
 
 ### Firefox 160
 
@@ -112,8 +115,10 @@ started, by PID.
   on the 30 s media timeout. The page never got as far as playback, so the
   stream was never ready and nothing was recorded.
 
-Reading: with the screen locked, Safari throttles and then suspends the
-hidden page, so these runs show the connection, not media. A media run needs
+Reading: with the screen locked the page was hidden, and its timers and
+media stopped, so these runs show the connection, not media. Why the first
+run sent about 8 s of audio and the later two none is not explained: the
+canvas timer and the progress beacon changed between them. A media run needs
 the host's screen unlocked (the owner's step), or another host. The
 `sudo safaridriver --enable` step was not needed.
 
@@ -141,7 +146,8 @@ dry run.
   1776 Opus frames, which FFmpeg decoded whole with no error. No NACK was
   needed (no loss on loopback).
 - **End.** `whip-obs.js` ends OBS with SIGTERM; OBS needed the second one.
-  No `DELETE` reached Sapflow, so the session had not ended when the script
+  OBS left a crash report on that exit, as on every OBS exit in W0; it was
+  not looked into. No `DELETE` reached Sapflow, so the session had not ended when the script
   stopped Sapflow 4 s later, and the recording finished `complete=false
   reason="server-stopped"`. That is the script's shutdown order, not a loss:
   the file decodes whole. Whether OBS sends `DELETE` when it is stopped from
@@ -206,8 +212,9 @@ in the earlier runs.
 
 Differences in frames, WHIP less SRT, with the reading rule of the
 qualification note (five seeds: a |t| below about 2.3 is no difference
-worth claiming). `summary.tsv` has the same figures (the `srt400` pair in
-its last two columns).
+worth claiming). `summary.tsv` has the same figures: its `minus_srt` and
+`welch_t_vs_srt` are against SRT at 200 ms, and `minus_srt400` and
+`welch_t_vs_srt400`, its last two columns, against SRT at 400 ms.
 
 | Profile | Against SRT at 200 ms | Welch t | Against SRT at 400 ms | Welch t | SRT 400 less SRT 200 | Welch t |
 |---|---|---|---|---|---|---|
@@ -228,7 +235,8 @@ SRT, retransmitted data packets counted by the proxy: at 200 ms latency
 to 647, 198 to 239 and 1171 to 1247. Sapflow's SRT receiver dropped 0 to 2,
 0 and 8 to 15 packets at 200 ms, and 0, 0 and 0 to 2 at 400 ms. As in the
 earlier runs, the reordering jitter, not the loss, makes most of the
-retransmissions at 200 ms; at 400 ms there were about a tenth as many.
+retransmissions at 200 ms; at 400 ms there were about a tenth as many at
+5%, a thirtieth at 1% and a fifth at 10%.
 Sapflow's SRT receiver waits for reordering for at most an eighth of the
 latency before it NAKs (`SAPFLOW_SRT_REORDER_WAIT_MAX_MS`), so a longer
 latency gives it longer; that this explains the drop is inferred, not
