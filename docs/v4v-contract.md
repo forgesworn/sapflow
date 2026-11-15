@@ -63,6 +63,17 @@ content-type: application/json
   sapflow still holds is not refused for memory. A refused encoder that
   retries is let in once there is room; nothing queues it. Each retry asks
   the app again.
+- While a stage's publisher is still sending, an SRT or RTMP publisher the
+  app admits for that stage makes sapflow send the live publisher's own
+  request again, with one more field, `"recheck":"holder"`, and wait up to
+  1 s for the answer. sapflow sets the field and no setting or publisher
+  can; no publisher's own request carries it. A 401 or 403, or a 2xx with
+  a different SRT passphrase, revokes the live publisher, and the newer
+  one takes the stage; a 429 or no answer in time changes nothing. The
+  credentials are ones the app admitted before, not a new attempt: answer
+  by the same rule as the original, but do not rate-limit the request,
+  count its refusal against the address, or show that refusal to the
+  stream's broadcaster as a failed attempt.
 
 ### A passphrase per SRT stream
 

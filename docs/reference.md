@@ -212,7 +212,11 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   whether the app still admits the live publisher, before its claim. If it
   sent the same user, password and protocol from the same address as the
   live publisher, the app's answer to it is the answer; otherwise the live publisher's own
-  request is sent again, and sapflow waits up to 1 s for the reply. If the
+  request is sent again, marked `"recheck":"holder"` (no other request
+  carries it), and sapflow waits up to 1 s for the reply. Its credentials
+  are ones the app admitted before, so the app should answer it by the
+  same rule but not rate-limit it, count its refusal against the address
+  or report that refusal to the broadcaster. If the
   app now refuses the live publisher's credentials (401 or 403), or hands
   out an SRT passphrase other than the one it gave it (a new one, one where
   there was none, or none where there was one), the live publisher is

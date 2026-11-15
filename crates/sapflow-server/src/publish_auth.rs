@@ -23,6 +23,15 @@
 //! bounds refuses the publisher as an app that did not answer usably would.
 //! RTMP and WHIP requests never carry the field, and their answers' headers
 //! are not read.
+//!
+//! A live publisher's own request is sent again when a newer publisher's
+//! claim would be refused while it sends ([`Recheck`]), so that rotating a
+//! stream key removes whoever holds the old one. That request also carries
+//! `"recheck":"holder"` ([`RECHECK_FIELD`]), and no other does. Its
+//! credentials are ones the app admitted before, not a new publisher's
+//! attempt, so an app should answer it as it would the original but not
+//! rate-limit it, count a refusal of it against the address, or report that
+//! refusal to the stream's broadcaster as a failed attempt.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -37,6 +46,11 @@ use crate::http_lite::Endpoint;
 /// The request field, and its value, that says this sapflow checks an SRT
 /// passphrase the app returns. Set by the binary, never by configuration.
 pub(crate) const SRT_KEY_FIELD: (&str, &str) = ("srtKey", "accepted");
+
+/// The request field, and its value, that marks a live publisher's request
+/// sent again ([`Recheck::still_admitted`]). Set by the binary, never by
+/// configuration or by a publisher.
+pub(crate) const RECHECK_FIELD: (&str, &str) = ("recheck", "holder");
 
 /// The 2xx answer's header that carries the stream's SRT passphrase.
 pub(crate) const SRT_PASSPHRASE_HEADER: &str = "sapflow-srt-passphrase";
@@ -168,11 +182,12 @@ impl Recheck {
         endpoint: &Endpoint,
         limit: Duration,
     ) -> Option<bool> {
+        let body = self.body();
         let (verdict, srt_key) = if self.offered {
-            ask_srt_key_within(endpoint, &self.req, self.from, limit).await
+            ask_srt_key_within(endpoint, &body, limit).await
         } else {
             (
-                ask_within(endpoint, &self.req, self.protocol, self.from, limit).await,
+                ask_within(endpoint, &body, self.protocol, limit).await,
                 None,
             )
         };
@@ -181,6 +196,17 @@ impl Recheck {
             Verdict::Denied | Verdict::Forbidden => Some(false),
             Verdict::Throttled | Verdict::Unavailable => None,
         }
+    }
+
+    /// The request this publisher was admitted with, marked with
+    /// [`RECHECK_FIELD`].
+    fn body(&self) -> Vec<u8> {
+        let mut value = value(&self.req, self.protocol, self.from);
+        if self.offered {
+            insert(&mut value, SRT_KEY_FIELD);
+        }
+        insert(&mut value, RECHECK_FIELD);
+        to_bytes(&value)
     }
 }
 
@@ -202,10 +228,14 @@ pub(crate) fn body(req: &PublishRequest, protocol: Protocol, from: IpAddr) -> Ve
 /// [`body`] for SRT with [`SRT_KEY_FIELD`] added.
 fn body_offering_srt_key(req: &PublishRequest, from: IpAddr) -> Vec<u8> {
     let mut value = value(req, Protocol::Srt, from);
-    if let Some(map) = value.as_object_mut() {
-        map.insert(SRT_KEY_FIELD.0.into(), SRT_KEY_FIELD.1.into());
-    }
+    insert(&mut value, SRT_KEY_FIELD);
     to_bytes(&value)
+}
+
+fn insert(value: &mut serde_json::Value, (name, field): (&str, &str)) {
+    if let Some(map) = value.as_object_mut() {
+        map.insert(name.into(), field.into());
+    }
 }
 
 fn value(req: &PublishRequest, protocol: Protocol, from: IpAddr) -> serde_json::Value {
@@ -234,17 +264,16 @@ pub(crate) async fn ask(
     protocol: Protocol,
     from: IpAddr,
 ) -> Verdict {
-    ask_within(endpoint, req, protocol, from, TIMEOUT).await
+    ask_within(endpoint, &body(req, protocol, from), protocol, TIMEOUT).await
 }
 
 async fn ask_within(
     endpoint: &Endpoint,
-    req: &PublishRequest,
+    body: &[u8],
     protocol: Protocol,
-    from: IpAddr,
     limit: Duration,
 ) -> Verdict {
-    let outcome = attempt(endpoint, &body(req, protocol, from), limit).await;
+    let outcome = attempt(endpoint, body, limit).await;
     log_outcome(protocol, &outcome);
     classify(outcome)
 }
@@ -258,22 +287,15 @@ pub(crate) async fn ask_srt_key(
     req: &PublishRequest,
     from: IpAddr,
 ) -> (Verdict, Option<CryptoConfig>) {
-    ask_srt_key_within(endpoint, req, from, TIMEOUT).await
+    ask_srt_key_within(endpoint, &body_offering_srt_key(req, from), TIMEOUT).await
 }
 
 async fn ask_srt_key_within(
     endpoint: &Endpoint,
-    req: &PublishRequest,
-    from: IpAddr,
+    body: &[u8],
     limit: Duration,
 ) -> (Verdict, Option<CryptoConfig>) {
-    let outcome = attempt_reading(
-        endpoint,
-        &body_offering_srt_key(req, from),
-        limit,
-        Some(SRT_PASSPHRASE_HEADER),
-    )
-    .await;
+    let outcome = attempt_reading(endpoint, body, limit, Some(SRT_PASSPHRASE_HEADER)).await;
     let (outcome, header) = match outcome {
         Ok((status, header)) => (Ok(status), header),
         Err(failure) => (Err(failure), HeaderRead::Absent),
@@ -733,9 +755,8 @@ mod tests {
         assert_eq!(
             ask_within(
                 &stub.endpoint,
-                &req,
+                &body(&req, Protocol::Srt, from()),
                 Protocol::Srt,
-                from(),
                 Duration::from_millis(200)
             )
             .await,
@@ -830,6 +851,62 @@ mod tests {
             .expect("WHIP admitted as before");
         assert!(again.take_srt_key().is_none());
         assert_eq!(stub.last(), mediamtx_body("webrtc"));
+    }
+
+    #[tokio::test]
+    async fn a_holders_request_is_sent_again_as_it_was_and_marked() {
+        let stub = stub::start(Answer::Password(PASSWORD)).await;
+        let rtmp =
+            PublishRequest::parse_rtmp("live", &format!("event-a?user=encoder&pass={PASSWORD}"))
+                .expect("rtmp");
+        let srt = srt(&format!("publish:live/event-a:encoder:{PASSWORD}"));
+        let cases = [
+            (
+                Recheck::new(&rtmp, Protocol::Rtmp, from(), false, None),
+                "rtmp",
+                false,
+            ),
+            (
+                Recheck::new(&srt, Protocol::Srt, from(), false, None),
+                "srt",
+                false,
+            ),
+            (
+                Recheck::new(&srt, Protocol::Srt, from(), true, None),
+                "srt",
+                true,
+            ),
+        ];
+        for (holder, protocol, offered) in cases {
+            stub.answer(Answer::Password(PASSWORD));
+            let limit = Duration::from_secs(1);
+            assert_eq!(
+                holder.still_admitted(&stub.endpoint, limit).await,
+                Some(true)
+            );
+            // The body the holder was admitted with, plus the marker.
+            let mut expected = mediamtx_body(protocol);
+            if offered {
+                expected["srtKey"] = "accepted".into();
+            }
+            expected["recheck"] = "holder".into();
+            assert_eq!(stub.last(), expected, "{protocol}, offered {offered}");
+            // A rotated key: the app refuses it, and the holder may be revoked.
+            stub.answer(Answer::Status(401));
+            assert_eq!(
+                holder.still_admitted(&stub.endpoint, limit).await,
+                Some(false)
+            );
+            assert_eq!(stub.last(), expected);
+        }
+        // The first request of any publisher never carries the marker.
+        assert_eq!(
+            ask(&stub.endpoint, &rtmp, Protocol::Rtmp, from()).await,
+            Verdict::Denied
+        );
+        assert_eq!(stub.last(), mediamtx_body("rtmp"));
+        let _ = ask_srt_key(&stub.endpoint, &srt, from()).await;
+        assert!(stub.last().get(RECHECK_FIELD.0).is_none());
     }
 
     #[tokio::test]
