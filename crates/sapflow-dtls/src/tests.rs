@@ -1671,6 +1671,233 @@ fn cookie_exchange() {
     );
 }
 
+fn cookie_pair() -> Pair {
+    let config = Config {
+        hello_verify: true,
+        ..Config::default()
+    };
+    pair_with(Options::default(), config, None)
+}
+
+/// A copy of a one-record hello datagram with its `message_seq` and record
+/// sequence number replaced, as an injector would send it.
+fn reseq(gram: &[u8], seq: u16, rseq: u64) -> Vec<u8> {
+    let mut g = gram.to_vec();
+    g[5..11].copy_from_slice(&rseq.to_be_bytes()[2..]);
+    g[17..19].copy_from_slice(&seq.to_be_bytes());
+    g
+}
+
+/// The number of HelloVerifyRequest messages in `grams`.
+fn hello_verifies(grams: &[Vec<u8>]) -> usize {
+    flight_types(grams)
+        .iter()
+        .filter(|&&t| t == message::HELLO_VERIFY_REQUEST)
+        .count()
+}
+
+/// The genuine hello at `p.now`, its HelloVerifyRequest delivered, and the
+/// client's cookie-bearing hello held back.
+fn hello_verify_and_held_cookie_hello(p: &mut Pair) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let hello = p.client.start();
+    assert_eq!(hello.len(), 1, "one datagram");
+    p.feed(&hello).expect("hello");
+    let hvr = p.drain();
+    assert_eq!(hello_verifies(&hvr), 1);
+    let mut back = Vec::new();
+    for d in &hvr {
+        back.extend(p.client.handle(d).expect("client"));
+    }
+    (hello, back)
+}
+
+/// Delivers the client's cookie-bearing hello, then a retransmission of it
+/// a second later, and runs the rest of the handshake, which must complete
+/// with one signature, one ECDH and one verification.
+fn cookie_hello_completes(p: &mut Pair, cookie_hello: &[Vec<u8>], name: &str) {
+    p.feed(cookie_hello).expect("cookie hello");
+    let first = p.drain();
+    p.now += Duration::from_secs(1);
+    p.feed(cookie_hello).expect("retransmitted cookie hello");
+    let again = p.drain();
+    // The client takes one copy of flight 4.
+    let mut to_client = if first.is_empty() { again } else { first };
+    assert!(
+        flight_types(&to_client).contains(&message::SERVER_HELLO),
+        "{name}: the cookie hello is answered with flight 4"
+    );
+    for _ in 0..4 {
+        let mut to_server = Vec::new();
+        for d in &to_client {
+            to_server.extend(p.client.handle(d).expect("client"));
+        }
+        if to_server.is_empty() {
+            break;
+        }
+        p.feed(&to_server).expect("client flight");
+        to_client = p.drain();
+    }
+    assert!(p.client.connected(), "the client verified our Finished");
+    assert_eq!(p.server.state(), State::Connected);
+    let c = p.connected();
+    assert_eq!(
+        c.keying_material.as_bytes(),
+        p.client
+            .keying_material
+            .as_deref()
+            .expect("client keys")
+            .as_slice()
+    );
+    crypto_once(p);
+}
+
+/// A4.4 review, round 6 (finding 12): with the cookie exchange on, a hello
+/// whose cookie is missing or wrong was answered with a HelloVerifyRequest
+/// and then moved the expected `message_seq` past it, as an accepted hello
+/// would. An injector that sent a copy of the genuine first hello as seq 1
+/// before the client's cookie-bearing hello 1 arrived took seq 1; with that
+/// extra HelloVerifyRequest lost, the genuine hello 1 was old, did not
+/// repeat the injected one, and was ignored until the caller's deadline.
+/// Each variant here is held, injected and discarded the same way: an
+/// empty-cookie copy at seq 1, another hello with a wrong cookie at seq 1,
+/// copies at seq 1 and 2 (and at 2 and 3) ahead of the genuine one, and
+/// copies spending the rest of the HelloVerifyRequest budget.
+#[test]
+fn an_invalid_cookie_hello_does_not_take_the_cookie_hellos_seq() {
+    type Inject = fn(&[u8]) -> Vec<Vec<u8>>;
+    let variants: [(&str, Inject); 5] = [
+        ("empty cookie at seq 1", |h| vec![reseq(h, 1, 40)]),
+        ("wrong cookie at seq 1", |_| {
+            let body = Options::default().hello_body(&[7; 32], &[0xee; 32]);
+            vec![fragment_record(1, 1, body.len() as u32, 0, &body, 40)]
+        }),
+        ("seq 1 and 2", |h| vec![reseq(h, 1, 40), reseq(h, 2, 41)]),
+        ("seq 2 and 3", |h| vec![reseq(h, 2, 40), reseq(h, 3, 41)]),
+        ("the rest of the budget", |h| {
+            (1..6).map(|s| reseq(h, s, 40 + u64::from(s))).collect()
+        }),
+    ];
+    for (name, inject) in variants {
+        let mut p = cookie_pair();
+        let (hello, cookie_hello) = hello_verify_and_held_cookie_hello(&mut p);
+        let injected = inject(&hello[0]);
+        let mut extra = 0;
+        for d in &injected {
+            p.feed(std::slice::from_ref(d)).expect(name);
+            extra += hello_verifies(&p.drain());
+        }
+        assert!(extra <= injected.len(), "{name}: at most one answer each");
+        assert_eq!(p.server.stats().signatures, 0, "{name}");
+        p.now += Duration::from_millis(300);
+        cookie_hello_completes(&mut p, &cookie_hello, name);
+    }
+}
+
+/// A retransmitted first hello, now reassembled afresh rather than seen as
+/// old, still only repeats the same HelloVerifyRequest, spaced and within
+/// the flight's six sends, and spends none of the budget of answers.
+#[test]
+fn a_retransmitted_first_hello_repeats_one_hello_verify_request() {
+    let mut p = cookie_pair();
+    let hello = p.client.start();
+    p.feed(&hello).expect("hello");
+    let first = p.drain();
+    assert_eq!(hello_verifies(&first), 1);
+    p.feed(&hello).expect("too soon");
+    assert!(p.drain().is_empty());
+    let mut sent = 1;
+    for _ in 0..20 {
+        p.now += Duration::from_secs(1);
+        p.feed(&hello).expect("repeat");
+        let again = p.drain();
+        if !again.is_empty() {
+            assert_eq!(flight_types(&again), flight_types(&first));
+            assert_ne!(again, first, "new record numbers");
+        }
+        sent += hello_verifies(&again);
+    }
+    assert_eq!(sent, 6, "max_transmissions sends of one flight");
+    let mut back = Vec::new();
+    for d in &first {
+        back.extend(p.client.handle(d).expect("client"));
+    }
+    cookie_hello_completes(&mut p, &back, "");
+}
+
+/// A forged first hello at seq 0, here another client's, answered before
+/// the genuine one arrives, no longer leaves the genuine hello at seq 0 old
+/// and unanswered: it gets its own HelloVerifyRequest.
+#[test]
+fn a_forged_first_hello_does_not_exclude_the_genuine_one() {
+    let mut p = cookie_pair();
+    let mut other = Client::new(Options::default(), testing::identity(2), 99);
+    p.feed(&other.start()).expect("forged hello");
+    assert_eq!(hello_verifies(&p.drain()), 1);
+    let (_, cookie_hello) = hello_verify_and_held_cookie_hello(&mut p);
+    cookie_hello_completes(&mut p, &cookie_hello, "");
+}
+
+/// Injected hellos whose HelloVerifyRequests reach the client make it send
+/// a fresh cookie hello one seq further each time (RFC 6347 section 4.2.1).
+/// After the whole budget of six, the client's hello at seq 6 is still in
+/// reach and completes; no HelloVerifyRequest is ever sent for a seq whose
+/// answer could not be.
+#[test]
+fn a_client_moved_on_by_every_hello_verify_request_still_completes() {
+    let mut p = cookie_pair();
+    let (hello, mut cookie_hello) = hello_verify_and_held_cookie_hello(&mut p);
+    for seq in 1..6u16 {
+        p.now += Duration::from_millis(300);
+        p.feed(&[reseq(&hello[0], seq, 40 + u64::from(seq))])
+            .expect("injected");
+        let hvr = p.drain();
+        assert_eq!(hello_verifies(&hvr), 1, "seq {seq}");
+        cookie_hello = Vec::new();
+        for d in &hvr {
+            cookie_hello.extend(p.client.handle(d).expect("client"));
+        }
+    }
+    assert_eq!(p.client.hello_verify_requests, 6);
+    let seq = u16::from_be_bytes([cookie_hello[0][17], cookie_hello[0][18]]);
+    assert_eq!(seq, 6);
+    // A seventh injection is past the budget and unanswered.
+    p.feed(&[reseq(&hello[0], 6, 60)]).expect("injected");
+    assert!(p.drain().is_empty());
+    p.now += Duration::from_millis(300);
+    cookie_hello_completes(&mut p, &cookie_hello, "");
+}
+
+/// The last seq in reach is never answered with a HelloVerifyRequest,
+/// whose follow-up would be out of reach, and nothing past it is kept.
+#[test]
+fn no_hello_verify_request_for_a_seq_whose_answer_is_out_of_reach() {
+    let mut p = cookie_pair();
+    for seq in [7u16, 6] {
+        let body = Options::default().hello_body(&[7; 32], &[]);
+        let d = fragment_record(1, seq, body.len() as u32, 0, &body, u64::from(seq));
+        p.feed(&[d]).expect("hello");
+        assert!(p.drain().is_empty(), "seq {seq}");
+    }
+    assert_eq!(p.server.buffered(), 0);
+    let (_, cookie_hello) = hello_verify_and_held_cookie_hello(&mut p);
+    cookie_hello_completes(&mut p, &cookie_hello, "");
+}
+
+/// While a valid cookie is awaited, hellos are taken at any seq in reach,
+/// so forged incomplete hellos at other seqs must not hold the buffer
+/// against the cookie hello: it takes their room at once.
+#[test]
+fn forged_hellos_at_other_seqs_do_not_hold_the_buffer() {
+    let mut p = cookie_pair();
+    let (_, cookie_hello) = hello_verify_and_held_cookie_hello(&mut p);
+    for (i, (seq, length)) in [(2u16, 8190u32), (3, 8191)].into_iter().enumerate() {
+        let d = fragment_record(1, seq, length, 0, &[1], 40 + i as u64);
+        assert_eq!(p.feed(&[d]), Ok(()));
+    }
+    assert!(p.server.buffered() > 16384 - 2048, "the buffer is full");
+    cookie_hello_completes(&mut p, &cookie_hello, "");
+}
+
 #[test]
 fn config_ranges() {
     let ok = Config::default();

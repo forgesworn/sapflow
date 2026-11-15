@@ -50,6 +50,21 @@ pub const MAX_EXPECTED_FINGERPRINTS: usize = 4;
 /// Messages past the next expected one that reassembly buffers. The
 /// client's longest flight is four handshake messages.
 const AHEAD: u16 = 4;
+
+/// The reassembly window: [`AHEAD`], or with the cookie exchange on, room
+/// for every seq a hello can have before a valid cookie. Each
+/// HelloVerifyRequest can move the client one seq on (RFC 6347 section
+/// 4.2.1 has it answer each with a new hello), so after
+/// [`Config::max_transmissions`] of them its hello can be that far on.
+fn window(config: &Config) -> u16 {
+    if config.hello_verify {
+        let hellos = u16::try_from(config.max_transmissions).unwrap_or(u16::MAX);
+        AHEAD.max(hellos.saturating_add(1))
+    } else {
+        AHEAD
+    }
+}
+
 /// The shortest ClientHello `ClientHello::parse` accepts: version, random,
 /// empty session id and cookie, one cipher suite and one compression
 /// method.
@@ -310,6 +325,10 @@ struct Handshake {
 enum Taken {
     /// Accepted: the handshake moves on to the next message.
     Accepted,
+    /// A hello without a valid cookie, answered with a HelloVerifyRequest.
+    /// It commits nothing: the hello expected is still one with a valid
+    /// cookie, at any seq in reach.
+    Answered,
     /// Refused without ending the handshake: it is unauthenticated, so a
     /// forger could have sent it, and the genuine message may follow.
     Refused(Error),
@@ -442,13 +461,16 @@ impl Server {
             max_message: config.max_message_len,
             max_fragments: config.max_fragments,
             max_buffered: config.max_buffered,
-            ahead: AHEAD,
+            ahead: window(&config),
             // A finite burst of forged candidates gives way once it is a
             // retransmission interval old, in time for the client's
             // retransmission.
             expire_after: Some(config.initial_retransmit),
             reclaim_every: Some(config.initial_retransmit),
         };
+        let mut reassembler = Reassembler::new(limits);
+        // Until a hello has a valid cookie, each hello stands alone.
+        reassembler.set_unordered(config.hello_verify);
         Ok(Self {
             interval: config.initial_retransmit,
             config,
@@ -457,7 +479,7 @@ impl Server {
             entropy,
             cookie_secret: None,
             phase: Phase::Hello { hello_verifies: 0 },
-            reassembler: Reassembler::new(limits),
+            reassembler,
             hs: None,
             read: None,
             replay: ReplayWindow::default(),
@@ -876,9 +898,10 @@ impl Server {
     /// the message the handshake expects there, checked before anything is
     /// kept for it: its type, its epoch, and a length its parser could
     /// accept. Each seq holds one message: a ClientHello at the next seq
-    /// while no hello has been answered, then flight 5 after the hello we
-    /// answered (Certificate, ClientKeyExchange and CertificateVerify at
-    /// epoch 0, then Finished, which is valid only under the read keys).
+    /// while no hello has been answered (at any seq in the window while a
+    /// valid cookie is awaited), then flight 5 after the hello we answered
+    /// (Certificate, ClientKeyExchange and CertificateVerify at epoch 0,
+    /// then Finished, which is valid only under the read keys).
     /// The error says why not, for a fragment under the read keys.
     fn admit(&self, epoch: u16, f: &message::Fragment<'_>) -> Result<(), Error> {
         let length = usize::try_from(f.length).map_err(|_| Error::Limit(Limit::MessageSize))?;
@@ -886,7 +909,9 @@ impl Server {
             return Err(Error::Limit(Limit::MessageSize));
         }
         let (msg_type, at_epoch, lengths) = match (&self.phase, &self.hs) {
-            (Phase::Hello { .. }, _) if f.seq == self.reassembler.next_seq() => {
+            (Phase::Hello { .. }, _)
+                if f.seq == self.reassembler.next_seq() || self.reassembler.unordered() =>
+            {
                 (message::CLIENT_HELLO, 0, HELLO_MIN..=usize::MAX)
             }
             (Phase::Flight5 { .. }, Some(hs)) => match f.seq.checked_sub(hs.hello_seq) {
@@ -909,13 +934,25 @@ impl Server {
 
     /// Hands complete messages to the state machine in order. One it
     /// refuses is discarded on its own: the seq stays, and so do its other
-    /// candidates, so the genuine message can still be taken.
+    /// candidates, so the genuine message can still be taken. While a valid
+    /// cookie is awaited, each hello stands alone: one answered with a
+    /// HelloVerifyRequest leaves the expected seq where it was, and the
+    /// hello with a valid cookie sets it, whatever seq it has.
     fn release(&mut self, now: Instant, record_seq: u64) -> Result<(), Error> {
         while let Some(m) = self.reassembler.take() {
+            let seq = m.seq;
             match self.message(now, record_seq, m)? {
+                Taken::Answered => self.refused = None,
                 Taken::Accepted => {
                     self.refused = None;
-                    self.reassembler.advance();
+                    if self.reassembler.unordered() {
+                        // Only hellos are kept before one is accepted.
+                        self.reassembler.set_unordered(false);
+                        self.reassembler
+                            .restart_at(seq.checked_add(1).ok_or(Error::Internal)?);
+                    } else {
+                        self.reassembler.advance();
+                    }
                     if !self.handshaking() {
                         // Nothing buffered can be valid after the handshake.
                         self.reassembler.restart_at(self.reassembler.next_seq());
@@ -1013,12 +1050,32 @@ impl Server {
         if self.config.hello_verify {
             let cookie = self.cookie(&hello)?;
             if !bool::from(hello.cookie.ct_eq(&cookie)) {
+                // A missing or wrong cookie is treated alike (RFC 6347
+                // section 4.2.1), and commits nothing.
                 let Phase::Hello { hello_verifies, .. } = self.phase else {
                     return Err(Error::Internal);
                 };
+                if self
+                    .answered
+                    .as_ref()
+                    .is_some_and(|(seq, body)| *seq == m.seq && *body == m.body)
+                {
+                    // A retransmission of the hello we last answered: the
+                    // same HelloVerifyRequest again, spaced and within the
+                    // flight's budget.
+                    self.resend(now)?;
+                    return Ok(Taken::Answered);
+                }
                 if hello_verifies >= self.config.max_transmissions {
                     // No more answers: refused, and sends nothing.
                     return Ok(Taken::Refused(Error::Limit(Limit::HelloVerify)));
+                }
+                // The client's answer has the next seq, which must be in
+                // reach.
+                let last =
+                    u32::from(self.reassembler.next_seq()) + u32::from(window(&self.config)) - 1;
+                if u32::from(m.seq) >= last {
+                    return Ok(Taken::Refused(Error::Limit(Limit::Sequence)));
                 }
                 self.phase = Phase::Hello {
                     hello_verifies: hello_verifies + 1,
@@ -1034,7 +1091,7 @@ impl Server {
                 });
                 self.transmissions = 0;
                 self.send_flight(now)?;
-                return Ok(Taken::Accepted);
+                return Ok(Taken::Answered);
             }
         }
         self.server_flight(now, &m, &hello, negotiated)?;

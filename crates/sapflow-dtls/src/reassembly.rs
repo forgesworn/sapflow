@@ -161,6 +161,10 @@ pub(crate) struct Reassembler {
     /// When room was last taken from younger candidates for an
     /// unauthenticated newcomer.
     last_reclaim: Option<Instant>,
+    /// Whether a complete candidate at any seq in the window is released,
+    /// not only one at `next_seq` (the server's hellos while it awaits a
+    /// valid cookie, each of which stands alone).
+    unordered: bool,
 }
 
 impl Reassembler {
@@ -171,7 +175,20 @@ impl Reassembler {
             partials: Vec::new(),
             buffered: 0,
             last_reclaim: None,
+            unordered: false,
         }
+    }
+
+    /// Whether [`Reassembler::take`] releases a complete candidate at any
+    /// seq in the window, the first started, rather than only at
+    /// `next_seq`. Every seq in the window then counts as the next one when
+    /// room is reclaimed for a newcomer.
+    pub(crate) fn set_unordered(&mut self, unordered: bool) {
+        self.unordered = unordered;
+    }
+
+    pub(crate) fn unordered(&self) -> bool {
+        self.unordered
     }
 
     /// The next `message_seq` expected.
@@ -184,8 +201,9 @@ impl Reassembler {
         self.buffered
     }
 
-    /// Restarts at `seq`, dropping anything in progress (used after a
-    /// HelloVerifyRequest, when the next ClientHello has a higher seq).
+    /// Restarts at `seq`, dropping anything in progress (used after the
+    /// handshake, by the test client after a HelloVerifyRequest, and by the
+    /// server once it accepts a hello with a valid cookie).
     pub(crate) fn restart_at(&mut self, seq: u16) {
         self.next_seq = seq;
         self.partials.clear();
@@ -405,16 +423,18 @@ impl Reassembler {
     /// Which candidate gives up its room to a newcomer for `seq`: a
     /// speculative one for a later seq first, latest first, if the newcomer
     /// is the next message (or authenticated) and the buffer is what is
-    /// short; then the oldest for the newcomer's own seq.
+    /// short; then the oldest for the newcomer's own seq. Unordered, every
+    /// seq is the next one, and a candidate for any other seq can give way.
     fn victim(&self, seq: u16, authenticated: bool) -> Option<usize> {
         let eligible = |p: &Partial| p.unauthenticated() && (authenticated || !p.complete());
         let slots_full = self.variants(seq) >= MAX_VARIANTS;
-        if !slots_full && (seq == self.next_seq || authenticated) {
+        let other = |p: &Partial| p.seq > seq || (self.unordered && p.seq != seq);
+        if !slots_full && (seq == self.next_seq || authenticated || self.unordered) {
             let later = self
                 .partials
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.seq > seq && eligible(p))
+                .filter(|(_, p)| other(p) && eligible(p))
                 .max_by_key(|&(i, p)| (p.seq, i))
                 .map(|(i, _)| i);
             if later.is_some() {
@@ -432,12 +452,13 @@ impl Reassembler {
     /// The next message, if a candidate for it is complete: of several, the
     /// one started first. It is removed, but the seq stays, with its other
     /// candidates, until [`Reassembler::advance`]; a caller that refuses it
-    /// takes again.
+    /// takes again. Unordered, the first started complete candidate at any
+    /// seq, and `next_seq` stays where it is.
     pub(crate) fn take(&mut self) -> Option<Message> {
         let i = self
             .partials
             .iter()
-            .position(|p| p.seq == self.next_seq && p.complete())?;
+            .position(|p| (self.unordered || p.seq == self.next_seq) && p.complete())?;
         // `remove`, not `swap_remove`: candidates stay in the order they
         // were started, so a later forgery cannot overtake an earlier one.
         let p = self.partials.remove(i);
