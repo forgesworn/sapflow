@@ -39,9 +39,17 @@ cp "$built" "$work/udp_server-hello-verify"
 fp=$("$openssl" x509 -in "$work/client.pem" -noout -fingerprint -sha256 | sed 's/^.*=//')
 seed=5361706c6f77445444534f70656e53534c496e7465726f7000000000000000${port: -2}
 status=0
-# Without the feature, cookie mode cannot be turned on.
-if "$work/udp_server" --hello-verify >/dev/null 2>&1; then
-  echo "the default build accepted --hello-verify"; status=1
+# Without the feature, cookie mode cannot be turned on: the default build
+# refuses --hello-verify with exit status 2 before reading anything else.
+rc=0
+"$work/udp_server" --hello-verify >/dev/null 2>&1 || rc=$?
+if [ "$rc" != 2 ]; then
+  echo "the default build did not refuse --hello-verify (exit $rc)"; status=1
+fi
+rc=0
+"$work/udp_server-hello-verify" --hello-verify >/dev/null 2>&1 || rc=$?
+if [ "$rc" = 2 ]; then
+  echo "the hello-verify build refused --hello-verify"; status=1
 fi
 run() {
   local name=$1 profiles=$2 len=$3; shift 3
