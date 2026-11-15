@@ -1852,14 +1852,14 @@ Implementation notes (11 November 2026):
     triggers shared the timer's six-send budget, so five repeats of the
     accepted hello at 200 ms spacing made the timer fail the handshake at
     about 2 s, refusing a genuine client flight at 3 s (a buggy peer can do
-    this too). It is fixed in `d9ca78e` with tests that failed before the
+    this too). It is fixed in `9bea2ac` with tests that failed before the
     fix, and round 6 (on `c3c66f2`) found it closed. Round 5 also
     re-confirmed the residuals and the dependency pins. Round 6 found one
     more (finding 12): with the cookie exchange on, which WHIP never turns
     on, a hello with a missing or wrong cookie moved the expected seq on
     after its HelloVerifyRequest, so an injected hello at the seq of the
     client's cookie-bearing hello, with its HelloVerifyRequest lost, kept
-    the genuine one out until the deadline. It is fixed in `5e4bee1` with
+    the genuine one out until the deadline. It is fixed in `ad0d3ee` with
     tests that failed before the fix, and round 7 (on `cc3c154`) found it
     closed. Round 6 re-confirmed the residuals and the dependency pins, and
     independently recomputed the eight RFC 5705 exporter results; round 7
@@ -2692,10 +2692,10 @@ that the inbound queue's back-pressure stays with the slow reader.
     November 2026 are to be fixed before WHIP faces users, are fixed in
     `355e2ab`, `004282e`, `1204189` and `74513ab`, and round 5 found them
     closed. Round 5's one finding (P2, a shared retransmission budget that
-    brought the handshake timeout forward) is fixed in `d9ca78e`, and round
+    brought the handshake timeout forward) is fixed in `9bea2ac`, and round
     6 found it closed. Round 6's one finding (P2, a hello without a valid
     cookie that moved the expected seq on, with the cookie exchange on) is
-    fixed in `5e4bee1`, and round 7 found it closed. Round 7 found two
+    fixed in `ad0d3ee`, and round 7 found it closed. Round 7 found two
     more P2s (13 and 14), both in the cookie exchange only. The owner
     decided on 15 November 2026 that A4.4 covers `sapflow-dtls` as WHIP
     builds it, without the experimental, off-by-default `hello-verify`
