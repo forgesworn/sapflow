@@ -12,7 +12,7 @@
 //! Each stream has:
 //!
 //! - a bounded reorder buffer that releases packets in sequence order,
-//!   waits up to the jitter deadline (`SAPFLOW_WHIP_JITTER`, 200 ms by
+//!   waits up to the jitter deadline (`SAPFLOW_WHIP_JITTER`, 400 ms by
 //!   default) for a gap, then declares it lost and moves on;
 //! - generic NACKs (RFC 4585 section 6.2.1) for the gaps, after a short
 //!   reorder delay, repeated every RTT and a quarter until the jitter
@@ -126,7 +126,8 @@ impl Default for ReportConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiverConfig {
     /// Longest wait for a missing packet before it is declared lost
-    /// (`SAPFLOW_WHIP_JITTER`). Default 200 ms.
+    /// (`SAPFLOW_WHIP_JITTER`). Default 400 ms, the owner's decision of
+    /// 15 November 2026 on A4.1's retest (200 ms before).
     pub jitter: Duration,
     /// How long a gap may be plain reordering before it is NACKed, and
     /// how long the first packets are held in case earlier ones arrive
@@ -187,7 +188,7 @@ pub struct ReceiverConfig {
 impl Default for ReceiverConfig {
     fn default() -> Self {
         Self {
-            jitter: Duration::from_millis(200),
+            jitter: Duration::from_millis(400),
             reorder_delay: Duration::from_millis(10),
             max_packets: 1024,
             max_bytes: 1_536_000,

@@ -16,9 +16,10 @@
 //! keeps are its own to clear.
 //!
 //! The replay window defaults to 1024 packets (RFC 3711's minimum is 64).
-//! Sapflow waits up to 200 ms for a NACKed retransmission, and a sender
-//! without RTX (OBS) resends on the original SSRC and index; at 5 Mbit/s
-//! that is a hundred or more packets back. An index never received inside
+//! Sapflow waits up to 400 ms (its default) for a NACKed retransmission,
+//! and a sender without RTX (OBS) resends on the original SSRC and index;
+//! at 5 Mbit/s that is two hundred or more packets back. With 1200-byte
+//! packets the window covers the wait up to about 24 Mbit/s. An index never received inside
 //! the window is accepted; a duplicate of a received one is refused.
 //!
 //! Stream slots are bounded and never freed: [`Config::max_streams`] (8 by

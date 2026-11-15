@@ -1097,7 +1097,13 @@ fn routing_binds_ssrcs_and_refuses_strangers() {
 
 #[test]
 fn keyframe_requests_are_scheduled_and_rate_limited() {
-    let mut r = video_only(no_hold(), false);
+    // A 200 ms wait, so that the loss below is declared within 500 ms of
+    // the last request and the rate limit shows.
+    let cfg = ReceiverConfig {
+        jitter: Duration::from_millis(200),
+        ..no_hold()
+    };
+    let mut r = video_only(cfg, false);
     let p_frame = [0x41, 0x9a, 1];
     feed(&mut r, 0, &pkt(96, 7, 1, 0, true, &p_frame)).expect("taken");
     // At once on the first packet; the P frame is skipped.
@@ -1316,11 +1322,11 @@ fn opus_fill_cannot_be_amplified_by_timestamps() {
         }
     }
     // Each packet, and at most a discontinuity before it; fill within the
-    // 200 ms allowance.
+    // 400 ms allowance.
     assert!(events <= 2 * 1023, "{events} events");
-    assert!(fill <= 9_600, "{fill} samples filled");
+    assert!(fill <= 19_200, "{fill} samples filled");
     assert!(
-        bytes <= 2 * 1023 + 9_600 / 120 * 3,
+        bytes <= 2 * 1023 + 19_200 / 120 * 3,
         "{bytes} bytes of frames"
     );
 }
@@ -1400,8 +1406,8 @@ fn keyframes_can_be_asked_for_before_media() {
 }
 
 /// The review's case: 1000 packets a second; 500 and 501 are lost and
-/// NACKed, and their retransmissions arrive 349 packets behind, after
-/// the deadline. They are late, never a restart.
+/// NACKed, and their retransmissions arrive 499 packets behind, after
+/// the 400 ms deadline. They are late, never a restart.
 fn late_retransmissions(rtx: bool) {
     let mut r = video_only(no_hold(), rtx);
     let slice = [0x41, 0x9a, 1];
@@ -1413,7 +1419,7 @@ fn late_retransmissions(rtx: bool) {
             let d = pkt(96, 7, seq, u32::from(seq) * 90, true, &slice);
             feed(&mut r, u64::from(seq), &d).expect("taken");
         }
-        if seq == 850 {
+        if seq == 1000 {
             for osn in [500u16, 501] {
                 let d = if rtx {
                     let mut payload = osn.to_be_bytes().to_vec();
@@ -1422,7 +1428,7 @@ fn late_retransmissions(rtx: bool) {
                 } else {
                     pkt(96, 7, osn, u32::from(osn) * 90, true, &slice)
                 };
-                late.push((osn, feed(&mut r, 850, &d).expect("taken").1));
+                late.push((osn, feed(&mut r, 1000, &d).expect("taken").1));
             }
         }
         events.extend(std::iter::from_fn(|| r.poll_event()));
@@ -1461,9 +1467,11 @@ mod timing;
 
 #[test]
 fn loss_wait_and_nack_repeat_defaults() {
-    // A4.1 measured these; the experimental settings leave them as they are.
+    // The wait is the owner's A4.1 choice of 15 November 2026; unset, the
+    // A4.1 settings leave these as they are.
     let c = ReceiverConfig::default();
-    assert_eq!(c.jitter, Duration::from_millis(200));
+    assert_eq!(c.jitter, Duration::from_millis(400));
+    assert_eq!(c.opus.allowance, 19_200, "the wait, in 48 kHz samples");
     assert_eq!(c.nack_repeat, None, "the RTT and a quarter");
     assert_eq!(c.max_nacks, 4);
     assert_eq!(c.reorder_delay, Duration::from_millis(10));
