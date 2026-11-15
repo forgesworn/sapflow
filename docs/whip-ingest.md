@@ -1783,8 +1783,8 @@ Implementation notes (11 November 2026):
     but cannot be used, a failed signature verification and anything under
     the read keys still end the handshake at once.
 
-    Forged epoch 0 input can still do two things. Each is to be accepted as
-    inherent, pending the owner's written acceptance for A4.4:
+    Forged epoch 0 input can still do two things. The owner accepted each
+    as inherent in writing for A4.4 on 15 November 2026:
     - **Plausible substitution.** A plausible substituted ClientHello,
       ClientKeyExchange or CertificateVerify that reaches the state machine
       before the genuine one spends the one signature, ECDH or verification
@@ -1804,7 +1804,9 @@ Implementation notes (11 November 2026):
     default; and a ClientHello at the top of the record sequence space
     exhausting the server's outgoing sequence after it has signed (a buggy
     peer can do this too). The crate README describes each. So a finite
-    burst can still hold a handshake until the deadline. See
+    burst can still hold a handshake until the deadline. The owner decided
+    on 15 November 2026 that these four are to be fixed before WHIP faces
+    users. See
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 
     W3 limits the damage:
@@ -2614,19 +2616,22 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
-  - Status, 12 November 2026: **not met yet.** Reviewed in four rounds,
+  - Status, 15 November 2026: **not met yet.** Reviewed in four rounds,
     recorded in
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
     The findings of rounds 1 to 3 are fixed. Round 4's four
-    handshake-availability findings are open. The residuals the record
-    states as inherent await the owner's written acceptance.
+    handshake-availability findings are open, and the owner decided on 15
+    November 2026 that they are to be fixed before WHIP faces users. The
+    owner accepted the residuals the record states as inherent in writing
+    on 15 November 2026.
 
 ### Qualification status (12 November 2026)
 
 Evidence: [whip-qualification-2026-11-12.md](whip-evidence/whip-qualification-2026-11-12.md)
 (first round) and
 [whip-qualification-2-2026-11-12.md](whip-evidence/whip-qualification-2-2026-11-12.md)
-(second round, with the owner's written decisions of that day), on the test
+(second round, with the owner's written decisions of 12 and 15 November
+2026), on the test
 host (Apple M4, macOS 26.6.2), headless Chrome 157, OBS 32.0.4 and FFmpeg 8.1.
 
 | Claim | Test | Status |
@@ -2635,8 +2640,8 @@ host (Apple M4, macOS 26.6.2), headless Chrome 157, OBS 32.0.4 and FFmpeg 8.1.
 | A3.9: `scripts/smoke.sh` covers WHIP alongside SRT and RTMP | `scripts/smoke.sh` (`whip_smoke`): FFmpeg's WHIP muxer publishes; 401 for a missing and a wrong token, the token not logged; LL-HLS with H.264 and Opus decodes; publish callback; `DELETE` ends the session, unpublish callback, the recording decodes. CI installs a pinned static FFmpeg 8.1.3 for it (`SMOKE_WHIP_FFMPEG`) | **Met**, locally and in CI (PR #81, merged as `9a6092c`: the pinned FFmpeg passed its SHA-256 check and the three WHIP checks passed) |
 | A3.10: whether OBS answers PLI with a keyframe | `scripts/whip-obs.js`, a dedicated OBS profile restored after each run; keyframe requests and arrivals from the server's debug log; OBS's own interval set to 10 s (7 s once), PLI every 2 s or none (control) | Recorded: **no**. OBS's keyframes followed its own interval (9.95 to 10.04 s apart, or 7.0) in every run, whether asked every 2 s or not. It answers NACKs, resending on the original SSRC (1495 repeats at 5% loss), so it does read Sapflow's RTCP. With 10 s keyframes and 5% loss, a frame NACKs could not repair cost up to 10 s of video |
 | A3.10: whether OBS changes its sending rate on REMB or receiver reports | `scripts/whip-obs.js` with a server built `--features test-feedback` and armed by `SAPFLOW_TEST_WHIP_FEEDBACK`: reports claiming 25% loss, or REMB at 500 kbit/s (answering `goog-remb`), from 20 s; headless Chrome (`scripts/whip-rate.js`) as the control | Recorded: **no** on either. OBS stayed at 2.50 to 2.53 Mbit/s; the same stimuli took Chrome's target to 30 and to 416 kbit/s within 2 s |
-| A4.1: no more frames unrecovered than SRT at the same wait and latency, on the same loss | `scripts/whip-loss.py` through `srt-loss-proxy` (the owner's decision): 1%, 5% and 10% random loss, 0 to 20 ms jitter, 30 ms each way, five seeds; SRT latency and WHIP's wait both 200 ms; Chrome 157 as the WHIP publisher, since FFmpeg's WHIP muxer does not retransmit | **Not met** at 5%: 83.0 frames unrecovered against SRT's 6.8 (t 9.73). At 1%, 9.4 against 2.0 (t 1.28, no difference worth claiming); at 10%, 50.8 against 130.8 by count but 19.8% against 14.5% of the frames each sent (Chrome cut its frame rate). WHIP was left with 3 to 9 packets its NACKs did not repair at 5%, SRT with 0 or 1. Not the jitter: without it, 48.0 against 6.0 (t 7.35), and with jitter that keeps order, 165.0 against 42.0 (t 8.34); the jitter's reordering is what made libsrt's 6700 retransmissions. A decision point for the default `SAPFLOW_WHIP_JITTER` and the NACK schedule |
-| A4.2: CPU and memory per WHIP publisher no higher than SRT's | `scripts/whip-cost.py` (benchmarks.md section B for SRT, RTMP and WHIP; 1, 10 and 50 publishers, three rounds; the verdict rule fixed before the numbers), on macOS, then again in a Linux container (`scripts/whip-cost-linux.sh`) | Memory: the owner accepts WHIP's (about 1 MB a stream over SRT) in writing, 12 November 2026. CPU, in a Linux container (27 of 27 runs, none skipped): WHIP/SRT per stream 0.74 to 0.84 at 1 stream and 0.83 to 0.96 at 50, so **met** there; at 10 streams 0.75, 0.83 and 1.11, so the rounds disagree and the call is the owner's. WHIP was below SRT in 8 of 9 rounds |
+| A4.1: no more frames unrecovered than SRT at the same wait and latency, on the same loss | `scripts/whip-loss.py` through `srt-loss-proxy` (the owner's decision): 1%, 5% and 10% random loss, 0 to 20 ms jitter, 30 ms each way, five seeds; SRT latency and WHIP's wait both 200 ms; Chrome 157 as the WHIP publisher, since FFmpeg's WHIP muxer does not retransmit | **Not met** at 5%: 83.0 frames unrecovered against SRT's 6.8 (t 9.73). At 1%, 9.4 against 2.0 (t 1.28, no difference worth claiming); at 10%, 50.8 against 130.8 by count but 19.8% against 14.5% of the frames each sent (Chrome cut its frame rate). WHIP was left with 3 to 9 packets its NACKs did not repair at 5%, SRT with 0 or 1. Not the jitter: without it, 48.0 against 6.0 (t 7.35), and with jitter that keeps order, 165.0 against 42.0 (t 8.34); the jitter's reordering is what made libsrt's 6700 retransmissions. Parked by the owner on 15 November 2026: NACK repeats sooner than every 1.25 round trips at the same wait, and a 400 ms wait, are to be measured at 5% loss before WHIP faces users |
+| A4.2: CPU and memory per WHIP publisher no higher than SRT's | `scripts/whip-cost.py` (benchmarks.md section B for SRT, RTMP and WHIP; 1, 10 and 50 publishers, three rounds; the verdict rule fixed before the numbers), on macOS, then again in a Linux container (`scripts/whip-cost-linux.sh`) | Memory: the owner accepts WHIP's (about 1 MB a stream over SRT) in writing, 12 November 2026. CPU, in a Linux container (27 of 27 runs, none skipped): WHIP/SRT per stream 0.74 to 0.84 at 1 stream and 0.83 to 0.96 at 50, so **met** there; at 10 streams 0.75, 0.83 and 1.11, so the rounds disagree; the owner accepted it on 15 November 2026. WHIP was below SRT in 8 of 9 rounds |
 
 ### W5: documentation
 
@@ -2650,8 +2655,8 @@ they describe what ships.
 |---|---|
 | `transport-cc` in v1 | Provisionally yes from desktop Chrome; A0.4 on the other targets |
 | Whether ICE-TCP is worth carrying | A0.3 against a public address on 443 |
-| Default `SAPFLOW_WHIP_JITTER` | A4.1: at 200 ms WHIP leaves more frames unrecovered than SRT at 5% loss; open, with the NACK schedule |
-| RustCrypto or `ring` | A4.2, measured 12 November 2026 (CPU met at 1 and 50 streams in a Linux container, the owner's call at 10; memory accepted). Not decided here |
+| Default `SAPFLOW_WHIP_JITTER` | A4.1: at 200 ms WHIP leaves more frames unrecovered than SRT at 5% loss. Parked by the owner on 15 November 2026: NACK repeats sooner at 200 ms, and a 400 ms wait, are to be measured before WHIP faces users. 200 ms until then |
+| RustCrypto or `ring` | A4.2, measured 12 November 2026 (CPU met at 1 and 50 streams in a Linux container and accepted by the owner at 10 on 15 November 2026; memory accepted). Not decided here |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
 | Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |
 | ICE restart via `PATCH` | Physical results in A4.3 |
