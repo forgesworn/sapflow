@@ -13,7 +13,8 @@ the merged build (see "A stream that never goes live"), and A4.1's jitter
 check ran on the build after main's #82 was merged too.
 
 The owner's decisions of 15 November 2026 on A4.1, A4.2 and A4.4 were
-added to this note afterwards. No new measurement came with them.
+added to this note afterwards. No new measurement came with decisions 5 to
+8; decision 9 rests on [the A4.1 retest](whip-a41-retest-2026-11-15.md).
 
 ## The owner's decisions
 
@@ -43,7 +44,8 @@ The owner's choices of 15 November 2026, with what each settles:
    200 ms until then.
 
    Measured on 15 November 2026: [the A4.1 retest](whip-a41-retest-2026-11-15.md).
-   No default was changed and A4.1 is not declared met there.
+   No default was changed and A4.1 is not declared met there; see
+   decision 9.
 
    Arithmetic, not a measurement: at a 60 ms round trip only two NACK tries
    come back within the 200 ms wait. With 5% loss on each NACK and on each
@@ -60,6 +62,22 @@ The owner's choices of 15 November 2026, with what each settles:
    residuals the [A4.4 record](a4.4-security-review-2026-11-12.md) states
    as inherent: a plausible substituted message that arrives before the
    genuine one, and sustained injection or flooding.
+9. **A4.1: "Default 400 ms".** On the evidence of
+   [the A4.1 retest](whip-a41-retest-2026-11-15.md), the default
+   `SAPFLOW_WHIP_JITTER` becomes 400 ms (it was 200 ms), and A4.1 is
+   recorded as accepted by the owner. With a 400 ms wait WHIP left 1.4
+   frames unrecovered against SRT's 27.0 at the 5% headline profile (0 to
+   20 ms of reordering jitter; t -2.72), and no difference worth claiming
+   with no jitter (10.0 against 8.0) or with jitter that keeps order (41.4
+   against 49.4). This is the owner's acceptance, not a pass by A4.1's
+   rule, which compares SRT at the same latency: SRT's latency stayed
+   200 ms, so WHIP had twice SRT's wait, and SRT at 400 ms was not
+   measured. Only 5% loss was measured at 400 ms. The cost is latency:
+   media behind a gap can wait up to 400 ms, about 200 ms more than
+   before; packets in order are not held, and end-to-end latency was not
+   measured. The 30 ms NACK repeat (`SAPFLOW_WHIP_NACK_REPEAT`) stays an
+   experimental setting only, and the default repeat (the RTT and a
+   quarter, at least 5 ms) is unchanged.
 
 ## Summary
 
@@ -69,7 +87,7 @@ The owner's choices of 15 November 2026, with what each settles:
 | A3.10 OBS keyframes | OBS 32.0.4 does not answer PLI: in five runs its keyframes came every 10 s, or 7 s, as its own keyframe interval was set, whether Sapflow asked every 2 s or not at all (a control) | Recorded: **no** |
 | A3.10 OBS rate | OBS's video stayed at 2.50 to 2.53 Mbit/s with receiver reports claiming 25% loss and with REMB at 500 kbit/s, as without either. The same stimuli took headless Chrome from about 1 Mbit/s to 0.03 and to 0.42 Mbit/s | Recorded: **no** change on either |
 | A3.8 sync, 4 s start hold | Chrome 157: 20 of 20 runs within (UDP and ICE-TCP 10 each), audio -0.6 to +17.5 ms against the video, every run aligned by sender reports. FFmpeg: 10 of 10 at 0 to 0.5 ms, aligned at once | **Met** |
-| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. Parked by the owner (decision 5): faster NACK repeats and a 400 ms wait are to be measured before WHIP faces users. Measured in [the A4.1 retest](whip-a41-retest-2026-11-15.md); decision still the owner's |
+| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. Parked by the owner (decision 5), then measured in [the A4.1 retest](whip-a41-retest-2026-11-15.md): a 400 ms wait left 1.4 frames against SRT's 27.0 at 5% (SRT still at 200 ms latency). **Accepted by the owner** with a 400 ms default (decision 9), not a pass by the rule |
 | A4.2 memory | accepted by the owner in writing (decision 4) | Accepted |
 | A4.2 CPU, Linux container | 27 of 27 runs under the load gate, none skipped. WHIP's CPU per stream against SRT's: 0.74 to 0.84 at 1 stream, 0.83 to 0.96 at 50, and at 10 streams 0.75 and 0.83 with one round at 1.11. WHIP was below SRT in 8 of 9 rounds | **Met** at 1 and 50 streams by the rule. At 10 the rounds disagree (one of three above); accepted by the owner (decision 6) |
 
@@ -590,11 +608,15 @@ not above as on macOS; the owner has accepted it either way.
 
 ## What is left open
 
-- **A4.1, parked.** At its 200 ms wait, WHIP leaves more frames
-  unrecovered than SRT at 5% loss. The owner parked it (decision 5): NACK
-  repeats sooner at the same wait, and a 400 ms wait, are to be measured
-  before WHIP faces users. The wait is compiled in (`SAPFLOW_WHIP_JITTER`
-  is not a setting yet), so no other value was measured.
+- **A4.1, accepted at 400 ms (decision 9).** At its 200 ms wait, WHIP
+  leaves more frames unrecovered than SRT at 5% loss. The retest measured
+  a 400 ms wait and faster NACK repeats, and the owner made 400 ms the
+  default. Still open: SRT at a 400 ms latency was not measured, so there
+  is no comparison at the same wait; 1% and 10% loss were not rerun at
+  400 ms; the latency the longer wait adds end to end was not measured;
+  and why the muxer broke off segments after 31 to 85 ms gaps in some
+  400 ms trials (the retest's "What is left after a 400 ms wait") was not
+  investigated.
 - **A stream that never goes live, or goes live late.** Under loss that is
   not repaired, video skips from a loss to the next keyframe. Sapflow's
   muxer then logs "timestamps broke before the first segment was complete;

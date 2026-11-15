@@ -370,15 +370,17 @@ pub struct OpusLimits {
     /// and is not filled. Default 96 000 (2 s).
     pub max_fill: u32,
     /// How far a gap may exceed the arrival time between its two packets,
-    /// in 48 kHz samples, for network jitter. Default 9600 (200 ms, the
-    /// jitter wait).
+    /// in 48 kHz samples, for network jitter. Default 19 200 (400 ms, the
+    /// receiver's default jitter wait): a retransmission can arrive up to
+    /// the wait after the packet that follows its gap. A fixed default; it
+    /// does not follow a non-default `SAPFLOW_WHIP_JITTER`.
     pub allowance: u32,
 }
 impl Default for OpusLimits {
     fn default() -> Self {
         Self {
             max_fill: 96_000,
-            allowance: 9_600,
+            allowance: 19_200,
         }
     }
 }
@@ -887,7 +889,7 @@ mod tests {
     #[test]
     fn fill_is_bounded_by_arrival_time() {
         // A sender claims 2 s gaps between packets that arrive together:
-        // only the 200 ms allowance is ever filled, the rest are
+        // only the 400 ms allowance is ever filled, the rest are
         // discontinuities.
         let mut d = Depacketiser::new(OpusLimits::default());
         let tiny = [0xe0u8, 1];
@@ -903,10 +905,10 @@ mod tests {
             .map(|k| k.1)
             .sum();
         assert_eq!(u64::from(fill), d.filled_samples());
-        assert!(fill <= 9_600, "{fill}");
+        assert!(fill <= 19_200, "{fill}");
         assert!(out.len() <= 2 * 1023, "{}", out.len());
         // Small gaps spend the same credit: back to back, 100 ms each,
-        // only two fit.
+        // only four fit.
         let mut d = Depacketiser::new(OpusLimits::default());
         let p = [0xf8u8, 1];
         for n in 0..10u32 {
@@ -914,7 +916,7 @@ mod tests {
         }
         let out = frames(&mut d);
         let filled = kinds(&out).iter().filter(|k| k.2 == FrameKind::Dtx).count();
-        assert_eq!(filled, 10, "two gaps of five 20 ms frames");
+        assert_eq!(filled, 20, "four gaps of five 20 ms frames");
         // A real DTX pause: the next packet really is 1.5 s later.
         let mut d = Depacketiser::new(OpusLimits::default());
         d.push(0, 0, &p).expect("ok");
@@ -925,13 +927,13 @@ mod tests {
             75
         );
         // Credit grows with arrival time only up to the fill limit and the
-        // allowance: after a minute's quiet, a 2 s gap and a 200 ms gap
+        // allowance: after a minute's quiet, a 2 s gap and a 400 ms gap
         // fill, and a third straight after does not.
         d.push(73_920 + 96_000, 60_000_000, &p).expect("ok");
         assert_eq!(frames(&mut d).len(), 101);
-        d.push(170_880 + 9_600, 60_000_000, &p).expect("ok");
-        assert_eq!(frames(&mut d).len(), 11);
-        d.push(181_440 + 960, 60_000_000, &p).expect("ok");
+        d.push(170_880 + 19_200, 60_000_000, &p).expect("ok");
+        assert_eq!(frames(&mut d).len(), 21);
+        d.push(191_040 + 960, 60_000_000, &p).expect("ok");
         assert!(matches!(
             frames(&mut d)[0],
             OpusOutput::Discontinuity { .. }

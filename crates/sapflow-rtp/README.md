@@ -91,7 +91,7 @@ Packets are routed by SSRC, or by payload type until an SSRC is bound.
 Each stream keeps:
 
 - **Reorder buffer.** Packets come out in sequence order. A gap waits up
-  to `jitter` (200 ms, `SAPFLOW_WHIP_JITTER`) from when it was seen, then
+  to `jitter` (400 ms, `SAPFLOW_WHIP_JITTER`) from when it was seen, then
   is declared lost (`Event::Lost`, with its sequence numbers). The first
   packets are held for `reorder_delay` (10 ms) in case earlier ones arrive
   late. Duplicates and packets older than what was released are dropped
@@ -101,7 +101,8 @@ Each stream keeps:
   A.1's `MAX_MISORDER` (100) is not used backward: late retransmissions
   are often further behind than that, and two in a row must not read as a
   restart. When
-  the buffer is full (`max_packets` 1024, `max_bytes` 1 536 000) it
+  the buffer is full (`max_packets` 1024, `max_bytes` 1 536 000; at the
+  400 ms wait, enough for about 24 Mbit/s of 1200-byte packets) it
   releases from the front, declaring what is missing there lost, though
   never for a late packet, and a payload larger than `max_bytes` is
   refused.
@@ -127,7 +128,8 @@ Each stream keeps:
   is loss; both are filled with silence shaped like the sender's last
   packet, up to `max_fill` (2 s). Since the sender chooses its
   timestamps, fill is also bounded by arrival time: a gap may exceed the
-  time between its two packets' arrivals by at most `allowance` (200 ms),
+  time between its two packets' arrivals by at most `allowance` (400 ms,
+  the default wait, since a retransmission can arrive that late),
   and total fill may run ahead of arrival time by at most `max_fill` and
   `allowance` together. A gap beyond any of these, or a step back, is a
   discontinuity and is not filled. A gap under 2.5 ms (the smallest CELT

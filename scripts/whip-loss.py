@@ -15,8 +15,11 @@ retransmission, and by the next 1 s keyframe.
   handshake impaired), latency 200 ms on both ends.
 - WHIP: through the proxy (--protocol whip: only SRTP and SRTCP impaired),
   the answer's only candidate being the proxy. Sapflow's jitter wait is its
-  default, 200 ms, unless an arm sets the experimental SAPFLOW_WHIP_JITTER
-  or SAPFLOW_WHIP_NACK_REPEAT (--arms). The publisher (--whip-publisher) is headless Chrome by default:
+  default unless an arm sets SAPFLOW_WHIP_JITTER or the experimental
+  SAPFLOW_WHIP_NACK_REPEAT (--arms). The default was 200 ms when the A4.1
+  runs were made and is 400 ms since the owner's decision of 15 November
+  2026, so a plain whip arm on a later build is no longer a 200 ms arm:
+  set SAPFLOW_WHIP_JITTER=200 to repeat one. The publisher (--whip-publisher) is headless Chrome by default:
   a 1280x720 canvas at 30 fps (moving bars and a frame counter) and a
   WebAudio tone, at most 2.5 Mbit/s, which answers NACKs over RTX and
   keyframe requests. FFmpeg's WHIP muxer (ffmpeg: the clip, copied) sends

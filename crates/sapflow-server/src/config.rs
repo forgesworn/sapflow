@@ -273,9 +273,9 @@ pub struct WhipConfig {
     pub opus_max_bitrate: u32,
     /// Media silence after which a new `POST` may supersede a session.
     pub stale: Duration,
-    /// Experimental, for A4.1's retest: the longest wait for a missing
-    /// packet (`SAPFLOW_WHIP_JITTER`, milliseconds, 20 to 1000). Default
-    /// 200 ms.
+    /// The longest wait for a missing packet (`SAPFLOW_WHIP_JITTER`,
+    /// milliseconds, 20 to 1000). Default 400 ms, the owner's decision of
+    /// 15 November 2026 on A4.1's retest.
     pub jitter: Duration,
     /// Experimental, for A4.1's retest: a fixed time between NACKs for one
     /// packet (`SAPFLOW_WHIP_NACK_REPEAT`, milliseconds, 5 to 1000). Default
@@ -433,7 +433,7 @@ impl WhipConfig {
                 .map(Duration::from_secs)
                 .ok_or_else(|| invalid("SAPFLOW_WHIP_STALE: seconds, 1 to 60"))?,
         };
-        let millis = |key: &str, range: std::ops::RangeInclusive<u64>| {
+        let millis = |key: &str, range: std::ops::RangeInclusive<u64>, note: &str| {
             vals.get(key)
                 .map(|v| {
                     v.parse::<u64>()
@@ -442,7 +442,7 @@ impl WhipConfig {
                         .map(Duration::from_millis)
                         .ok_or_else(|| {
                             invalid(&format!(
-                                "{key}: milliseconds, {} to {} (experimental)",
+                                "{key}: milliseconds, {} to {}{note}",
                                 range.start(),
                                 range.end()
                             ))
@@ -451,8 +451,8 @@ impl WhipConfig {
                 .transpose()
         };
         let jitter =
-            millis("SAPFLOW_WHIP_JITTER", 20..=1000)?.unwrap_or(Duration::from_millis(200));
-        let nack_repeat = millis("SAPFLOW_WHIP_NACK_REPEAT", 5..=1000)?;
+            millis("SAPFLOW_WHIP_JITTER", 20..=1000, "")?.unwrap_or(Duration::from_millis(400));
+        let nack_repeat = millis("SAPFLOW_WHIP_NACK_REPEAT", 5..=1000, " (experimental)")?;
         Ok(Some(Self {
             stale,
             addr,
@@ -1231,8 +1231,8 @@ mod tests {
         assert_eq!(c.keyframe_interval, Some(Duration::from_secs(2)));
         assert_eq!(c.opus_max_bitrate, 128_000);
         assert_eq!(c.stale, Duration::from_secs(2));
-        // The experimental A4.1 settings leave the receiver's defaults.
-        assert_eq!(c.jitter, Duration::from_millis(200));
+        // Unset, the A4.1 settings leave the receiver's defaults.
+        assert_eq!(c.jitter, Duration::from_millis(400));
         assert_eq!(c.nack_repeat, None);
         assert!(c.allow_origins.is_empty() && c.trusted_proxy.is_none());
         let c = load(
@@ -1247,7 +1247,7 @@ mod tests {
                     ("SAPFLOW_WHIP_KEYFRAME_INTERVAL", Some("0")),
                     ("SAPFLOW_WHIP_STALE", Some("5")),
                     ("SAPFLOW_WHIP_OPUS_MAX_BITRATE", Some("64000")),
-                    ("SAPFLOW_WHIP_JITTER", Some("400")),
+                    ("SAPFLOW_WHIP_JITTER", Some("250")),
                     ("SAPFLOW_WHIP_NACK_REPEAT", Some("30")),
                 ],
             ),
@@ -1256,7 +1256,7 @@ mod tests {
         .expect("WHIP")
         .whip
         .expect("on");
-        assert_eq!(c.jitter, Duration::from_millis(400));
+        assert_eq!(c.jitter, Duration::from_millis(250));
         assert_eq!(c.nack_repeat, Some(Duration::from_millis(30)));
         assert_eq!(
             c.allow_origins,
