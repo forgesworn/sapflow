@@ -429,7 +429,9 @@ pub fn client_key_exchange(body: &[u8]) -> Result<&[u8], Error> {
 
 /// A CertificateVerify's DER signature (RFC 5246 section 7.4.8). The scheme
 /// must be `ecdsa_secp256r1_sha256`, the only one the CertificateRequest
-/// offered.
+/// offered, and the signature must decode as one for it (valid DER, `r`
+/// and `s` in range): what fails here is refused before the one
+/// verification is spent on it.
 pub fn certificate_verify(body: &[u8]) -> Result<&[u8], Error> {
     let mut r = Reader::new(body);
     let scheme = r.u16().ok_or(Error::Decode)?;
@@ -440,6 +442,7 @@ pub fn certificate_verify(body: &[u8]) -> Result<&[u8], Error> {
     if scheme != ECDSA_P256_SHA256 {
         return Err(Error::VerifyScheme);
     }
+    crate::identity::signature(sig)?;
     Ok(sig)
 }
 

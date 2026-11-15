@@ -1147,7 +1147,9 @@ impl Server {
                 };
                 let key = hs.peer.as_ref().ok_or(Error::Internal)?;
                 // The one verification: once it has failed, the handshake
-                // cannot complete, so the failure is final.
+                // cannot complete, so the failure is final. A signature that
+                // does not decode was refused above without spending it, so
+                // only a well-formed one that does not verify gets here.
                 self.stats.verifications += 1;
                 identity::verify_der(key, hash, signature)?;
                 hs.transcript.update(whole(&m)?);

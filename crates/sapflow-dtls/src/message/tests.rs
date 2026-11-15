@@ -338,7 +338,18 @@ fn key_exchange_verify_and_finished_bounds() {
     assert_eq!(client_key_exchange(&compressed), Err(Error::BadKeyShare));
     assert_eq!(client_key_exchange(&[0]), Err(Error::Decode));
     assert_eq!(client_key_exchange(&[2, 4]), Err(Error::Decode));
-    assert_eq!(certificate_verify(&[4, 3, 0, 1, 9]), Ok(&[9][..]));
+    // r = 1, s = 1: valid DER, in range.
+    let der = [0x30, 6, 2, 1, 1, 2, 1, 1];
+    assert_eq!(
+        certificate_verify(&[&[4, 3, 0, 8][..], &der].concat()),
+        Ok(&der[..])
+    );
+    // Not DER, then r = 0: refused before any verification.
+    assert_eq!(certificate_verify(&[4, 3, 0, 1, 9]), Err(Error::Decode));
+    assert_eq!(
+        certificate_verify(&[4, 3, 0, 8, 0x30, 6, 2, 1, 0, 2, 1, 1]),
+        Err(Error::Decode)
+    );
     assert_eq!(
         certificate_verify(&[5, 3, 0, 1, 9]),
         Err(Error::VerifyScheme)

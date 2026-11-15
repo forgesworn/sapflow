@@ -1943,3 +1943,49 @@ fn complementary_forged_candidates_give_way_to_a_retransmission() {
     completes(&mut p, &rest);
     crypto_once(&p);
 }
+
+/// A4.4 review, round 4 (finding 8): a CertificateVerify whose signature is
+/// not a valid DER ECDSA P-256 signature, queued ahead: one byte (30 bytes
+/// on the wire), an `r` of zero, and an `s` above the group order. Before,
+/// each passed the message parser, was counted as the one verification,
+/// failed to decode and ended the handshake. Now each is refused like any
+/// other malformed epoch 0 message, without spending the verification, and
+/// the genuine one completes the handshake. (A well-formed but wrong
+/// signature still spends it: an accepted residual.)
+#[test]
+fn a_certificate_verify_that_is_not_der_does_not_spend_the_verification() {
+    let mut above_order = vec![0x30, 38, 2, 1, 1, 2, 33, 0];
+    above_order.extend_from_slice(&[0xff; 32]);
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("one byte", vec![0xff]),
+        ("r of zero", vec![0x30, 6, 2, 1, 0, 2, 1, 1]),
+        ("s above the order", above_order),
+    ];
+    for (name, signature) in cases {
+        let mut body = message::ECDSA_P256_SHA256.to_be_bytes().to_vec();
+        body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+        body.extend_from_slice(&signature);
+        let mut p = pair(Options::default());
+        let recs = flight5(&mut p);
+        let d = fragment_record(
+            message::CERTIFICATE_VERIFY,
+            3,
+            body.len() as u32,
+            0,
+            &body,
+            60,
+        );
+        if name == "one byte" {
+            assert_eq!(d.len(), 30);
+        }
+        assert_eq!(p.feed(&[d]), Ok(()), "{name}");
+        assert!(p.drain().is_empty(), "{name}: no alert");
+        completes(&mut p, &recs);
+        crypto_once(&p);
+        assert_eq!(
+            message::certificate_verify(&body),
+            Err(Error::Decode),
+            "{name}"
+        );
+    }
+}
