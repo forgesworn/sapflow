@@ -121,7 +121,15 @@ The cookie exchange is off by default: the server is used only behind ICE,
 which proves return routability for the address pair before any DTLS
 datagram is accepted, and that is the cookie's purpose (RFC 6347 section
 4.2.1 allows turning it off where amplification is not a problem). It saves
-a round trip. Turning it on works (A2.1 runs it against OpenSSL).
+a round trip. Turning it on works (A2.1 runs it against OpenSSL). WHIP
+(`sapflow-whip` and `sapflow-server`) never turns it on: the session's
+`dtls` config is `Config::default()`, though the field is public, so an
+embedder could. While the exchange awaits a valid cookie, each hello stands
+alone, as the RFC's stateless exchange intends. A hello is taken at any of
+the first `max_transmissions` plus one seqs (at least four), and one at the
+last of them gets no HelloVerifyRequest, since the answer would be out of
+reach. A HelloVerifyRequest commits nothing; the hello with a valid cookie
+sets the expected seq, the transcript and our sequence numbers.
 
 ## What ends a handshake, and what is dropped
 
@@ -135,7 +143,8 @@ dropped and counted in `Stats::records_dropped`:
   client's ChangeCipherSpec;
 - an epoch 0 fragment that cannot belong to the message expected at its
   seq, checked before anything is kept for it. A ClientHello is expected at
-  the next seq until a hello is answered; then Certificate,
+  the next seq until a hello is answered (with the cookie exchange on, at
+  any seq in reach until one has a valid cookie); then Certificate,
   ClientKeyExchange (2 to 66 bytes) and CertificateVerify (5 to 76 bytes)
   at epoch 0, and Finished (12 bytes) only at epoch 1. So once
   CertificateVerify is accepted, no epoch 0 handshake data is kept at all;
@@ -230,7 +239,7 @@ handshake. Each is fixed, with a test that failed before the fix:
   handshake failed after the server had signed. A first hello within 65536
   of the top is now refused before anything is signed or sent.
 
-Fixed, awaiting round 6 review: round 5 (on `25ba46d`) found that resends
+Fixed, and closed in round 6: round 5 (on `25ba46d`) found that resends
 the peer triggers and timer resends shared the six-send budget, and a
 peer-triggered resend restarted the timer without doubling it. Five repeats
 of the accepted hello at 200 ms spacing spent the budget by 1 s, and the
@@ -240,6 +249,19 @@ fixed expiry (Bounds and defaults, above), with tests that failed before
 the fix. The final flight and the HelloVerifyRequest flight have no timer,
 so spending their budgets ends nothing. Round 5 also re-confirmed the
 residuals above and the dependency pins below.
+
+Fixed, awaiting round 7 review: round 6 (on `c3c66f2`) found that, with
+the cookie exchange on, a hello with a missing or wrong cookie was
+answered with a HelloVerifyRequest and then moved the expected seq on, as
+an accepted hello would. An injected copy of the genuine first hello at
+seq 1 took the seq of the client's cookie-bearing hello 1; with that extra
+HelloVerifyRequest lost, the genuine hello was old, did not repeat the
+injected one, and was ignored until the deadline. A forged first hello at
+seq 0 excluded the genuine one the same way. A HelloVerifyRequest now
+commits nothing (the cookie exchange, above), with tests that failed
+before the fix. Round 6 also re-confirmed the residuals above and the
+dependency pins below, and independently recomputed the eight RFC 5705
+exporter results.
 
 Behind ICE, only an attacker who could spoof the selected address pair
 could send any of this, apart from the three cases a buggy peer could

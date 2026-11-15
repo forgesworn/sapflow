@@ -1746,7 +1746,9 @@ Implementation notes (11 November 2026):
   may match.
 - **Bounds and defaults.** These are listed in the crate README.
   - HelloVerifyRequest is off by default, because ICE has already proved
-    return routability.
+    return routability. WHIP never turns it on (`SessionConfig::dtls` is
+    `Config::default()` in `sapflow-whip`, and `sapflow-server` does not
+    change it).
   - Flights are re-recorded for every send.
   - A peer's retransmission triggers a resend only when it repeats the
     start of the hello we answered (the version and random included), or
@@ -1845,9 +1847,18 @@ Implementation notes (11 November 2026):
     triggers shared the timer's six-send budget, so five repeats of the
     accepted hello at 200 ms spacing made the timer fail the handshake at
     about 2 s, refusing a genuine client flight at 3 s (a buggy peer can do
-    this too). It is fixed in `d4db7d7` with tests that failed before the
-    fix, and awaits a round 6 review. Round 5 also re-confirmed the
-    residuals and the dependency pins. The crate README describes each fix.
+    this too). It is fixed in `d9ca78e` with tests that failed before the
+    fix, and round 6 (on `c3c66f2`) found it closed. Round 5 also
+    re-confirmed the residuals and the dependency pins. Round 6 found one
+    more (finding 12): with the cookie exchange on, which WHIP never turns
+    on, a hello with a missing or wrong cookie moved the expected seq on
+    after its HelloVerifyRequest, so an injected hello at the seq of the
+    client's cookie-bearing hello, with its HelloVerifyRequest lost, kept
+    the genuine one out until the deadline. It is fixed in `5e4bee1` with
+    tests that failed before the fix, and awaits a round 7 review. Round 6
+    re-confirmed the residuals and the dependency pins, and independently
+    recomputed the eight RFC 5705 exporter results. The crate README
+    describes each fix.
     See [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 
     W3 limits the damage:
@@ -2657,7 +2668,7 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
-  - Status, 15 November 2026: **not met yet.** Reviewed in five rounds,
+  - Status, 15 November 2026: **not met yet.** Reviewed in six rounds,
     recorded in
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
     The findings of rounds 1 to 3 are fixed. Round 4's four
@@ -2665,9 +2676,11 @@ that the inbound queue's back-pressure stays with the slow reader.
     November 2026 are to be fixed before WHIP faces users, are fixed in
     `355e2ab`, `004282e`, `1204189` and `74513ab`, and round 5 found them
     closed. Round 5's one finding (P2, a shared retransmission budget that
-    brought the handshake timeout forward) is fixed in `d4db7d7` and awaits
-    a round 6 review. A4.4 needs that independent review of the whole
-    scope before it can be met.
+    brought the handshake timeout forward) is fixed in `d9ca78e`, and round
+    6 found it closed. Round 6's one finding (P2, a hello without a valid
+    cookie that moved the expected seq on, with the cookie exchange on) is
+    fixed in `5e4bee1` and awaits a round 7 review. A4.4 needs that
+    independent review of the whole scope before it can be met.
     The owner accepted the residuals the record states as inherent in
     writing on 15 November 2026.
 
