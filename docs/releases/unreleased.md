@@ -513,7 +513,8 @@ Notes for the release after 0.2.0-rc.1.
 
 - Breaking for embedders: the DTLS cookie exchange is now behind the
   experimental `hello-verify` cargo feature, off by default. Without it,
-  `Config` has no `hello_verify` field and the cookie code is not compiled;
+  `Config` has no `hello_verify` field and the cookie and HelloVerifyRequest
+  code is not compiled (reassembly's unordered hello mode stays, unreachable);
   code that names the field needs the feature. `Limit::HelloVerify` stays,
   produced only with the feature. WHIP never used the exchange and does not
   enable the feature. The feature is outside the A4.4 review and has two

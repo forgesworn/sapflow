@@ -128,8 +128,10 @@ problem). Leaving it out also saves a round trip.
 
 It exists only behind the `hello-verify` cargo feature, which is off by
 default and experimental. Without the feature, `Config` has no
-`hello_verify` field and the cookie code is not compiled, so nothing can
-turn it on. WHIP never enables the feature: `sapflow-whip` and
+`hello_verify` field, and the cookie, its HMAC, the HelloVerifyRequest and
+its budget of answers are not compiled, so nothing can turn it on.
+Reassembly's mode that takes hellos at any seq while a cookie is awaited is
+still compiled, but nothing can switch it on. WHIP never enables the feature: `sapflow-whip` and
 `sapflow-server` depend on this crate without it, and the session's `dtls`
 config is `Config::default()`. The A4.4 security review covers this crate
 as WHIP builds it, without the feature (the owner's decision of 15 November

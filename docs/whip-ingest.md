@@ -1751,7 +1751,8 @@ Implementation notes (11 November 2026):
     change it). Since 15 November 2026 it exists only behind
     `sapflow-dtls`'s experimental `hello-verify` cargo feature, off by
     default, which neither `sapflow-whip` nor `sapflow-server` enables;
-    without it the cookie code is not compiled.
+    without it the cookie and HelloVerifyRequest code is not compiled
+    (reassembly's unordered hello mode stays, unreachable).
   - Flights are re-recorded for every send.
   - A peer's retransmission triggers a resend only when it repeats the
     start of the hello we answered (the version and random included), or
@@ -1766,7 +1767,8 @@ Implementation notes (11 November 2026):
     the crate README.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
   byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
-  dropped first flight, a dropped final flight and the cookie exchange. The
+  dropped first flight, a dropped final flight and the cookie exchange
+  (since 15 November 2026 on a `hello-verify` feature build). The
   datagrams and OpenSSL's key log are fixtures. Unit tests replay them offline, derive the exporter
   and record keys from OpenSSL's master secret, and feed both halves of the
   material to `sapflow-rtp`.

@@ -34,7 +34,7 @@
 //! Cargo features, both off by default: `testing` (test helpers and the
 //! fuzz entry points, not for production) and `hello-verify`
 //! (experimental: the HelloVerifyRequest cookie exchange and
-//! `Config::hello_verify`). WHIP enables neither in its builds. The cookie
+//! `Config::hello_verify`). WHIP's release builds enable neither. The cookie
 //! exchange is outside the A4.4 security review and has known open
 //! findings, listed in the crate README.
 
