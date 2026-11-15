@@ -1785,7 +1785,9 @@ Implementation notes (11 November 2026):
 - **For W3.**
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
-    about 63 s before `Error::Timeout`.
+    about 63 s before `Error::Timeout`. That expiry is fixed when flight 4
+    is first sent; resends the peer triggers spend the six sends but do not
+    move it.
   - **Epoch 0 injection.** Epoch 0 input is not authenticated. Rounds 2
     and 3 of the A4.4 review (12 November 2026) found that one forged packet
     could end a handshake or hold it until the deadline. Round 2: a 25-byte
@@ -1838,9 +1840,15 @@ Implementation notes (11 November 2026):
     after it has signed (a buggy peer can do this too). The owner decided
     on 15 November 2026 that these four are to be fixed before WHIP faces
     users. They are fixed in `355e2ab`, `004282e`, `1204189` and `74513ab`, each with
-    a test that failed before the fix, and await a round 5 review. The
-    crate README describes each fix. See
-    [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
+    a test that failed before the fix, and round 5 (on `25ba46d`) found
+    them closed. Round 5 found one more (finding 11): resends the peer
+    triggers shared the timer's six-send budget, so five repeats of the
+    accepted hello at 200 ms spacing made the timer fail the handshake at
+    about 2 s, refusing a genuine client flight at 3 s (a buggy peer can do
+    this too). It is fixed in `d4db7d7` with tests that failed before the
+    fix, and awaits a round 6 review. Round 5 also re-confirmed the
+    residuals and the dependency pins. The crate README describes each fix.
+    See [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 
     W3 limits the damage:
     - each `Server` receives only datagrams from its selected ICE-validated
@@ -2649,14 +2657,17 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
-  - Status, 15 November 2026: **not met yet.** Reviewed in four rounds,
+  - Status, 15 November 2026: **not met yet.** Reviewed in five rounds,
     recorded in
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
     The findings of rounds 1 to 3 are fixed. Round 4's four
     handshake-availability findings, which the owner decided on 15
     November 2026 are to be fixed before WHIP faces users, are fixed in
-    `355e2ab`, `004282e`, `1204189` and `74513ab` and await a round 5 review. A4.4
-    needs that independent review of the whole scope before it can be met.
+    `355e2ab`, `004282e`, `1204189` and `74513ab`, and round 5 found them
+    closed. Round 5's one finding (P2, a shared retransmission budget that
+    brought the handshake timeout forward) is fixed in `d4db7d7` and awaits
+    a round 6 review. A4.4 needs that independent review of the whole
+    scope before it can be met.
     The owner accepted the residuals the record states as inherent in
     writing on 15 November 2026.
 

@@ -112,7 +112,10 @@ alert is sent once, then nothing.
 
 With the defaults an unanswered flight 4 is sent at 0, 1, 3, 7, 15 and 31 s
 and the handshake fails at about 63 s, so the caller (W3) sets its own,
-shorter handshake deadline.
+shorter handshake deadline. That 63 s is fixed when flight 4 is first sent.
+Resends the peer triggers count towards the six sends, and once those are
+spent nothing more is sent, but they never bring the failure forward or
+push it back.
 
 The cookie exchange is off by default: the server is used only behind ICE,
 which proves return routability for the address pair before any DTLS
@@ -170,7 +173,7 @@ the client's next retransmission. In the worst case found (the slots full,
 replacement spent, and a forged byte inside a later fragment's range) that
 is two of the client's retransmissions. Round 4 of the A4.4 review found
 cases where a finite burst still held the flight until the deadline; they
-are fixed, awaiting round 5 review, as listed below.
+are fixed, and round 5 found them closed, as listed below.
 
 These still end the handshake, with one fatal alert where `Error::alert`
 names one:
@@ -201,7 +204,7 @@ November 2026 (A4.4):
   refilling the slots and the buffer, or keep winning the race above.
   Reclaiming bounds a finite burst, not a sustained one.
 
-Fixed, awaiting round 5 review: round 4 of the A4.4 review (12 November
+Fixed, and closed in round 5: round 4 of the A4.4 review (12 November
 2026) found four more ways forged epoch 0 input could end or hold a
 handshake. Each is fixed, with a test that failed before the fix:
 
@@ -227,8 +230,19 @@ handshake. Each is fixed, with a test that failed before the fix:
   handshake failed after the server had signed. A first hello within 65536
   of the top is now refused before anything is signed or sent.
 
+Fixed, awaiting round 6 review: round 5 (on `25ba46d`) found that resends
+the peer triggers and timer resends shared the six-send budget, and a
+peer-triggered resend restarted the timer without doubling it. Five repeats
+of the accepted hello at 200 ms spacing spent the budget by 1 s, and the
+timer failed the handshake at about 2 s, so a genuine client flight at 3 s
+was refused. The budget now bounds output only, and flight 4 fails at its
+fixed expiry (Bounds and defaults, above), with tests that failed before
+the fix. The final flight and the HelloVerifyRequest flight have no timer,
+so spending their budgets ends nothing. Round 5 also re-confirmed the
+residuals above and the dependency pins below.
+
 Behind ICE, only an attacker who could spoof the selected address pair
-could send any of this, apart from the two cases a buggy peer could
+could send any of this, apart from the three cases a buggy peer could
 trigger.
 
 ## Dependencies
