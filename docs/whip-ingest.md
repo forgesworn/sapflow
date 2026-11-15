@@ -1795,18 +1795,18 @@ Implementation notes (11 November 2026):
       slots and the buffer. Reclaiming bounds a finite burst, not a
       sustained one.
 
-    Round 4 (on 89bd367) found four more, which are open and not fixed:
-    two complementary forged candidates that absorb every genuine
-    retransmission without triggering reclamation; a CertificateVerify
-    whose signature is not valid DER ending the handshake at once (a buggy
-    peer can do this too); complete forged messages at a later seq
-    blocking the expected Certificate when `max_buffered` is set below the
-    default; and a ClientHello at the top of the record sequence space
-    exhausting the server's outgoing sequence after it has signed (a buggy
-    peer can do this too). The crate README describes each. So a finite
-    burst can still hold a handshake until the deadline. The owner decided
+    Round 4 (on 89bd367) found four more: two complementary forged
+    candidates that absorb every genuine retransmission without triggering
+    reclamation; a CertificateVerify whose signature is not valid DER
+    ending the handshake at once (a buggy peer can do this too); complete
+    forged messages at a later seq blocking the expected Certificate when
+    `max_buffered` is set below the default; and a ClientHello at the top
+    of the record sequence space exhausting the server's outgoing sequence
+    after it has signed (a buggy peer can do this too). The owner decided
     on 15 November 2026 that these four are to be fixed before WHIP faces
-    users. See
+    users. They are fixed in `355e2ab`, `004282e`, `1204189` and `74513ab`, each with
+    a test that failed before the fix, and await a round 5 review. The
+    crate README describes each fix. See
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 
     W3 limits the damage:
@@ -2620,10 +2620,12 @@ that the inbound queue's back-pressure stays with the slow reader.
     recorded in
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
     The findings of rounds 1 to 3 are fixed. Round 4's four
-    handshake-availability findings are open, and the owner decided on 15
-    November 2026 that they are to be fixed before WHIP faces users. The
-    owner accepted the residuals the record states as inherent in writing
-    on 15 November 2026.
+    handshake-availability findings, which the owner decided on 15
+    November 2026 are to be fixed before WHIP faces users, are fixed in
+    `355e2ab`, `004282e`, `1204189` and `74513ab` and await a round 5 review. A4.4
+    needs that independent review of the whole scope before it can be met.
+    The owner accepted the residuals the record states as inherent in
+    writing on 15 November 2026.
 
 ### Qualification status (12 November 2026)
 
