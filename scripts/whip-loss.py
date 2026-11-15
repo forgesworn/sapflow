@@ -15,8 +15,8 @@ retransmission, and by the next 1 s keyframe.
   handshake impaired), latency 200 ms on both ends.
 - WHIP: through the proxy (--protocol whip: only SRTP and SRTCP impaired),
   the answer's only candidate being the proxy. Sapflow's jitter wait is its
-  compiled default, 200 ms (SAPFLOW_WHIP_JITTER is a proposal, not a
-  setting). The publisher (--whip-publisher) is headless Chrome by default:
+  default, 200 ms, unless an arm sets the experimental SAPFLOW_WHIP_JITTER
+  or SAPFLOW_WHIP_NACK_REPEAT (--arms). The publisher (--whip-publisher) is headless Chrome by default:
   a 1280x720 canvas at 30 fps (moving bars and a frame counter) and a
   WebAudio tone, at most 2.5 Mbit/s, which answers NACKs over RTX and
   keyframe requests. FFmpeg's WHIP muxer (ffmpeg: the clip, copied) sends
@@ -35,13 +35,26 @@ Decoder error lines and sapflow's own counters are kept beside them.
         [--losses 1,5,10] [--seeds 5] [--clean 3] [--jitter-ms 20]
         [--delay-ms 30] [--protocols srt,whip] [--whip-publisher chrome|ffmpeg]
         [--profiles LOSS:JITTER[:keep],...] [--base 47300]
+        [--arms NAME=PROTOCOL[+KEY=VALUE...],...] [--max-load 8]
 
 --profiles replaces --losses and --jitter-ms with a list of profiles, each
 a loss percentage and a jitter in ms, and `keep` for jitter that spreads the
 delays without reordering (the proxy's --jitter-order keep): for example
 0:20,5:0,5:20:keep. The clean runs (--clean) are added as before.
 
-Writes DIR/trials.tsv and DIR/summary.tsv. Every child is the driver's own
+--arms replaces --protocols with named arms, each a protocol and any
+environment for sapflow, run in the order given for each seed: for example
+base=whip,srt=srt,nack30=whip+SAPFLOW_WHIP_NACK_REPEAT=30,
+wait400=whip+SAPFLOW_WHIP_JITTER=400. Each arm has its own clean runs. The
+summary gives each arm against the SRT arm and, for WHIP arms, against the
+first WHIP arm (the baseline), with a Welch t each.
+
+--max-load holds each trial until the one-minute load average is below it
+(0, the default, never waits); the load at the start, the wait and the load
+at the end are kept with the trial.
+
+Writes DIR/trials.jsonl as each trial ends, then DIR/trials.tsv and
+DIR/summary.tsv. Every child is the driver's own
 and is stopped by its PID.
 """
 
@@ -109,7 +122,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     s.forEach((x) => { if (x.type === 'outbound-rtp' && x.kind === 'video') Object.assign(out, {
       framesEncoded: x.framesEncoded, framesSent: x.framesSent, keyFramesEncoded: x.keyFramesEncoded, nackCount: x.nackCount,
       pliCount: x.pliCount, packetsSent: x.packetsSent, retransmittedPacketsSent: x.retransmittedPacketsSent,
-      frameWidth: x.frameWidth, framesPerSecond: x.framesPerSecond, qualityLimitationReason: x.qualityLimitationReason }); });
+      frameWidth: x.frameWidth, framesPerSecond: x.framesPerSecond, qualityLimitationReason: x.qualityLimitationReason });
+      if (x.type === 'remote-inbound-rtp' && x.kind === 'video') Object.assign(out, {
+        roundTripTime: x.roundTripTime, totalRoundTripTime: x.totalRoundTripTime,
+        roundTripTimeMeasurements: x.roundTripTimeMeasurements }); });
     const d = await fetch(location, { method: 'DELETE', headers: { Authorization: 'Bearer TOKEN' } });
     out.delete = d.status; pc.close();
   } catch (e) { out.errors.push(String(e && e.message || e)); }
@@ -214,9 +230,20 @@ def frames_in(files):
     return v, a, errors
 
 
-def trial(args, protocol, profile, seed, out):
+def wait_for_load(limit):
+    """Waits until the one-minute load is below the limit; returns the wait in s."""
+    if not limit:
+        return 0
+    t0 = time.monotonic()
+    while os.getloadavg()[0] >= limit:
+        time.sleep(15)
+    return round(time.monotonic() - t0)
+
+
+def trial(args, arm, profile, seed, out):
+    name, protocol, arm_env = arm
     loss, jitter, keep = profile
-    tag = f"{protocol}-l{loss}-j{jitter}{'k' if keep else ''}-s{seed}"
+    tag = f"{name}-l{loss}-j{jitter}{'k' if keep else ''}-s{seed}"
     d = out / "trials" / tag
     d.mkdir(parents=True, exist_ok=True)
     base = args.base
@@ -231,10 +258,12 @@ def trial(args, protocol, profile, seed, out):
            "SAPFLOW_WHIP_CANDIDATES": f"udp 127.0.0.1:{port['proxy']}",
            "SAPFLOW_WHIP_PUBLIC_URL": f"http://127.0.0.1:{port['whip']}",
            "SAPFLOW_WHIP_ALLOW_ORIGINS": f"http://127.0.0.1:{port['page']}",
-           "RUST_LOG": "info,sapflow::whip=debug"}
-    row = {"protocol": protocol, "loss_pct": loss, "seed": seed, "jitter_ms": jitter,
-           "jitter_order": "keep" if keep else "reorder",
-           "delay_ms": args.delay_ms, "load": round(os.getloadavg()[0], 2)}
+           "RUST_LOG": "info,sapflow::whip=debug", **arm_env}
+    waited = wait_for_load(args.max_load)
+    row = {"arm": name, "protocol": protocol, "loss_pct": loss, "seed": seed, "jitter_ms": jitter,
+           "jitter_order": "keep" if keep else "reorder", "env": " ".join(f"{k}={v}" for k, v in arm_env.items()),
+           "delay_ms": args.delay_ms, "load": round(os.getloadavg()[0], 2), "load_wait_s": waited,
+           "started": time.strftime("%H:%M:%S")}
     slog = open(d / "sapflow.log", "w")
     srv = subprocess.Popen([args.bin], env=env, stdout=slog, stderr=slog)
     procs = []
@@ -270,7 +299,8 @@ def trial(args, protocol, profile, seed, out):
             (d / "chrome-report.json").write_text(json.dumps(report, indent=1))
             row["publisher_exit"] = 0 if report and not report.get("errors") else 1
             row["frames_sent"] = report.get("framesSent")
-            for k in ("keyFramesEncoded", "nackCount", "pliCount", "retransmittedPacketsSent", "packetsSent"):
+            for k in ("keyFramesEncoded", "nackCount", "pliCount", "retransmittedPacketsSent", "packetsSent",
+                      "roundTripTime"):
                 row[f"chrome_{k}"] = report.get(k)
             row["errors"] = ";".join(report.get("errors", [])) if report else "no report"
         else:
@@ -289,6 +319,7 @@ def trial(args, protocol, profile, seed, out):
         stop(srv)
         slog.close()
         time.sleep(0.5)
+    row["load_end"] = round(os.getloadavg()[0], 2)
     recs = sorted((d / "rec").rglob("*.mp4")) if (d / "rec").exists() else []
     row["recordings"] = len(recs)
     row["video_frames"], row["audio_frames"], row["decode_errors"] = frames_in(recs)
@@ -308,11 +339,15 @@ def trial(args, protocol, profile, seed, out):
     row["proxy_reordered"] = stats.get("reordered_orig", "")
     text = (d / "sapflow.log").read_text(errors="replace")
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    listening = re.findall(r"WHIP listening.*?jitter_ms=(\d+) nack_repeat=(\S+)", text)
+    if listening:
+        row["sapflow_jitter_ms"], row["sapflow_nack_repeat"] = int(listening[-1][0]), listening[-1][1].strip('"')
     if protocol == "whip":
         last = re.findall(r"WHIP receive counters (.*)$", text, re.M)
         if last:
             for k, v in re.findall(r"(\w+)=(\d+)", last[-1]):
-                if k in ("video_nacked", "video_recovered", "video_lost", "video_incomplete", "video_skipped"):
+                if k in ("video_packets", "video_nacked", "video_recovered", "video_lost", "video_incomplete",
+                         "video_skipped", "audio_lost"):
                     row[f"sapflow_{k}"] = int(v)
     else:
         m = re.findall(r"SRT connection closed .*?received=(\d+) retransmitted=(\d+) lost=(\d+) dropped=(\d+)", text)
@@ -321,6 +356,8 @@ def trial(args, protocol, profile, seed, out):
             row.update({"sapflow_srt_received": int(r_), "sapflow_srt_retransmitted": int(t_),
                         "sapflow_srt_lost": int(l_), "sapflow_srt_dropped": int(dr)})
     print(json.dumps(row), flush=True)
+    with open(out / "trials.jsonl", "a") as f:
+        f.write(json.dumps(row) + "\n")
     return row
 
 
@@ -330,6 +367,26 @@ def welch(a, b):
     va, vb = statistics.variance(a), statistics.variance(b)
     se = math.sqrt(va / len(a) + vb / len(b))
     return None if se == 0 else (statistics.mean(a) - statistics.mean(b)) / se
+
+
+def parse_arms(text):
+    """NAME=PROTOCOL[+KEY=VALUE...],... into (name, protocol, env) tuples."""
+    arms = []
+    for item in text.split(","):
+        name, _, rest = item.partition("=")
+        protocol, *pairs = rest.split("+")
+        if not name or protocol not in ("srt", "whip"):
+            raise SystemExit(f"--arms: {item!r} is not NAME=srt|whip[+KEY=VALUE...]")
+        env = {}
+        for pair in pairs:
+            k, eq, v = pair.partition("=")
+            if not eq or not k.startswith("SAPFLOW_"):
+                raise SystemExit(f"--arms: {pair!r} is not SAPFLOW_KEY=VALUE")
+            env[k] = v
+        arms.append((name, protocol, env))
+    if len({a[0] for a in arms}) != len(arms):
+        raise SystemExit("--arms: names must differ")
+    return arms
 
 
 def main():
@@ -343,13 +400,22 @@ def main():
     ap.add_argument("--jitter-ms", type=int, default=20)
     ap.add_argument("--delay-ms", type=int, default=30)
     ap.add_argument("--protocols", default="srt,whip")
+    ap.add_argument("--arms", default=None, help="NAME=PROTOCOL[+KEY=VALUE...],... in place of --protocols")
+    ap.add_argument("--max-load", type=float, default=0, help="start a trial only below this one-minute load")
     ap.add_argument("--whip-publisher", default="chrome", choices=["chrome", "ffmpeg"])
     ap.add_argument("--profiles", default=None, help="LOSS:JITTER[:keep],... in place of --losses and --jitter-ms")
     ap.add_argument("--base", type=int, default=47300)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    if (args.out / "trials.jsonl").exists():
+        raise SystemExit(f"{args.out / 'trials.jsonl'} exists: refusing to add to earlier evidence")
     clips(args.out)
-    protocols = args.protocols.split(",")
+    if args.arms:
+        arms = parse_arms(args.arms)
+        interleave = "fixed"
+    else:
+        arms = [(p, p, {}) for p in args.protocols.split(",")]
+        interleave = "flip"
     clean = (0, 0, False)
     if args.profiles:
         profiles = []
@@ -360,41 +426,59 @@ def main():
         profiles = [(int(x), args.jitter_ms, False) for x in args.losses.split(",")]
     plan = []
     for s in range(1, args.clean + 1):
-        for p in protocols:
-            plan.append((p, clean, s))
+        for a in arms:
+            plan.append((a, clean, s))
     for prof in profiles:
         for s in range(1, args.seeds + 1):
-            # Back to back per seed, the order flipping each seed.
-            for p in (protocols if s % 2 else list(reversed(protocols))):
-                plan.append((p, prof, s))
-    rows = [trial(args, p, prof, s, args.out) for p, prof, s in plan]
-    keys = sorted({k for r in rows for k in r}, key=lambda k: (k not in ("protocol", "loss_pct", "jitter_ms", "seed"), k))
+            # Back to back per seed: with --arms in the order given, else the
+            # order flipping each seed.
+            order = arms if interleave == "fixed" or s % 2 else list(reversed(arms))
+            for a in order:
+                plan.append((a, prof, s))
+    rows = [trial(args, a, prof, s, args.out) for a, prof, s in plan]
+    keys = sorted({k for r in rows for k in r},
+                  key=lambda k: (k not in ("arm", "protocol", "loss_pct", "jitter_ms", "seed"), k))
     with open(args.out / "trials.tsv", "w") as f:
         f.write("\t".join(keys) + "\n")
         for r in rows:
             f.write("\t".join(str(r.get(k, "")) for k in keys) + "\n")
     key = lambda r: (r["loss_pct"], r["jitter_ms"], r["jitter_order"] == "keep")
+    names = [a[0] for a in arms]
+    srt = next((a[0] for a in arms if a[1] == "srt"), None)
+    baseline = next((a[0] for a in arms if a[1] == "whip"), None)
+    fmt = lambda x, n=1: "" if x is None else round(x, n)
     with open(args.out / "summary.tsv", "w") as f:
-        f.write("loss_pct\tjitter_ms\tjitter_order\tprotocol\truns\tunrecovered_mean\tunrecovered_sd\tunrecovered\t"
-                "vs_clean_mean\twhip_minus_srt\twelch_t\tnever_ready\tretransmits\treordered\n")
+        f.write("loss_pct\tjitter_ms\tjitter_order\tarm\tprotocol\truns\tunrecovered_mean\tunrecovered_sd\tunrecovered\t"
+                "share_of_sent_pct\tvs_clean_mean\tminus_srt\twelch_t_vs_srt\tminus_baseline\twelch_t_vs_baseline\t"
+                "never_ready\tload\tretransmits\treordered\n")
         order = ([clean] if args.clean else []) + [p for p in profiles if p != clean]
-        groups = {(prof, p): [r for r in rows if r["protocol"] == p and key(r) == prof] for prof in order for p in protocols}
-        base = {p: statistics.mean([r.get("unrecovered", 0) for r in groups[(clean, p)]]) if groups.get((clean, p)) else 0.0
-                for p in protocols}
+        groups = {(prof, n): [r for r in rows if r["arm"] == n and key(r) == prof] for prof in order for n in names}
+        un_of = lambda g: [r.get("unrecovered") for r in g if r.get("unrecovered") is not None]
+        base = {n: statistics.mean(un_of(groups[(clean, n)])) if un_of(groups.get((clean, n), [])) else 0.0
+                for n in names}
         for prof in order:
-            un = {p: [r.get("unrecovered") for r in groups[(prof, p)] if r.get("unrecovered") is not None] for p in protocols}
-            both = len(protocols) == 2 and un.get("whip") and un.get("srt")
-            t = welch(un["whip"], un["srt"]) if both else None
-            diff = statistics.mean(un["whip"]) - statistics.mean(un["srt"]) if both else None
-            for p in protocols:
-                xs = un[p]
-                g = groups[(prof, p)]
-                f.write(f"{prof[0]}\t{prof[1]}\t{'keep' if prof[2] else 'reorder'}\t{p}\t{len(g)}\t"
-                        f"{round(statistics.mean(xs), 1) if xs else ''}\t"
-                        f"{round(statistics.stdev(xs), 1) if len(xs) > 1 else ''}\t{' '.join(str(x) for x in xs)}\t"
-                        f"{round(statistics.mean(xs) - base[p], 1) if xs else ''}\t"
-                        f"{round(diff, 1) if diff is not None else ''}\t{round(t, 2) if t is not None else ''}\t"
+            un = {n: un_of(groups[(prof, n)]) for n in names}
+            for a in arms:
+                n = a[0]
+                xs, g = un[n], groups[(prof, n)]
+
+                def against(other):
+                    if other is None or other == n or not xs or not un.get(other):
+                        return None, None
+                    return statistics.mean(xs) - statistics.mean(un[other]), welch(xs, un[other])
+
+                d_srt, t_srt = against(srt)
+                d_base, t_base = against(baseline) if a[1] == "whip" else (None, None)
+                sent = [r["frames_sent"] for r in g if r.get("frames_sent") and r.get("unrecovered") is not None]
+                share = 100 * sum(xs) / sum(sent) if sent and sum(sent) else None
+                loads = [r["load"] for r in g] + [r["load_end"] for r in g if "load_end" in r]
+                f.write(f"{prof[0]}\t{prof[1]}\t{'keep' if prof[2] else 'reorder'}\t{n}\t{a[1]}\t{len(g)}\t"
+                        f"{fmt(statistics.mean(xs)) if xs else ''}\t"
+                        f"{fmt(statistics.stdev(xs)) if len(xs) > 1 else ''}\t{' '.join(str(x) for x in xs)}\t"
+                        f"{fmt(share)}\t{fmt(statistics.mean(xs) - base[n]) if xs else ''}\t"
+                        f"{fmt(d_srt)}\t{fmt(t_srt, 2)}\t{fmt(d_base)}\t{fmt(t_base, 2)}\t"
                         f"{sum(1 for r in g if not r.get('ready'))}\t"
+                        f"{f'{min(loads)} to {max(loads)}' if loads else ''}\t"
                         f"{' '.join(str(r.get('proxy_retransmits', '')) for r in g)}\t"
                         f"{' '.join(str(r.get('proxy_reordered', '')) for r in g)}\n")
     print((args.out / "summary.tsv").read_text())

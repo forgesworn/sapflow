@@ -936,10 +936,13 @@ impl Sockets {
 }
 
 fn session_config(config: &WhipConfig) -> SessionConfig {
-    SessionConfig {
+    let mut c = SessionConfig {
         keyframe_interval: config.keyframe_interval,
         ..SessionConfig::default()
-    }
+    };
+    c.receiver.jitter = config.jitter;
+    c.receiver.nack_repeat = config.nack_repeat;
+    c
 }
 
 fn digest(token: &str) -> [u8; 32] {
@@ -1028,6 +1031,11 @@ async fn run(
     tracing::info!(
         addr = %whip.config.addr,
         udp = %whip.config.udp_addr,
+        jitter_ms = whip.config.jitter.as_millis() as u64,
+        nack_repeat = whip
+            .config
+            .nack_repeat
+            .map_or_else(|| "rtt*1.25".to_owned(), |d| format!("{}ms", d.as_millis())),
         "WHIP listening"
     );
     let (tcp, tcp_listener) = whip_tcp::link(sockets.tcp);

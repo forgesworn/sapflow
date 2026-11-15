@@ -148,6 +148,11 @@ pub struct ReceiverConfig {
     pub initial_rtt: Duration,
     /// Most NACKs sent for one packet. Default 4.
     pub max_nacks: u8,
+    /// Experimental: a fixed time between NACKs for one packet
+    /// (`SAPFLOW_WHIP_NACK_REPEAT`), in place of the RTT and a quarter, at
+    /// least 5 ms. For measuring A4.1 only. Default `None`: the RTT and a
+    /// quarter.
+    pub nack_repeat: Option<Duration>,
     /// Ceiling on NACK traffic, all streams together, in bits per second
     /// of RTCP NACK packets as built (headers and FCI). Default 64 000.
     pub nack_bitrate: u32,
@@ -189,6 +194,7 @@ impl Default for ReceiverConfig {
             max_dropout: 3000,
             initial_rtt: Duration::from_millis(100),
             max_nacks: 4,
+            nack_repeat: None,
             nack_bitrate: 64_000,
             nack_burst: 1500,
             keyframe_interval: Some(Duration::from_secs(2)),
@@ -848,6 +854,7 @@ impl Receiver {
             reorder_delay: micros(c.reorder_delay),
             max_dropout: u64::from(c.max_dropout),
             max_nacks: c.max_nacks,
+            nack_repeat: c.nack_repeat.map(micros),
         };
         let media = match cfg.codec {
             Codec::H264 => Media::Video(Box::new(Video {

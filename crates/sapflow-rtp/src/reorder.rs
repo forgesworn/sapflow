@@ -27,6 +27,9 @@ pub(crate) struct Settings {
     pub reorder_delay: u64,
     pub max_dropout: u64,
     pub max_nacks: u8,
+    /// A fixed time between NACKs for one packet, in place of
+    /// [`retry`]'s RTT and a quarter. `None` by default.
+    pub nack_repeat: Option<u64>,
 }
 
 /// A packet held for release.
@@ -425,7 +428,7 @@ impl Reorder {
         } else if nacks == 0 {
             since.saturating_add(self.s.reorder_delay)
         } else {
-            last_nack.saturating_add(retry(rtt))
+            last_nack.saturating_add(self.s.nack_repeat.unwrap_or_else(|| retry(rtt)))
         };
         (at < deadline).then_some(at)
     }
@@ -506,6 +509,7 @@ mod tests {
             reorder_delay: 10 * MS,
             max_dropout: 3000,
             max_nacks: 4,
+            nack_repeat: None,
         }
     }
 
@@ -635,6 +639,47 @@ mod tests {
         assert_eq!(r.next_nack(assumed), Some(135 * MS));
         r.mark_nacked(&r.due_nacks(135 * MS, assumed), 135 * MS);
         assert_eq!(r.next_nack(assumed), None, "260 ms is past the deadline");
+    }
+
+    #[test]
+    fn nack_repeat_default_and_fixed() {
+        // The default is the RTT and a quarter, at least 5 ms.
+        assert_eq!(settings().nack_repeat, None);
+        assert_eq!(retry(60 * MS), 75 * MS);
+        assert_eq!(retry(80 * MS), 100 * MS);
+        assert_eq!(retry(MS), 5 * MS);
+        // A fixed spacing ignores the RTT: missing since 0, NACKs at 10,
+        // 40, 70 and 100 ms, capped at 4, whatever the RTT.
+        for rtt in [MS, 60 * MS, 500 * MS] {
+            let mut r = Reorder::new(Settings {
+                nack_repeat: Some(30 * MS),
+                ..settings()
+            });
+            put(&mut r, 0, 1);
+            put(&mut r, 0, 3);
+            let mut sent = Vec::new();
+            while let Some(at) = r.next_nack(rtt) {
+                let due = r.due_nacks(at, rtt);
+                r.mark_nacked(&due, at);
+                sent.push(at);
+            }
+            assert_eq!(sent, [10 * MS, 40 * MS, 70 * MS, 100 * MS], "rtt {rtt}");
+        }
+        // Still bounded by the jitter deadline: 10, 110; 210 is past 200.
+        let mut r = Reorder::new(Settings {
+            nack_repeat: Some(100 * MS),
+            max_nacks: 8,
+            ..settings()
+        });
+        put(&mut r, 0, 1);
+        put(&mut r, 0, 3);
+        let mut sent = Vec::new();
+        while let Some(at) = r.next_nack(30 * MS) {
+            let due = r.due_nacks(at, 30 * MS);
+            r.mark_nacked(&due, at);
+            sent.push(at);
+        }
+        assert_eq!(sent, [10 * MS, 110 * MS]);
     }
 
     #[test]

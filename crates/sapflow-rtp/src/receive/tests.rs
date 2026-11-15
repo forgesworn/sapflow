@@ -1458,3 +1458,14 @@ fn late_retransmissions_over_rtx_are_not_a_restart() {
 }
 
 mod timing;
+
+#[test]
+fn loss_wait_and_nack_repeat_defaults() {
+    // A4.1 measured these; the experimental settings leave them as they are.
+    let c = ReceiverConfig::default();
+    assert_eq!(c.jitter, Duration::from_millis(200));
+    assert_eq!(c.nack_repeat, None, "the RTT and a quarter");
+    assert_eq!(c.max_nacks, 4);
+    assert_eq!(c.reorder_delay, Duration::from_millis(10));
+    assert_eq!(c.initial_rtt, Duration::from_millis(100));
+}

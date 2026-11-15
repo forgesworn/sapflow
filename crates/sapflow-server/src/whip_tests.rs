@@ -2411,3 +2411,34 @@ fn every_end_reason_has_a_name() {
     assert_eq!((counts.add("deleted"), counts.add("deleted")), (1, 2));
     assert_eq!((counts.get("deleted"), counts.get("panicked")), (2, 0));
 }
+
+/// The experimental A4.1 settings reach the receiver only when given; the
+/// receiver's own defaults (200 ms, the RTT and a quarter) stand otherwise.
+#[test]
+fn loss_wait_and_nack_repeat_reach_the_receiver_only_when_set() {
+    let plain = session_config(&app(&[]).config.whip.clone().expect("WHIP on"));
+    let defaults = sapflow_rtp::receive::ReceiverConfig::default();
+    assert_eq!(plain.receiver, defaults);
+    assert_eq!(plain.receiver.jitter, Duration::from_millis(200));
+    assert_eq!(plain.receiver.nack_repeat, None);
+    let set = session_config(
+        &app(&[
+            ("SAPFLOW_WHIP_JITTER", "400"),
+            ("SAPFLOW_WHIP_NACK_REPEAT", "30"),
+        ])
+        .config
+        .whip
+        .clone()
+        .expect("WHIP on"),
+    );
+    assert_eq!(set.receiver.jitter, Duration::from_millis(400));
+    assert_eq!(set.receiver.nack_repeat, Some(Duration::from_millis(30)));
+    assert_eq!(
+        sapflow_rtp::receive::ReceiverConfig {
+            jitter: defaults.jitter,
+            nack_repeat: None,
+            ..set.receiver
+        },
+        defaults
+    );
+}
