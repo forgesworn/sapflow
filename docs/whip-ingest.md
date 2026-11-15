@@ -1582,7 +1582,22 @@ API; a `tcp` candidate without `SAPFLOW_WHIP_TCP_ADDR`, and
 address; `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` other than `v2`, or `v2` without
 `SAPFLOW_WHIP_TCP_ADDR` or `SAPFLOW_WHIP_TRUSTED_PROXY`. The UDP socket is
 bound even when only `tcp` candidates are advertised.
-`SAPFLOW_WHIP_JITTER` is still a proposal.
+
+**Experimental, for A4.1's retest only.** Two settings let the loss wait and
+the NACK repeat be chosen at start, so that the owner's decision 5 of 15
+November 2026 could be measured. They are not recommended settings, and
+their defaults are the receiver's own, unchanged:
+
+- `SAPFLOW_WHIP_JITTER`: the longest wait for a missing packet, in
+  milliseconds, 20 to 1000. Unset: 200 ms.
+- `SAPFLOW_WHIP_NACK_REPEAT`: a fixed time between NACKs for one packet, in
+  milliseconds, 5 to 1000, in place of the RTT and a quarter. The cap of 4
+  NACKs a packet and the 64 kbit/s NACK ceiling still apply. Unset: the RTT
+  and a quarter, at least 5 ms.
+
+Anything else (a unit, a fraction, a value out of range) is refused at
+start. The server logs the effective values with `WHIP listening`. The
+default `SAPFLOW_WHIP_JITTER` is still A4.1's open decision.
 
 | Variable | Meaning |
 |---|---|
@@ -1595,7 +1610,8 @@ bound even when only `tcp` candidates are advertised.
 | `SAPFLOW_WHIP_TRUSTED_PROXY` | Address whose `X-Forwarded-For` and PROXY headers are believed |
 | `SAPFLOW_WHIP_ALLOW_ORIGINS` | Origins allowed by CORS for browser publishing |
 | `SAPFLOW_WHIP_KEYFRAME_INTERVAL` | Keyframe request cadence, proposed 2 s |
-| `SAPFLOW_WHIP_JITTER` | Longest wait for a lost packet, proposed 200 ms |
+| `SAPFLOW_WHIP_JITTER` | Experimental: longest wait for a lost packet, ms, default 200 |
+| `SAPFLOW_WHIP_NACK_REPEAT` | Experimental: fixed time between NACKs for one packet, ms; default the RTT and a quarter |
 | `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, default 2 s |
 | `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | `maxaveragebitrate` offered for Opus |
 
