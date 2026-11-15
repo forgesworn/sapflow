@@ -179,8 +179,8 @@ names one:
 - a CertificateVerify signature that fails the one verification.
 
 What forged epoch 0 input can still do, each bounded by the caller's
-handshake deadline. Each is to be accepted as inherent, pending the owner's
-written acceptance (A4.4):
+handshake deadline. The owner accepted each as inherent in writing on 15
+November 2026 (A4.4):
 
 - A plausible substituted ClientHello, ClientKeyExchange or
   CertificateVerify that reaches the state machine before the genuine one.

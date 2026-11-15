@@ -12,6 +12,9 @@ A4.2's Linux run and the final gate ran after. One A4.1 trial was rerun on
 the merged build (see "A stream that never goes live"), and A4.1's jitter
 check ran on the build after main's #82 was merged too.
 
+The owner's decisions of 15 November 2026 on A4.1, A4.2 and A4.4 were
+added to this note afterwards. No new measurement came with them.
+
 ## The owner's decisions
 
 The owner's written decisions of 12 November 2026, as given:
@@ -27,6 +30,34 @@ The owner's written decisions of 12 November 2026, as given:
    on the test host, "WHIP against SRT, with RTMP for reference, and the
    same ratio rule fixed in advance".
 
+## The owner's decisions of 15 November 2026
+
+The owner's choices of 15 November 2026, with what each settles:
+
+5. **A4.1: "Park, test both later".** A4.1 stays recorded as not met. Two
+   changes not yet tried are named for the retest: NACK repeats sooner than
+   every 1.25 round trips at the same 200 ms wait, which adds attempts
+   without adding latency, and a 400 ms wait. Both are to be measured at 5%
+   loss with five seeds, in the same slice as the fixes for A4.4 findings 7
+   to 10, before WHIP faces users. The default `SAPFLOW_WHIP_JITTER` stays
+   200 ms until then.
+
+   Arithmetic, not a measurement: at a 60 ms round trip only two NACK tries
+   come back within the 200 ms wait. With 5% loss on each NACK and on each
+   retransmission, about 1% of lost packets stay unrepaired, about 4 of
+   some 390, against the 3 to 9 measured.
+6. **A4.2 CPU at 10 streams: "Accept as met".** By the rule fixed in
+   advance the rounds disagree at 10 streams (0.75, 0.83 and 1.11), so this
+   is the owner's acceptance, not a pass by the rule. With decision 4 on
+   memory, A4.2 is settled.
+7. **A4.4 findings 7 to 10: "Before WHIP faces users".** They are to be
+   fixed before WHIP is offered to users, and stay open while WHIP is off
+   by default. A4.4 stays not met until then.
+8. **A4.4 residuals: "Accept them".** The owner accepts in writing the
+   residuals the [A4.4 record](a4.4-security-review-2026-11-12.md) states
+   as inherent: a plausible substituted message that arrives before the
+   genuine one, and sustained injection or flooding.
+
 ## Summary
 
 | Gate | Result | Status |
@@ -35,9 +66,9 @@ The owner's written decisions of 12 November 2026, as given:
 | A3.10 OBS keyframes | OBS 32.0.4 does not answer PLI: in five runs its keyframes came every 10 s, or 7 s, as its own keyframe interval was set, whether Sapflow asked every 2 s or not at all (a control) | Recorded: **no** |
 | A3.10 OBS rate | OBS's video stayed at 2.50 to 2.53 Mbit/s with receiver reports claiming 25% loss and with REMB at 500 kbit/s, as without either. The same stimuli took headless Chrome from about 1 Mbit/s to 0.03 and to 0.42 Mbit/s | Recorded: **no** change on either |
 | A3.8 sync, 4 s start hold | Chrome 157: 20 of 20 runs within (UDP and ICE-TCP 10 each), audio -0.6 to +17.5 ms against the video, every run aligned by sender reports. FFmpeg: 10 of 10 at 0 to 0.5 ms, aligned at once | **Met** |
-| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. A decision point: the default `SAPFLOW_WHIP_JITTER` (200 ms) and the NACK schedule |
+| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. Parked by the owner (decision 5): faster NACK repeats and a 400 ms wait are to be measured before WHIP faces users |
 | A4.2 memory | accepted by the owner in writing (decision 4) | Accepted |
-| A4.2 CPU, Linux container | 27 of 27 runs under the load gate, none skipped. WHIP's CPU per stream against SRT's: 0.74 to 0.84 at 1 stream, 0.83 to 0.96 at 50, and at 10 streams 0.75 and 0.83 with one round at 1.11. WHIP was below SRT in 8 of 9 rounds | **Met** at 1 and 50 streams by the rule. At 10 the rounds disagree (one of three above), so the call there is the owner's |
+| A4.2 CPU, Linux container | 27 of 27 runs under the load gate, none skipped. WHIP's CPU per stream against SRT's: 0.74 to 0.84 at 1 stream, 0.83 to 0.96 at 50, and at 10 streams 0.75 and 0.83 with one round at 1.11. WHIP was below SRT in 8 of 9 rounds | **Met** at 1 and 50 streams by the rule. At 10 the rounds disagree (one of three above); accepted by the owner (decision 6) |
 
 ## Host and versions
 
@@ -546,7 +577,7 @@ averages were 1.1 to 7.8 at the start of each run.
 **Verdict.** By the rule, WHIP's CPU is no higher than SRT's at 1 stream
 and at 50. At 10 the rounds disagree: two at 0.75 and 0.83, and one at 1.11,
 where WHIP's own CPU per stream (1.32%) was twice its other two rounds'.
-That call is the owner's. WHIP was below SRT in 8 of the 9 rounds, and
+The owner accepted it (decision 6). WHIP was below SRT in 8 of the 9 rounds, and
 above RTMP in 8 of 9.
 
 The container's spread is much smaller than the macOS host's. SRT at 50
@@ -556,11 +587,11 @@ not above as on macOS; the owner has accepted it either way.
 
 ## What is left open
 
-- **A4.1's decision.** At its 200 ms wait, WHIP leaves more frames
-  unrecovered than SRT at 5% loss. The default `SAPFLOW_WHIP_JITTER` and
-  the NACK schedule (how many attempts, how soon) are the owner's to
-  choose. The wait is compiled in (`SAPFLOW_WHIP_JITTER` is not a setting
-  yet), so no other value was measured.
+- **A4.1, parked.** At its 200 ms wait, WHIP leaves more frames
+  unrecovered than SRT at 5% loss. The owner parked it (decision 5): NACK
+  repeats sooner at the same wait, and a 400 ms wait, are to be measured
+  before WHIP faces users. The wait is compiled in (`SAPFLOW_WHIP_JITTER`
+  is not a setting yet), so no other value was measured.
 - **A stream that never goes live, or goes live late.** Under loss that is
   not repaired, video skips from a loss to the next keyframe. Sapflow's
   muxer then logs "timestamps broke before the first segment was complete;
@@ -587,7 +618,7 @@ not above as on macOS; the owner has accepted it either way.
 - **A3.10's scope.** One OBS version, x264 only, and one level of each
   stimulus (25% claimed loss, REMB at 500 kbit/s) on loopback. Hardware
   encoders and OBS's own dynamic bitrate setting were not tried.
-- **A4.2 at 10 streams** is the owner's call (above). The macOS figures
+- **A4.2 at 10 streams** was accepted by the owner (decision 6). The macOS figures
   from the first round stand beside these.
 - **Docker, left on the test host.** The images pulled or built for this
   work were removed: `rust:1.94.1-slim-bookworm`,
