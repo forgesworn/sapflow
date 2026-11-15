@@ -127,8 +127,9 @@ pub enum Error {
     BadFinished,
     /// The peer reached a bound.
     Limit(Limit),
-    /// The handshake made no progress after
-    /// [`crate::Config::max_transmissions`] sends of our flight.
+    /// The client's flight did not complete by flight 4's fixed expiry, the
+    /// end of the timer-only schedule of
+    /// [`crate::Config::max_transmissions`] sends.
     Timeout,
     /// The peer sent a fatal alert (or `close_notify` during the
     /// handshake) under the read keys, with this description. An epoch 0

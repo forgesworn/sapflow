@@ -515,6 +515,99 @@ fn retransmitted_hello_resends_once_per_spacing_and_within_budget() {
     );
 }
 
+/// Flight 4 at `p.now`, and the client's answer to it, held back.
+fn flight4_and_held_answer(p: &mut Pair) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let hello = p.client.start();
+    p.feed(&hello).expect("hello");
+    let mut back = Vec::new();
+    for d in &p.drain() {
+        back.extend(p.client.handle(d).expect("client"));
+    }
+    (hello, split_records(&back))
+}
+
+/// Replays the hello `n` times at the 200 ms resend floor; each resends
+/// flight 4 while the send budget lasts.
+fn replay_hello(p: &mut Pair, hello: &[Vec<u8>], n: usize) {
+    for _ in 0..n {
+        p.now += Duration::from_millis(200);
+        p.feed(hello).expect("replayed hello");
+        p.drain();
+    }
+}
+
+/// A4.4 review, round 5: peer-triggered resends and timer resends shared
+/// one budget, and a peer-triggered resend restarted the timer without
+/// doubling it. Five replays of the accepted hello at 200 ms spacing spent
+/// the six sends by 1 s, and the timer then failed the handshake at 2 s,
+/// so a genuine client flight delayed to 3 s (well inside WHIP's 10 s
+/// deadline) was refused. The budget now only stops sends; the handshake
+/// fails when the timer-only schedule would have run out.
+#[test]
+fn replayed_hellos_do_not_bring_the_timeout_forward() {
+    let mut p = pair(Options::default());
+    let start = p.now;
+    let (hello, recs) = flight4_and_held_answer(&mut p);
+    replay_hello(&mut p, &hello, 5);
+    assert_eq!(p.server.stats().retransmissions, 5, "the budget is spent");
+    let late = start + Duration::from_secs(3);
+    while let Some(t) = p.server.poll_timeout().filter(|&t| t <= late) {
+        assert!(t > p.now, "the timer is always ahead");
+        p.now = t;
+        p.server
+            .handle_timeout(t)
+            .expect("no timeout before the schedule runs out");
+        assert!(p.drain().is_empty(), "nothing past the budget");
+    }
+    p.now = late;
+    completes(&mut p, &recs);
+    assert_eq!(p.server.stats().retransmissions, 5, "six sends in all");
+}
+
+/// Spending the budget early neither brings the timeout forward nor
+/// pushes it back: an unanswered flight 4 fails when the timer alone would
+/// have failed it (63 s with the defaults), and sends nothing after the
+/// budget, whatever the peer repeats.
+#[test]
+fn a_spent_budget_leaves_the_timeout_where_it_was() {
+    let config = Config::default();
+    let mut p = pair(Options::default());
+    let start = p.now;
+    let (hello, _) = flight4_and_held_answer(&mut p);
+    replay_hello(&mut p, &hello, 5);
+    let mut failed_at = None;
+    while let Some(t) = p.server.poll_timeout() {
+        assert!(t > p.now, "the timer is always ahead");
+        // The peer keeps repeating its hello up to each timer.
+        while p.now + Duration::from_secs(1) < t {
+            p.now += Duration::from_secs(1);
+            p.feed(&hello).expect("replayed hello");
+            assert!(p.drain().is_empty(), "nothing past the budget");
+        }
+        p.now = t;
+        match p.server.handle_timeout(t) {
+            Ok(()) => assert!(p.drain().is_empty(), "nothing past the budget"),
+            Err(e) => {
+                assert_eq!(e, Error::Timeout);
+                failed_at = Some(t);
+                break;
+            }
+        }
+    }
+    let schedule: Duration = (0..config.max_transmissions)
+        .map(|k| {
+            config
+                .initial_retransmit
+                .saturating_mul(1 << k)
+                .min(config.max_retransmit)
+        })
+        .sum();
+    assert_eq!(schedule, Duration::from_secs(63));
+    assert_eq!(failed_at, Some(start + schedule));
+    assert_eq!(p.server.state(), State::Failed(Error::Timeout));
+    assert_eq!(p.server.stats().retransmissions, 5, "six sends in all");
+}
+
 #[test]
 fn a_short_prefix_of_the_hello_does_not_trigger_a_resend() {
     let mut p = pair(Options::default());

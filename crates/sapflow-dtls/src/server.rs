@@ -107,8 +107,13 @@ pub struct Config {
     /// the peer's retransmission. Up to `max_retransmit`; default 200 ms.
     pub min_resend_interval: Duration,
     /// Most sends of one flight, the first included, whatever triggered
-    /// them. After that many sends of flight 4 with no reply the handshake
-    /// fails with [`Error::Timeout`]. 1 to 32; default 6.
+    /// them. It bounds output only: once it is spent, nothing more is sent,
+    /// but the handshake still waits for the client's flight until the time
+    /// the timer alone would have taken to send flight 4 this many times and
+    /// wait out the last interval (63 s with the defaults), and then fails
+    /// with [`Error::Timeout`]. Resends the peer triggers spend the budget
+    /// but never bring that time forward or push it back. 1 to 32; default
+    /// 6.
     pub max_transmissions: u32,
     /// Whether to send a HelloVerifyRequest cookie first. Default off: the
     /// server is used only behind ICE, which proves return routability for
@@ -332,6 +337,9 @@ pub struct Server {
     flight: Option<Flight>,
     transmissions: u32,
     timer: Option<Instant>,
+    /// When an unanswered flight 4 fails, fixed when it is first sent: the
+    /// end of the timer-only schedule ([`lifetime`]).
+    expiry: Option<Instant>,
     interval: Duration,
     last_sent: Option<Instant>,
     sent_this_input: bool,
@@ -360,6 +368,24 @@ pub(crate) fn downgrade_sentinel(random: &[u8; 32]) -> bool {
     random
         .get(24..)
         .is_some_and(|tail| DOWNGRADE.iter().any(|s| s.as_slice() == tail))
+}
+
+/// How long an unanswered flight 4 is waited on: the timer-only schedule,
+/// [`Config::max_transmissions`] intervals starting at
+/// [`Config::initial_retransmit`] and doubling up to
+/// [`Config::max_retransmit`], as [`Server::handle_timeout`] backs off.
+fn lifetime(config: &Config) -> Duration {
+    let mut interval = config.initial_retransmit;
+    let mut total = Duration::ZERO;
+    for _ in 0..config.max_transmissions {
+        total = total.saturating_add(interval);
+        interval = next_interval(config, interval);
+    }
+    total
+}
+
+fn next_interval(config: &Config, interval: Duration) -> Duration {
+    interval.saturating_mul(2).min(config.max_retransmit)
 }
 
 fn whole(m: &Message) -> Result<Vec<u8>, Error> {
@@ -442,6 +468,7 @@ impl Server {
             flight: None,
             transmissions: 0,
             timer: None,
+            expiry: None,
             last_sent: None,
             sent_this_input: false,
             out: VecDeque::new(),
@@ -541,9 +568,11 @@ impl Server {
         self.settle(result)
     }
 
-    /// The timer from [`Server::poll_timeout`] fired: resend the flight,
-    /// or fail with [`Error::Timeout`] once it has been sent
-    /// [`Config::max_transmissions`] times.
+    /// The timer from [`Server::poll_timeout`] fired: resend the flight
+    /// while [`Config::max_transmissions`] allows, or fail with
+    /// [`Error::Timeout`] once the flight's fixed expiry has come (see
+    /// [`Config::max_transmissions`]). With the budget spent and the expiry
+    /// still ahead, nothing is sent and the timer waits for the expiry.
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
         let Some(at) = self.timer else {
             return Ok(());
@@ -551,16 +580,18 @@ impl Server {
         if now < at || self.terminal() {
             return Ok(());
         }
-        if self.transmissions >= self.config.max_transmissions {
+        let expiry = self.expiry.unwrap_or(at);
+        if now >= expiry {
             return self.settle(Err(Error::Timeout));
         }
-        self.interval = self
-            .interval
-            .saturating_mul(2)
-            .min(self.config.max_retransmit);
+        if self.transmissions >= self.config.max_transmissions {
+            self.timer = Some(expiry);
+            return Ok(());
+        }
+        self.interval = next_interval(&self.config, self.interval);
         self.sent_this_input = false;
         let result = self.send_flight(now);
-        self.timer = Some(now + self.interval);
+        self.timer = Some((now + self.interval).min(expiry));
         self.settle(result)
     }
 
@@ -597,6 +628,7 @@ impl Server {
         self.write = None;
         self.flight = None;
         self.timer = None;
+        self.expiry = None;
         self.reassembler.restart_at(self.reassembler.next_seq());
     }
 
@@ -646,7 +678,8 @@ impl Server {
     /// A retransmission from the peer suggests our flight was lost (RFC
     /// 6347 section 4.2.4). At most one resend per input datagram, none
     /// beyond [`Config::max_transmissions`], and none sooner than
-    /// [`Config::min_resend_interval`] after the last send.
+    /// [`Config::min_resend_interval`] after the last send. It restarts the
+    /// timer, but never past the flight's expiry.
     fn resend(&mut self, now: Instant) -> Result<(), Error> {
         if self.sent_this_input
             || self.flight.is_none()
@@ -662,7 +695,8 @@ impl Server {
         }
         self.send_flight(now)?;
         if self.timer.is_some() {
-            self.timer = Some(now + self.interval);
+            let next = now + self.interval;
+            self.timer = Some(self.expiry.map_or(next, |e| next.min(e)));
         }
         Ok(())
     }
@@ -1100,6 +1134,7 @@ impl Server {
         self.interval = self.config.initial_retransmit;
         self.send_flight(now)?;
         self.timer = Some(now + self.interval);
+        self.expiry = Some(now + lifetime(&self.config));
         Ok(())
     }
 
@@ -1223,6 +1258,7 @@ impl Server {
                     refused_renegotiation: false,
                 };
                 self.timer = None;
+                self.expiry = None;
                 self.transmissions = 0;
                 self.profile = Some(profile);
                 self.send_flight(now)?;
