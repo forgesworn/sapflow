@@ -13,6 +13,8 @@
 //! `--seed` makes the identity and the server's randomness reproducible, so
 //! a `--record`ed run replays offline byte for byte. `--drop-first-flight`
 //! discards our first flight once, to exercise both sides' retransmission;
+//! `--hello-verify` turns the cookie exchange on, and needs the
+//! experimental `hello-verify` feature as well as `testing`;
 //! `--drop-final-flight` discards our ChangeCipherSpec and Finished once, so
 //! the client must retransmit its flight and we must answer it.
 //! Bind to loopback only.
@@ -56,7 +58,13 @@ fn main() {
                 seed = Some(s);
             }
             "--mtu" => config.mtu = args.next().expect("mtu").parse().expect("mtu"),
+            #[cfg(feature = "hello-verify")]
             "--hello-verify" => config.hello_verify = true,
+            #[cfg(not(feature = "hello-verify"))]
+            "--hello-verify" => {
+                eprintln!("--hello-verify needs the experimental hello-verify feature");
+                std::process::exit(2);
+            }
             "--drop-first-flight" => drop_first = true,
             "--drop-final-flight" => drop_final = true,
             "--record" => record = Some(std::fs::File::create(args.next().expect("file")).unwrap()),

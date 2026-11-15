@@ -11,6 +11,10 @@ cargo-fuzz = true
 [features]
 default = ["fuzzing"]
 fuzzing = []
+# Opt in to the experimental DTLS cookie exchange, so dtls_server's mode
+# bit 0 turns it on. Off by default: the default fuzz build is sapflow-dtls
+# as WHIP builds it.
+hello-verify = ["sapflow-dtls/hello-verify"]
 
 [dependencies]
 libfuzzer-sys = "0.4.13"

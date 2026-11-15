@@ -1746,7 +1746,13 @@ Implementation notes (11 November 2026):
   may match.
 - **Bounds and defaults.** These are listed in the crate README.
   - HelloVerifyRequest is off by default, because ICE has already proved
-    return routability.
+    return routability. WHIP never turns it on (`SessionConfig::dtls` is
+    `Config::default()` in `sapflow-whip`, and `sapflow-server` does not
+    change it). Since 15 November 2026 it exists only behind
+    `sapflow-dtls`'s experimental `hello-verify` cargo feature, off by
+    default, which neither `sapflow-whip` nor `sapflow-server` enables;
+    without it the cookie and HelloVerifyRequest code is not compiled
+    (reassembly's unordered hello mode stays, unreachable).
   - Flights are re-recorded for every send.
   - A peer's retransmission triggers a resend only when it repeats the
     start of the hello we answered (the version and random included), or
@@ -1761,7 +1767,8 @@ Implementation notes (11 November 2026):
     the crate README.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
   byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
-  dropped first flight, a dropped final flight and the cookie exchange. The
+  dropped first flight, a dropped final flight and the cookie exchange
+  (since 15 November 2026 on a `hello-verify` feature build). The
   datagrams and OpenSSL's key log are fixtures. Unit tests replay them offline, derive the exporter
   and record keys from OpenSSL's master secret, and feed both halves of the
   material to `sapflow-rtp`.
@@ -1779,13 +1786,15 @@ Implementation notes (11 November 2026):
 - **Review.** On 11 November 2026 a review of this crate found no defect in
   the protocol or crypto code, and asked for fixes. Those fixes are made.
   That review was by an agent of the same session as the crate's author,
-  which A4.4 excludes, so it does not count towards A4.4. A4.4 still needs
-  an independent review of `sapflow-dtls` and of SRTP in `sapflow-rtp`,
-  with every finding recorded.
+  which A4.4 excludes, so it does not count towards A4.4. The independent
+  A4.4 review that followed is recorded in
+  [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 - **For W3.**
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
-    about 63 s before `Error::Timeout`.
+    about 63 s before `Error::Timeout`. That expiry is fixed when flight 4
+    is first sent; resends the peer triggers spend the six sends but do not
+    move it.
   - **Epoch 0 injection.** Epoch 0 input is not authenticated. Rounds 2
     and 3 of the A4.4 review (12 November 2026) found that one forged packet
     could end a handshake or hold it until the deadline. Round 2: a 25-byte
@@ -1838,9 +1847,35 @@ Implementation notes (11 November 2026):
     after it has signed (a buggy peer can do this too). The owner decided
     on 15 November 2026 that these four are to be fixed before WHIP faces
     users. They are fixed in `355e2ab`, `004282e`, `1204189` and `74513ab`, each with
-    a test that failed before the fix, and await a round 5 review. The
-    crate README describes each fix. See
-    [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
+    a test that failed before the fix, and round 5 (on `25ba46d`) found
+    them closed. Round 5 found one more (finding 11): resends the peer
+    triggers shared the timer's six-send budget, so five repeats of the
+    accepted hello at 200 ms spacing made the timer fail the handshake at
+    about 2 s, refusing a genuine client flight at 3 s (a buggy peer can do
+    this too). It is fixed in `9bea2ac` with tests that failed before the
+    fix, and round 6 (on `c3c66f2`) found it closed. Round 5 also
+    re-confirmed the residuals and the dependency pins. Round 6 found one
+    more (finding 12): with the cookie exchange on, which WHIP never turns
+    on, a hello with a missing or wrong cookie moved the expected seq on
+    after its HelloVerifyRequest, so an injected hello at the seq of the
+    client's cookie-bearing hello, with its HelloVerifyRequest lost, kept
+    the genuine one out until the deadline. It is fixed in `ad0d3ee` with
+    tests that failed before the fix, and round 7 (on `cc3c154`) found it
+    closed. Round 6 re-confirmed the residuals and the dependency pins, and
+    independently recomputed the eight RFC 5705 exporter results; round 7
+    re-confirmed the residuals and pins and recomputed the eight exporter
+    results again. Round 7 found two more, both only with the cookie
+    exchange on: finding 13 (P2), a lifetime cap on HelloVerifyRequests
+    that forged empty-cookie hellos sent before the publisher's first can
+    spend, so the genuine hello gets none; and finding 14 (P2,
+    conformance), later HelloVerifyRequests and the first ServerHello after
+    a cookie exchange not mirroring the triggering hello's record number.
+    The owner then decided on 15 November 2026 to put the cookie exchange
+    behind the experimental `hello-verify` feature and narrow A4.4 to
+    `sapflow-dtls` as WHIP builds it, without that feature, plus SRTP. 13
+    and 14 stay open against the feature. The crate README describes each
+    fix and the feature.
+    See [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 
     W3 limits the damage:
     - each `Server` receives only datagrams from its selected ICE-validated
@@ -2649,14 +2684,25 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
-  - Status, 15 November 2026: **not met yet.** Reviewed in four rounds,
+  - Status, 15 November 2026: **met on the narrowed scope.** Round 8, on
+    `35607aa`, found no in-scope issue. Reviewed in eight rounds,
     recorded in
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
     The findings of rounds 1 to 3 are fixed. Round 4's four
     handshake-availability findings, which the owner decided on 15
     November 2026 are to be fixed before WHIP faces users, are fixed in
-    `355e2ab`, `004282e`, `1204189` and `74513ab` and await a round 5 review. A4.4
-    needs that independent review of the whole scope before it can be met.
+    `355e2ab`, `004282e`, `1204189` and `74513ab`, and round 5 found them
+    closed. Round 5's one finding (P2, a shared retransmission budget that
+    brought the handshake timeout forward) is fixed in `9bea2ac`, and round
+    6 found it closed. Round 6's one finding (P2, a hello without a valid
+    cookie that moved the expected seq on, with the cookie exchange on) is
+    fixed in `ad0d3ee`, and round 7 found it closed. Round 7 found two
+    more P2s (13 and 14), both in the cookie exchange only. The owner
+    decided on 15 November 2026 that A4.4 covers `sapflow-dtls` as WHIP
+    builds it, without the experimental, off-by-default `hello-verify`
+    feature that now holds the cookie exchange, plus SRTP; 13 and 14 stay
+    open against that feature, outside A4.4. Round 8 reviewed that
+    scope and found nothing.
     The owner accepted the residuals the record states as inherent in
     writing on 15 November 2026.
 

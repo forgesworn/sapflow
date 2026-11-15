@@ -51,7 +51,9 @@ pub enum Limit {
     Buffered,
     /// More certificates in the peer's chain than [`crate::MAX_CHAIN`].
     Chain,
-    /// The peer kept asking for a HelloVerifyRequest.
+    /// The peer kept asking for a HelloVerifyRequest. Only produced with
+    /// the experimental `hello-verify` feature, but always present so that
+    /// turning the feature on elsewhere in a build cannot break a match.
     HelloVerify,
     /// A record sequence number would wrap.
     Sequence,
@@ -65,7 +67,8 @@ pub enum Limit {
 /// unauthenticated (epoch 0) message refused without ending the handshake,
 /// and then nothing is sent: a hello outside the profile, a certificate
 /// that does not match the offer, a bad key share or verify scheme, or a
-/// hello once HelloVerifyRequests have run out.
+/// hello once HelloVerifyRequests have run out (with the experimental
+/// `hello-verify` feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -127,8 +130,9 @@ pub enum Error {
     BadFinished,
     /// The peer reached a bound.
     Limit(Limit),
-    /// The handshake made no progress after
-    /// [`crate::Config::max_transmissions`] sends of our flight.
+    /// The client's flight did not complete by flight 4's fixed expiry, the
+    /// end of the timer-only schedule of
+    /// [`crate::Config::max_transmissions`] sends.
     Timeout,
     /// The peer sent a fatal alert (or `close_notify` during the
     /// handshake) under the read keys, with this description. An epoch 0

@@ -453,6 +453,7 @@ pub fn finished(body: &[u8]) -> Result<[u8; 12], Error> {
 
 /// HelloVerifyRequest (RFC 6347 section 4.2.1), with `server_version`
 /// DTLS 1.0, as that section says DTLS 1.2 servers should use.
+#[cfg(feature = "hello-verify")]
 pub(crate) fn hello_verify_request(cookie: &[u8]) -> Result<Vec<u8>, Error> {
     let mut b = Vec::with_capacity(3 + cookie.len());
     put_u16(&mut b, DTLS_1_0);

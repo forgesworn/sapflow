@@ -275,7 +275,8 @@ impl Harness {
 
 /// A scripted server run. The first byte sets the mode:
 ///
-/// - bit 0: `hello_verify`;
+/// - bit 0: `hello_verify`, with the `hello-verify` feature; ignored
+///   without it;
 /// - bit 1: a 256-byte MTU;
 /// - bit 2: the client offers only `SRTP_AES128_CM_HMAC_SHA1_80`;
 /// - bit 3: the client fragments to 90-byte datagrams;
@@ -305,6 +306,7 @@ pub fn dtls_server(data: &[u8]) -> Reached {
         script = rest;
     }
     let config = Config {
+        #[cfg(feature = "hello-verify")]
         hello_verify: mode & 1 != 0,
         mtu: if mode & 2 != 0 { 256 } else { 1200 },
         initial_retransmit: Duration::from_millis(100),

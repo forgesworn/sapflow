@@ -1,6 +1,7 @@
 //! The DTLS 1.2 server state machine, sans-IO.
 //!
-//! Flights (RFC 6347 section 4.2.4), with an optional cookie exchange:
+//! Flights (RFC 6347 section 4.2.4), with an optional cookie exchange
+//! (only with the experimental `hello-verify` feature):
 //!
 //! ```text
 //! ClientHello                 -->
@@ -50,6 +51,23 @@ pub const MAX_EXPECTED_FINGERPRINTS: usize = 4;
 /// Messages past the next expected one that reassembly buffers. The
 /// client's longest flight is four handshake messages.
 const AHEAD: u16 = 4;
+
+/// The reassembly window: [`AHEAD`], or with the cookie exchange on, room
+/// for every seq a hello can have before a valid cookie. Each
+/// HelloVerifyRequest can move the client one seq on (RFC 6347 section
+/// 4.2.1 has it answer each with a new hello), so after
+/// [`Config::max_transmissions`] of them its hello can be that far on.
+fn window(config: &Config) -> u16 {
+    #[cfg(feature = "hello-verify")]
+    if config.hello_verify {
+        let hellos = u16::try_from(config.max_transmissions).unwrap_or(u16::MAX);
+        return AHEAD.max(hellos.saturating_add(1));
+    }
+    #[cfg(not(feature = "hello-verify"))]
+    let _ = config;
+    AHEAD
+}
+
 /// The shortest ClientHello `ClientHello::parse` accepts: version, random,
 /// empty session id and cookie, one cipher suite and one compression
 /// method.
@@ -107,14 +125,25 @@ pub struct Config {
     /// the peer's retransmission. Up to `max_retransmit`; default 200 ms.
     pub min_resend_interval: Duration,
     /// Most sends of one flight, the first included, whatever triggered
-    /// them. After that many sends of flight 4 with no reply the handshake
-    /// fails with [`Error::Timeout`]. 1 to 32; default 6.
+    /// them. It bounds output only: once it is spent, nothing more is sent,
+    /// but the handshake still waits for the client's flight until the time
+    /// the timer alone would have taken to send flight 4 this many times and
+    /// wait out the last interval (63 s with the defaults), and then fails
+    /// with [`Error::Timeout`]. Resends the peer triggers spend the budget
+    /// but never bring that time forward or push it back. 1 to 32; default
+    /// 6.
     pub max_transmissions: u32,
     /// Whether to send a HelloVerifyRequest cookie first. Default off: the
     /// server is used only behind ICE, which proves return routability for
     /// the address before any DTLS datagram is accepted, and that is what
     /// the cookie is for (RFC 6347 section 4.2.1 allows turning it off
     /// where amplification is not a problem). Off saves a round trip.
+    ///
+    /// Experimental, and present only with the `hello-verify` feature,
+    /// which is off by default and which WHIP never enables. It is outside
+    /// the A4.4 security review and has known open findings (see the
+    /// crate README).
+    #[cfg(feature = "hello-verify")]
     pub hello_verify: bool,
     /// Largest handshake message accepted, by declared length. 512 to
     /// 65536; default 8192 (Chrome's ClientHello is 1413 bytes).
@@ -140,6 +169,7 @@ impl Default for Config {
             max_retransmit: Duration::from_secs(60),
             min_resend_interval: Duration::from_millis(200),
             max_transmissions: 6,
+            #[cfg(feature = "hello-verify")]
             hello_verify: false,
             max_message_len: 8192,
             max_fragments: 32,
@@ -272,6 +302,8 @@ enum Stage {
 
 enum Phase {
     Hello {
+        /// HelloVerifyRequests sent for distinct hellos.
+        #[cfg(feature = "hello-verify")]
         hello_verifies: u32,
     },
     Flight5 {
@@ -305,6 +337,11 @@ struct Handshake {
 enum Taken {
     /// Accepted: the handshake moves on to the next message.
     Accepted,
+    /// A hello without a valid cookie, answered with a HelloVerifyRequest.
+    /// It commits nothing: the hello expected is still one with a valid
+    /// cookie, at any seq in reach.
+    #[cfg(feature = "hello-verify")]
+    Answered,
     /// Refused without ending the handshake: it is unauthenticated, so a
     /// forger could have sent it, and the genuine message may follow.
     Refused(Error),
@@ -317,6 +354,7 @@ pub struct Server {
     /// One to [`MAX_EXPECTED_FINGERPRINTS`] acceptable fingerprints.
     expected: Vec<Fingerprint>,
     entropy: Entropy,
+    #[cfg(feature = "hello-verify")]
     cookie_secret: Option<Zeroizing<[u8; 32]>>,
     phase: Phase,
     reassembler: Reassembler,
@@ -332,6 +370,9 @@ pub struct Server {
     flight: Option<Flight>,
     transmissions: u32,
     timer: Option<Instant>,
+    /// When an unanswered flight 4 fails, fixed when it is first sent: the
+    /// end of the timer-only schedule ([`lifetime`]).
+    expiry: Option<Instant>,
     interval: Duration,
     last_sent: Option<Instant>,
     sent_this_input: bool,
@@ -360,6 +401,24 @@ pub(crate) fn downgrade_sentinel(random: &[u8; 32]) -> bool {
     random
         .get(24..)
         .is_some_and(|tail| DOWNGRADE.iter().any(|s| s.as_slice() == tail))
+}
+
+/// How long an unanswered flight 4 is waited on: the timer-only schedule,
+/// [`Config::max_transmissions`] intervals starting at
+/// [`Config::initial_retransmit`] and doubling up to
+/// [`Config::max_retransmit`], as [`Server::handle_timeout`] backs off.
+fn lifetime(config: &Config) -> Duration {
+    let mut interval = config.initial_retransmit;
+    let mut total = Duration::ZERO;
+    for _ in 0..config.max_transmissions {
+        total = total.saturating_add(interval);
+        interval = next_interval(config, interval);
+    }
+    total
+}
+
+fn next_interval(config: &Config, interval: Duration) -> Duration {
+    interval.saturating_mul(2).min(config.max_retransmit)
 }
 
 fn whole(m: &Message) -> Result<Vec<u8>, Error> {
@@ -416,22 +475,31 @@ impl Server {
             max_message: config.max_message_len,
             max_fragments: config.max_fragments,
             max_buffered: config.max_buffered,
-            ahead: AHEAD,
+            ahead: window(&config),
             // A finite burst of forged candidates gives way once it is a
             // retransmission interval old, in time for the client's
             // retransmission.
             expire_after: Some(config.initial_retransmit),
             reclaim_every: Some(config.initial_retransmit),
         };
+        #[cfg_attr(not(feature = "hello-verify"), allow(unused_mut))]
+        let mut reassembler = Reassembler::new(limits);
+        // Until a hello has a valid cookie, each hello stands alone.
+        #[cfg(feature = "hello-verify")]
+        reassembler.set_unordered(config.hello_verify);
         Ok(Self {
             interval: config.initial_retransmit,
             config,
             identity,
             expected,
             entropy,
+            #[cfg(feature = "hello-verify")]
             cookie_secret: None,
-            phase: Phase::Hello { hello_verifies: 0 },
-            reassembler: Reassembler::new(limits),
+            phase: Phase::Hello {
+                #[cfg(feature = "hello-verify")]
+                hello_verifies: 0,
+            },
+            reassembler,
             hs: None,
             read: None,
             replay: ReplayWindow::default(),
@@ -442,6 +510,7 @@ impl Server {
             flight: None,
             transmissions: 0,
             timer: None,
+            expiry: None,
             last_sent: None,
             sent_this_input: false,
             out: VecDeque::new(),
@@ -541,9 +610,11 @@ impl Server {
         self.settle(result)
     }
 
-    /// The timer from [`Server::poll_timeout`] fired: resend the flight,
-    /// or fail with [`Error::Timeout`] once it has been sent
-    /// [`Config::max_transmissions`] times.
+    /// The timer from [`Server::poll_timeout`] fired: resend the flight
+    /// while [`Config::max_transmissions`] allows, or fail with
+    /// [`Error::Timeout`] once the flight's fixed expiry has come (see
+    /// [`Config::max_transmissions`]). With the budget spent and the expiry
+    /// still ahead, nothing is sent and the timer waits for the expiry.
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
         let Some(at) = self.timer else {
             return Ok(());
@@ -551,16 +622,18 @@ impl Server {
         if now < at || self.terminal() {
             return Ok(());
         }
-        if self.transmissions >= self.config.max_transmissions {
+        let expiry = self.expiry.unwrap_or(at);
+        if now >= expiry {
             return self.settle(Err(Error::Timeout));
         }
-        self.interval = self
-            .interval
-            .saturating_mul(2)
-            .min(self.config.max_retransmit);
+        if self.transmissions >= self.config.max_transmissions {
+            self.timer = Some(expiry);
+            return Ok(());
+        }
+        self.interval = next_interval(&self.config, self.interval);
         self.sent_this_input = false;
         let result = self.send_flight(now);
-        self.timer = Some(now + self.interval);
+        self.timer = Some((now + self.interval).min(expiry));
         self.settle(result)
     }
 
@@ -597,6 +670,7 @@ impl Server {
         self.write = None;
         self.flight = None;
         self.timer = None;
+        self.expiry = None;
         self.reassembler.restart_at(self.reassembler.next_seq());
     }
 
@@ -646,7 +720,8 @@ impl Server {
     /// A retransmission from the peer suggests our flight was lost (RFC
     /// 6347 section 4.2.4). At most one resend per input datagram, none
     /// beyond [`Config::max_transmissions`], and none sooner than
-    /// [`Config::min_resend_interval`] after the last send.
+    /// [`Config::min_resend_interval`] after the last send. It restarts the
+    /// timer, but never past the flight's expiry.
     fn resend(&mut self, now: Instant) -> Result<(), Error> {
         if self.sent_this_input
             || self.flight.is_none()
@@ -662,7 +737,8 @@ impl Server {
         }
         self.send_flight(now)?;
         if self.timer.is_some() {
-            self.timer = Some(now + self.interval);
+            let next = now + self.interval;
+            self.timer = Some(self.expiry.map_or(next, |e| next.min(e)));
         }
         Ok(())
     }
@@ -842,9 +918,10 @@ impl Server {
     /// the message the handshake expects there, checked before anything is
     /// kept for it: its type, its epoch, and a length its parser could
     /// accept. Each seq holds one message: a ClientHello at the next seq
-    /// while no hello has been answered, then flight 5 after the hello we
-    /// answered (Certificate, ClientKeyExchange and CertificateVerify at
-    /// epoch 0, then Finished, which is valid only under the read keys).
+    /// while no hello has been answered (at any seq in the window while a
+    /// valid cookie is awaited), then flight 5 after the hello we answered
+    /// (Certificate, ClientKeyExchange and CertificateVerify at epoch 0,
+    /// then Finished, which is valid only under the read keys).
     /// The error says why not, for a fragment under the read keys.
     fn admit(&self, epoch: u16, f: &message::Fragment<'_>) -> Result<(), Error> {
         let length = usize::try_from(f.length).map_err(|_| Error::Limit(Limit::MessageSize))?;
@@ -852,7 +929,9 @@ impl Server {
             return Err(Error::Limit(Limit::MessageSize));
         }
         let (msg_type, at_epoch, lengths) = match (&self.phase, &self.hs) {
-            (Phase::Hello { .. }, _) if f.seq == self.reassembler.next_seq() => {
+            (Phase::Hello { .. }, _)
+                if f.seq == self.reassembler.next_seq() || self.reassembler.unordered() =>
+            {
                 (message::CLIENT_HELLO, 0, HELLO_MIN..=usize::MAX)
             }
             (Phase::Flight5 { .. }, Some(hs)) => match f.seq.checked_sub(hs.hello_seq) {
@@ -875,13 +954,26 @@ impl Server {
 
     /// Hands complete messages to the state machine in order. One it
     /// refuses is discarded on its own: the seq stays, and so do its other
-    /// candidates, so the genuine message can still be taken.
+    /// candidates, so the genuine message can still be taken. While a valid
+    /// cookie is awaited, each hello stands alone: one answered with a
+    /// HelloVerifyRequest leaves the expected seq where it was, and the
+    /// hello with a valid cookie sets it, whatever seq it has.
     fn release(&mut self, now: Instant, record_seq: u64) -> Result<(), Error> {
         while let Some(m) = self.reassembler.take() {
+            let seq = m.seq;
             match self.message(now, record_seq, m)? {
+                #[cfg(feature = "hello-verify")]
+                Taken::Answered => self.refused = None,
                 Taken::Accepted => {
                     self.refused = None;
-                    self.reassembler.advance();
+                    if self.reassembler.unordered() {
+                        // Only hellos are kept before one is accepted.
+                        self.reassembler.set_unordered(false);
+                        self.reassembler
+                            .restart_at(seq.checked_add(1).ok_or(Error::Internal)?);
+                    } else {
+                        self.reassembler.advance();
+                    }
                     if !self.handshaking() {
                         // Nothing buffered can be valid after the handshake.
                         self.reassembler.restart_at(self.reassembler.next_seq());
@@ -925,6 +1017,7 @@ impl Server {
         }
     }
 
+    #[cfg(feature = "hello-verify")]
     fn cookie(&mut self, hello: &ClientHello<'_>) -> Result<[u8; 32], Error> {
         let secret = match &self.cookie_secret {
             Some(s) => s.clone(),
@@ -976,15 +1069,36 @@ impl Server {
             }
             self.seqs.epoch0 = record_seq;
         }
+        #[cfg(feature = "hello-verify")]
         if self.config.hello_verify {
             let cookie = self.cookie(&hello)?;
             if !bool::from(hello.cookie.ct_eq(&cookie)) {
+                // A missing or wrong cookie is treated alike (RFC 6347
+                // section 4.2.1), and commits nothing.
                 let Phase::Hello { hello_verifies, .. } = self.phase else {
                     return Err(Error::Internal);
                 };
+                if self
+                    .answered
+                    .as_ref()
+                    .is_some_and(|(seq, body)| *seq == m.seq && *body == m.body)
+                {
+                    // A retransmission of the hello we last answered: the
+                    // same HelloVerifyRequest again, spaced and within the
+                    // flight's budget.
+                    self.resend(now)?;
+                    return Ok(Taken::Answered);
+                }
                 if hello_verifies >= self.config.max_transmissions {
                     // No more answers: refused, and sends nothing.
                     return Ok(Taken::Refused(Error::Limit(Limit::HelloVerify)));
+                }
+                // The client's answer has the next seq, which must be in
+                // reach.
+                let last =
+                    u32::from(self.reassembler.next_seq()) + u32::from(window(&self.config)) - 1;
+                if u32::from(m.seq) >= last {
+                    return Ok(Taken::Refused(Error::Limit(Limit::Sequence)));
                 }
                 self.phase = Phase::Hello {
                     hello_verifies: hello_verifies + 1,
@@ -1000,7 +1114,7 @@ impl Server {
                 });
                 self.transmissions = 0;
                 self.send_flight(now)?;
-                return Ok(Taken::Accepted);
+                return Ok(Taken::Answered);
             }
         }
         self.server_flight(now, &m, &hello, negotiated)?;
@@ -1100,6 +1214,7 @@ impl Server {
         self.interval = self.config.initial_retransmit;
         self.send_flight(now)?;
         self.timer = Some(now + self.interval);
+        self.expiry = Some(now + lifetime(&self.config));
         Ok(())
     }
 
@@ -1223,6 +1338,7 @@ impl Server {
                     refused_renegotiation: false,
                 };
                 self.timer = None;
+                self.expiry = None;
                 self.transmissions = 0;
                 self.profile = Some(profile);
                 self.send_flight(now)?;
