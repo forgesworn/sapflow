@@ -40,8 +40,9 @@ the reason (see What ends a handshake, below).
   RFC 8827). A client with only an RSA key sends an empty Certificate
   (`NoCertificate`); an RSA certificate that is sent is
   `UnsupportedCertificate`.
-- A HelloVerifyRequest carries version DTLS 1.0, as RFC 6347 section 4.2.1
-  says DTLS 1.2 servers should.
+- With the experimental `hello-verify` feature, a HelloVerifyRequest
+  carries version DTLS 1.0, as RFC 6347 section 4.2.1 says DTLS 1.2
+  servers should.
 - No session resumption, no application data (counted and dropped), no
   compression.
 
@@ -89,7 +90,7 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 | `max_retransmit` | 60 s | up to 600 s |
 | `min_resend_interval` (peer-triggered resends) | 200 ms | up to `max_retransmit` |
 | `max_transmissions` (per flight, any trigger) | 6 | 1 to 32 |
-| `hello_verify` | off | |
+| `hello_verify` | off | only with the `hello-verify` feature |
 | `max_message_len` | 8192 | 512 to 65536 |
 | `max_fragments` (per message) | 32 | 1 to 1024 |
 | `max_buffered` (all reassembly) | 16384 | `max_message_len` + 568 to 1 MiB |
@@ -117,19 +118,52 @@ Resends the peer triggers count towards the six sends, and once those are
 spent nothing more is sent, but they never bring the failure forward or
 push it back.
 
-The cookie exchange is off by default: the server is used only behind ICE,
-which proves return routability for the address pair before any DTLS
-datagram is accepted, and that is the cookie's purpose (RFC 6347 section
-4.2.1 allows turning it off where amplification is not a problem). It saves
-a round trip. Turning it on works (A2.1 runs it against OpenSSL). WHIP
-(`sapflow-whip` and `sapflow-server`) never turns it on: the session's
-`dtls` config is `Config::default()`, though the field is public, so an
-embedder could. While the exchange awaits a valid cookie, each hello stands
+### The experimental `hello-verify` feature
+
+The cookie exchange (HelloVerifyRequest) is not needed here: the server is
+used only behind ICE, which proves return routability for the address pair
+before any DTLS datagram is accepted, and that is the cookie's purpose
+(RFC 6347 section 4.2.1 allows leaving it out where amplification is not a
+problem). Leaving it out also saves a round trip.
+
+It exists only behind the `hello-verify` cargo feature, which is off by
+default and experimental. Without the feature, `Config` has no
+`hello_verify` field and the cookie code is not compiled, so nothing can
+turn it on. WHIP never enables the feature: `sapflow-whip` and
+`sapflow-server` depend on this crate without it, and the session's `dtls`
+config is `Config::default()`. The A4.4 security review covers this crate
+as WHIP builds it, without the feature (the owner's decision of 15 November
+2026); the cookie exchange is outside it.
+
+With the feature on and `hello_verify` set, the exchange works (A2.1 runs
+it against OpenSSL). While it awaits a valid cookie, each hello stands
 alone, as the RFC's stateless exchange intends. A hello is taken at any of
 the first `max_transmissions` plus one seqs (at least four), and one at the
 last of them gets no HelloVerifyRequest, since the answer would be out of
 reach. A HelloVerifyRequest commits nothing; the hello with a valid cookie
 sets the expected seq, the transcript and our sequence numbers.
+
+Two findings from round 7 of the A4.4 review (on `cc3c154`) are open,
+in this feature only:
+
+- **13 (P2).** Only a repeat of the hello last answered counts as a
+  retransmission. Every other hello without a valid cookie spends one of
+  the `max_transmissions` answers, and they never come back. Six forged
+  empty-cookie hellos sent before the publisher's first (seq 0, say, with
+  two alternating randoms) spend them all, and the genuine hello then gets
+  no HelloVerifyRequest. A fix would replace the lifetime cap with a
+  budget that recovers over time.
+- **14 (P2, conformance).** Our first record mirrors the record number of
+  the hello it answers, but only while nothing has been sent. Later
+  HelloVerifyRequests, and the first ServerHello after a cookie exchange,
+  count on instead of mirroring the hello that triggered them, as RFC 6347
+  section 4.2.1 requires. Ordinary loss causes it. It has not been shown
+  to break a browser. `a_retransmitted_first_hello_repeats_one_hello_verify_request`
+  pins today's behaviour.
+
+The cookie tests, the cookie replay of the OpenSSL run and the
+`dtls_server` fuzz target's cookie mode run only in the feature build;
+`tests/check.sh` and CI build, lint and test both.
 
 ## What ends a handshake, and what is dropped
 
@@ -153,12 +187,13 @@ dropped and counted in `Stats::records_dropped`:
   `max_fragments` (that candidate is removed), and an empty fragment of a
   message that is not empty;
 - a complete epoch 0 message that fails a check made before any ECDH or
-  verification: a hello that does not parse, is outside the profile or has
-  run out of HelloVerifyRequests; a Certificate that does not parse, is
-  empty or does not match the offer; a ClientKeyExchange without a valid
-  uncompressed P-256 point; a CertificateVerify that does not parse or uses
-  another scheme. It is discarded on its own: the seq stays, and its other
-  candidates are kept. `Server::refused` gives the reason.
+  verification: a hello that does not parse, is outside the profile or
+  (with `hello-verify`) has run out of HelloVerifyRequests; a Certificate
+  that does not parse, is empty or does not match the offer; a
+  ClientKeyExchange without a valid uncompressed P-256 point; a
+  CertificateVerify that does not parse or uses another scheme. It is
+  discarded on its own: the seq stays, and its other candidates are kept.
+  `Server::refused` gives the reason.
 
 A client that really aborts, or really sends such a message, gets no alert
 and is ended by the caller's handshake deadline.
@@ -250,7 +285,7 @@ the fix. The final flight and the HelloVerifyRequest flight have no timer,
 so spending their budgets ends nothing. Round 5 also re-confirmed the
 residuals above and the dependency pins below.
 
-Fixed, awaiting round 7 review: round 6 (on `c3c66f2`) found that, with
+Fixed, and closed in round 7: round 6 (on `c3c66f2`) found that, with
 the cookie exchange on, a hello with a missing or wrong cookie was
 answered with a HelloVerifyRequest and then moved the expected seq on, as
 an accepted hello would. An injected copy of the genuine first hello at
@@ -261,7 +296,10 @@ seq 0 excluded the genuine one the same way. A HelloVerifyRequest now
 commits nothing (the cookie exchange, above), with tests that failed
 before the fix. Round 6 also re-confirmed the residuals above and the
 dependency pins below, and independently recomputed the eight RFC 5705
-exporter results.
+exporter results. Round 7 (on `cc3c154`) found it closed, re-confirmed the
+residuals and the pins, and recomputed the eight exporter results again;
+its two findings are in the experimental `hello-verify` feature only (13
+and 14, above).
 
 Behind ICE, only an attacker who could spoof the selected address pair
 could send any of this, apart from the three cases a buggy peer could
@@ -287,8 +325,8 @@ is 1.94.
 
 - A2.1: `tests/openssl_interop.sh` runs OpenSSL 4 `s_client -dtls1_2` against
   `examples/udp_server.rs` on loopback for both SRTP profiles, with small
-  MTUs, a dropped first or final flight and the cookie exchange, and
-  compares the exported
+  MTUs, a dropped first or final flight and (built with `hello-verify`) the
+  cookie exchange, and compares the exported
   keying material. `tests/fixtures/openssl-keymatexport.txt` is the
   transcript; `tests/fixtures/openssl/` holds each run's datagrams and
   OpenSSL's key log, which the unit tests replay offline byte for byte.
@@ -302,4 +340,5 @@ is 1.94.
   `dtls_handshake_messages` (`fuzz/`).
 
 `bash crates/sapflow-dtls/tests/check.sh [target]` runs formatting, clippy
-three ways, the tests and the fuzz crate check.
+three ways, the tests and the fuzz crate check, for the default build and
+again with the `hello-verify` feature.
