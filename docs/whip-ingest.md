@@ -2714,6 +2714,9 @@ Evidence: [whip-qualification-2026-11-12.md](whip-evidence/whip-qualification-20
 (second round, with the owner's written decisions of 12 and 15 November
 2026), on the test
 host (Apple M4, macOS 26.6.2), headless Chrome 157, OBS 32.0.4 and FFmpeg 8.1.
+[The client retest](whip-evidence/whip-client-retest-2026-11-15.md) of 15
+November 2026 reran Chrome, Firefox, Safari and OBS against main, and A4.1's
+loss runs at the 400 ms default against SRT at 200 and 400 ms.
 
 | Claim | Test | Status |
 |---|---|---|

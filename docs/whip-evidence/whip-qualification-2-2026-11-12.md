@@ -619,6 +619,8 @@ not above as on macOS; the owner has accepted it either way.
   and why the muxer broke off segments after 31 to 85 ms gaps in some
   400 ms trials (the retest's "What is left after a 400 ms wait") was not
   investigated.
+  SRT at 400 ms, and 1% and 10% at the 400 ms default, were measured
+  later in [the client retest](whip-client-retest-2026-11-15.md).
 - **A stream that never goes live, or goes live late.** Under loss that is
   not repaired, video skips from a loss to the next keyframe. Sapflow's
   muxer then logs "timestamps broke before the first segment was complete;

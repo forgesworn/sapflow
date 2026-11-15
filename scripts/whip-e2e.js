@@ -5,6 +5,21 @@
 //   cargo build -p sapflow [--target <triple>]
 //   node scripts/whip-e2e.js --bin <sapflow> --vendor <dir with hls.min.js> --out <scratch dir> \
 //     [--base 47300] [--seconds 10] [--transport udp|tcp|proxy] [--resize | --resize-loop]
+//     [--browser chrome|firefox|safari] [--ff-prefs '{"pref":value}'] [--range 47310-47319]
+//
+// --browser picks the publisher (Chrome by default, unchanged). Firefox and
+// Safari use the W0 launchers in scripts/whip-w0/browser.js: Firefox
+// headless with a temporary profile and fake media (--ff-prefs adds prefs to
+// its user.js); Safari through safaridriver, with synthetic media (an
+// animated canvas and a WebAudio tone, since automation cannot answer a
+// camera prompt). Over ssh, set W0_SAFARI_AGENT=1 so the driver runs in the
+// GUI session, as browser.js documents. --range is the port range the
+// driver's port is taken from (default base+10 to base+19). If Safari's
+// remote automation is off the run stops with exit 3: enabling it is the
+// owner's job (`sudo safaridriver --enable`). Their stop() ends what they
+// started, the Safari session included. --resize and --resize-loop are
+// Chrome-only. run.json in --out records the browser, its user agent and
+// what ICE did.
 //
 // Ports: base+1 HLS, base+2 SRT, base+3 WHIP signalling, base+4 WHIP media,
 // base+5 this script's page server, base+6 the ICE-TCP listener, base+7 the
@@ -61,6 +76,8 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const { launchFirefox, launchSafari } = require('./whip-w0/browser.js');
+const ports = require('./whip-w0/ports.js');
 
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
@@ -72,6 +89,9 @@ const resize = args.includes('--resize');
 const ROLL_BURST = 8;
 const transport = opt('transport', 'udp');
 if (!['udp', 'tcp', 'proxy'].includes(transport)) { console.error('--transport udp|tcp|proxy'); process.exit(2); }
+const browser = opt('browser', 'chrome');
+if (!['chrome', 'firefox', 'safari'].includes(browser)) { console.error('--browser chrome|firefox|safari'); process.exit(2); }
+if (browser !== 'chrome' && (resize || loop)) { console.error('--resize and --resize-loop are Chrome-only'); process.exit(2); }
 const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const port = { hls: base + 1, srt: base + 2, whip: base + 3, media: base + 4, page: base + 5, tcp: base + 6, relay: base + 7 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -128,13 +148,39 @@ const PAGE = `<!doctype html><meta charset="utf-8"><title>WHIP A3.1</title>
 <video id="v" muted playsinline width="640" height="360"></video><canvas id="c" width="640" height="360"></canvas>
 <script src="/hls.min.js"></script>
 <script>
-const report = (o) => fetch('/report', { method: 'POST', body: JSON.stringify(o) });
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const report = (o) => fetch('/report', { method: 'POST', body: JSON.stringify(o) });${browser !== 'chrome' ? `
+// Not Chrome: the page posts its progress each second, so a run whose page
+// never reports still shows how far it got and what it was sending.
+let stage = 'start', progressPc = null;
+const progress = { t0: performance.now(), samples: [] };
+setInterval(async () => {
+  const o = { t: Math.round(performance.now() - progress.t0), stage, visibility: document.visibilityState };
+  if (progressPc) { try { (await progressPc.getStats()).forEach((x) => { if (x.type === 'outbound-rtp') o[x.kind] = [x.packetsSent, x.framesEncoded, x.framesSent].join('/'); }); o.conn = progressPc.connectionState; } catch (e) { o.statsError = String(e); } }
+  if (typeof window.canvasFrames === 'function') o.canvas = window.canvasFrames();
+  progress.samples.push(o); if (progress.samples.length > 120) progress.samples.shift();
+  fetch('/progress', { method: 'POST', body: JSON.stringify(progress) }).catch(() => {});
+}, 1000);` : ''}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));${browser === 'safari' ? `
+// Safari: an animated 640x360 canvas and a WebAudio tone (W0's synthetic media).
+async function synthetic(out) {
+  const c = document.createElement('canvas'); c.width = 640; c.height = 360;
+  const g = c.getContext('2d'); let n = 0;
+  const draw = () => { n++; g.fillStyle = 'hsl(' + ((n * 3) % 360) + ',60%,30%)'; g.fillRect(0, 0, 640, 360); g.fillStyle = '#fff'; g.font = '48px monospace'; g.fillText('frame ' + n, 20 + (n * 7) % 400, 80 + (n * 3) % 220); };
+  draw(); setInterval(draw, 33); // a timer, not requestAnimationFrame: the automation window may not be visible
+  window.canvasFrames = () => n;
+  const ac = new AudioContext(), dest = ac.createMediaStreamDestination(), o = ac.createOscillator();
+  o.frequency.value = 440; o.connect(dest); o.start();
+  try { await Promise.race([ac.resume(), sleep(1500)]); } catch {} // resume() can stay pending without a gesture
+  out.audioContextState = ac.state;
+  const s = c.captureStream(30);
+  dest.stream.getAudioTracks().forEach((t) => s.addTrack(t));
+  return s;
+}` : ''}
 (async () => {
   const out = { errors: [], ua: navigator.userAgent };
   try {
-    const media = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 640, height: 360 } });
-    const pc = new RTCPeerConnection();
+    const media = ${browser === 'safari' ? 'await synthetic(out)' : "await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 640, height: 360 } })"};
+    const pc = new RTCPeerConnection();${browser !== 'chrome' ? " progressPc = pc; stage = 'offer';" : ''}
     let sender = null;
     media.getTracks().forEach((t) => { const tr = pc.addTransceiver(t, { direction: 'sendonly', streams: [media] }); if (t.kind === 'video') sender = tr.sender; });
     await pc.setLocalDescription(await pc.createOffer());
@@ -146,8 +192,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     if (r.status !== 201) throw new Error('POST ' + r.status + ' ' + await r.text());
     await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
     for (let i = 0; i < 100 && pc.connectionState !== 'connected'; i++) await sleep(100);
-    out.connection = pc.connectionState;
+    if (pc.connectionState !== 'connected') {
+      const st = await pc.getStats(); out.outbound = [];
+      st.forEach((x) => { if (x.type === 'outbound-rtp') out.outbound.push([x.kind, x.packetsSent, x.framesEncoded].join(' ')); });
+    }
+    out.connection = pc.connectionState; out.ice = pc.iceConnectionState;${browser !== 'chrome' ? " stage = 'connected ' + pc.connectionState;" : ''}
     const stats = await pc.getStats();
+    out.pairs = []; stats.forEach((s) => { if (s.type === 'candidate-pair') out.pairs.push([s.state, s.nominated ? 'nominated' : '', s.selected ? 'selected' : '',
+      (stats.get(s.localCandidateId) || {}).protocol, (stats.get(s.localCandidateId) || {}).candidateType, (stats.get(s.remoteCandidateId) || {}).protocol].join(' ')); });
     stats.forEach((s) => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
       const local = stats.get(s.localCandidateId), remote = stats.get(s.remoteCandidateId);
       if (local) out.publisher = { address: local.address, port: local.port };
@@ -157,7 +209,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const playlist = 'http://127.0.0.1:${port.hls}/live/${EVENT}/index.m3u8';
     for (let i = 0; i < 150; i++) { const p = await fetch(playlist).catch(() => null); if (p && p.ok) break; await sleep(100); }
     const v = document.getElementById('v');
-    const hls = new Hls({ lowLatencyMode: true });
+    const hls = new Hls({ lowLatencyMode: true });${browser !== 'chrome' ? " stage = 'playing';" : ''}
     hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) out.errors.push('hls ' + d.details); });
     hls.loadSource(playlist);
     hls.attachMedia(v);
@@ -196,7 +248,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       if (start !== null && v.currentTime - start >= ${seconds} && (!${resize} || out.afterHalf >= 3)) break;
       await sleep(100);
     }
-    out.played = start === null ? 0 : v.currentTime - start; out.width = v.videoWidth; out.height = v.videoHeight;
+    ${browser !== 'chrome' ? "stage = 'played';" : ''}out.played = start === null ? 0 : v.currentTime - start; out.width = v.videoWidth; out.height = v.videoHeight;
     const q = v.getVideoPlaybackQuality(); out.decoded = q.totalVideoFrames; out.dropped = q.droppedVideoFrames;
     const c = document.getElementById('c'); c.getContext('2d').drawImage(v, 0, 0, 640, 360);
     out.frame = c.toDataURL('image/png');
@@ -209,11 +261,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 })();
 </script>`;
 
+let lastProgress = null;
 function pageServer(onReport) {
   const hlsjs = fs.readFileSync(path.join(vendor, 'hls.min.js'));
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); return res.end(PAGE); }
     if (req.method === 'GET' && req.url === '/hls.min.js') { res.writeHead(200, { 'content-type': 'text/javascript' }); return res.end(hlsjs); }
+    if (req.method === 'POST' && req.url === '/progress') {
+      let body = ''; req.on('data', (d) => { body += d; }); req.on('end', () => { res.end('ok'); try { lastProgress = JSON.parse(body); } catch {} });
+      return;
+    }
     if (req.method === 'POST' && req.url === '/report') {
       let body = ''; req.on('data', (d) => { body += d; }); req.on('end', () => { res.end('ok'); onReport(JSON.parse(body)); });
       return;
@@ -268,6 +325,12 @@ function relay(listen, target, clients) {
   return new Promise((r) => server.listen(listen, '127.0.0.1', () => r(server)));
 }
 
+// Safari processes started for automation (`--automation`), by PID.
+function automationSafari() {
+  const r = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' });
+  return r.stdout.split('\n').map((l) => /^\s*(\d+)\s+(.*)$/.exec(l)).filter((m) => m && /\/Safari\.app\/Contents\/MacOS\/Safari /.test(m[2] + ' ') && m[2].includes('--automation')).map((m) => +m[1]);
+}
+
 // The far ends of sapflow's established connections to its ICE-TCP port.
 function tcpPeers(pid, local) {
   const r = spawnSync('lsof', ['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:ESTABLISHED'], { encoding: 'utf8' });
@@ -291,7 +354,8 @@ function secrets(offer, publisher, extra = []) {
     const c = /^c=IN IP[46] (\S+)/.exec(line); if (c && c[1] !== '0.0.0.0') found.add(c[1]);
     const pwd = /^a=ice-pwd:(\S+)/.exec(line); if (pwd) found.add(pwd[1]);
   }
-  for (const p of [publisher, ...extra].filter(Boolean)) {
+  // A browser whose statistics give no local address (mDNS) has none to add.
+  for (const p of [publisher, ...extra].filter((x) => x && x.address && x.port)) {
     found.add(`${p.address}:${p.port}`); found.add(String(p.port)); if (p.address !== '127.0.0.1') found.add(p.address);
   }
   // The server's own loopback address appears in its listen lines; it is
@@ -379,14 +443,60 @@ function hits(text, s) {
   let report;
   const done = new Promise((r) => { report = r; });
   const page = await pageServer(report);
-  const browser = launchChrome(`http://127.0.0.1:${port.page}/`);
-  const r = await Promise.race([done, sleep((seconds + 60) * 1000).then(() => null)]);
+  const url = `http://127.0.0.1:${port.page}/`;
+  const run = { browser, transport, seconds };
+  let r = null;
+  if (browser === 'chrome') {
+    const chrome = launchChrome(url);
+    r = await Promise.race([done, sleep((seconds + 60) * 1000).then(() => null)]);
+    await stopGroup(chrome.child.pid);
+    trash(chrome.profile);
+  } else {
+    // stop() on every path: Firefox's process group and profile, or the
+    // Safari session, the driver and its LaunchAgent.
+    let handle = null;
+    const safariBefore = browser === 'safari' ? automationSafari() : [];
+    try {
+      if (browser === 'firefox') {
+        const extraPrefs = JSON.parse(opt('ff-prefs', '{}'));
+        run.ffPrefs = extraPrefs;
+        handle = launchFirefox(url, { extraPrefs });
+      } else {
+        handle = await launchSafari(url, { range: ports.parseRange(opt('range', `${base + 10}-${base + 19}`)) });
+        run.safari = { browserVersion: handle.capabilities && handle.capabilities.browserVersion, webrtc: handle.capabilities && handle.capabilities['webkit:WebRTC'] };
+      }
+      r = await Promise.race([done, sleep((seconds + 60) * 1000).then(() => null)]);
+    } catch (e) {
+      run.launchError = String(e && e.message || e);
+      run.safariAutomationDisabled = !!(e && e.safariAutomationDisabled);
+    } finally {
+      if (handle) {
+        await handle.stop();
+        if (browser === 'safari') Object.assign(run.safari, { sessionEnded: handle.sessionEnded, agentUnloaded: handle.agentUnloaded });
+      }
+      // The automation Safari can outlive DELETE /session: end the one this
+      // run started, by its PID, and only that one.
+      if (browser === 'safari') {
+        await sleep(3000);
+        const left = automationSafari().filter((p) => !safariBefore.includes(p));
+        for (const p of left) { try { process.kill(p, 'SIGTERM'); } catch {} }
+        if (left.length) await sleep(3000);
+        if (run.safari) Object.assign(run.safari, { automationSafariLeft: left.length, automationSafariStillRunning: automationSafari().filter((p) => left.includes(p)).length });
+      }
+    }
+  }
   clearInterval(served);
   if (watch) clearInterval(watch);
-  await stopGroup(browser.child.pid);
   page.close();
   if (proxy) proxy.stop();
-  trash(browser.profile);
+  if (lastProgress) run.progress = lastProgress.samples;
+  if (r) Object.assign(run, { ua: r.ua, connection: r.connection, ice: r.ice, pair: r.pair, pairs: r.pairs, outbound: r.outbound, audioContextState: r.audioContextState, errors: r.errors });
+  fs.writeFileSync(path.join(out, 'run.json'), JSON.stringify(run, null, 1));
+  if (run.launchError) {
+    console.log('browser launch failed:', run.launchError, run.safariAutomationDisabled ? '(Safari remote automation is not enabled: the owner must run `sudo safaridriver --enable`)' : '');
+    await stopGroup(s.child.pid);
+    process.exit(3);
+  }
   if (!r) { check('page reported', false, 'timeout'); }
   else {
     fs.writeFileSync(path.join(out, 'offer.sdp'), r.offer || '');
