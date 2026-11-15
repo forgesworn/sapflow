@@ -26,7 +26,7 @@ use crate::error::alert;
 use crate::flight::{self, Flight, OutMessage, Sequences};
 use crate::identity::{self, Fingerprint, Identity};
 use crate::message::{self, ClientHello, Negotiated, SrtpProfile};
-use crate::reassembly::{Limits, Message, Push, Reassembler};
+use crate::reassembly::{Limits, MAX_VARIANTS, Message, Push, Reassembler};
 use crate::record::{self, DTLS_1_2, Protection, Record, ReplayWindow};
 use crate::{ConfigError, Error, Limit};
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -65,6 +65,12 @@ const KEY_EXCHANGE_MAX: usize = 1 + 65;
 const VERIFY_MAX: usize = 2 + 2 + 72;
 /// Finished's `verify_data`.
 const FINISHED_LEN: usize = 12;
+/// The most bytes complete candidates for later seqs can hold while the
+/// expected message is still missing: admission lets only ClientKeyExchange
+/// and CertificateVerify in ahead at epoch 0, each with at most
+/// [`MAX_VARIANTS`] candidates. Nothing reclaims a complete candidate, so
+/// [`Config::max_buffered`] keeps this much over `max_message_len`.
+const LATER_COMPLETE_MAX: usize = MAX_VARIANTS * (KEY_EXCHANGE_MAX + VERIFY_MAX);
 /// The TLS 1.3 downgrade sentinels (RFC 8446 section 4.1.3), which a DTLS
 /// 1.2 server must not send by chance either.
 const DOWNGRADE: [&[u8; 8]; 2] = [b"DOWNGRD\x01", b"DOWNGRD\x00"];
@@ -109,7 +115,11 @@ pub struct Config {
     /// count). 1 to 1024; default 32.
     pub max_fragments: usize,
     /// Most bytes held by messages being reassembled. At least
-    /// `max_message_len`, at most 1 MiB; default 16384.
+    /// `max_message_len` plus 568, at most 1 MiB; default 16384. The 568
+    /// bytes are what complete forged messages for later seqs can hold (four
+    /// candidates each for ClientKeyExchange and CertificateVerify), so the
+    /// expected message always has room once incomplete candidates are
+    /// reclaimed.
     pub max_buffered: usize,
 }
 
@@ -153,7 +163,8 @@ impl Config {
         )?;
         check((1..=1024).contains(&self.max_fragments), "max_fragments")?;
         check(
-            self.max_buffered >= self.max_message_len && self.max_buffered <= 1 << 20,
+            self.max_buffered >= self.max_message_len + LATER_COMPLETE_MAX
+                && self.max_buffered <= 1 << 20,
             "max_buffered",
         )?;
         Ok(())

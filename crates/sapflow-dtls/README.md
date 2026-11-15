@@ -92,7 +92,13 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 | `hello_verify` | off | |
 | `max_message_len` | 8192 | 512 to 65536 |
 | `max_fragments` (per message) | 32 | 1 to 1024 |
-| `max_buffered` (all reassembly) | 16384 | `max_message_len` to 1 MiB |
+| `max_buffered` (all reassembly) | 16384 | `max_message_len` + 568 to 1 MiB |
+
+The 568 bytes over `max_message_len` are the most that complete forged
+messages for later seqs can hold (four candidates each for
+ClientKeyExchange, at most 66 bytes, and CertificateVerify, at most 76).
+Nothing reclaims a complete candidate, so this floor keeps room for the
+expected message.
 
 Fixed: at most 4 messages buffered ahead, 4 certificates in the peer's
 chain, 16 datagrams queued for sending. One input datagram produces at most

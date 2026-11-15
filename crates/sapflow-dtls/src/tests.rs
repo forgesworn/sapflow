@@ -1989,3 +1989,57 @@ fn a_certificate_verify_that_is_not_der_does_not_spend_the_verification() {
         );
     }
 }
+
+/// A4.4 review, round 4 (finding 9): complete forged ClientKeyExchange and
+/// CertificateVerify messages for later seqs are kept until their seq comes,
+/// and nothing reclaims a complete candidate. Admission bounds them: four
+/// candidates each of at most 66 and 76 bytes, 568 in all. With
+/// `max_buffered` at 512 they left too little room for the expected
+/// Certificate, and the handshake waited until the deadline. `max_buffered`
+/// must now be at least `max_message_len` plus those 568 bytes, so a 512
+/// buffer is refused, and at that floor the genuine flight completes at
+/// once with every later slot held by a forgery.
+#[test]
+fn the_buffer_always_has_room_for_the_expected_message() {
+    let small = Config {
+        max_message_len: 512,
+        max_buffered: 512,
+        ..Config::default()
+    };
+    assert_eq!(small.validate().map_err(|e| e.0), Err("max_buffered"));
+    let just_under = Config {
+        max_buffered: 512 + 567,
+        ..small
+    };
+    assert_eq!(just_under.validate().map_err(|e| e.0), Err("max_buffered"));
+    let config = Config {
+        max_message_len: 512,
+        max_buffered: 512 + 568,
+        ..Config::default()
+    };
+    assert_eq!(config.validate(), Ok(()));
+    let mut p = pair_with(Options::default(), config, None);
+    let recs = flight5(&mut p);
+    let (cert, _) = certificate_in_pieces(&recs);
+    assert!(cert.len() <= 512);
+    let mut rseq = 60;
+    for k in 0..4u8 {
+        // A point that is not on the curve, and a signature under another
+        // scheme: each is refused when its seq comes.
+        let mut key_exchange = vec![65, 4];
+        key_exchange.extend_from_slice(&[k; 64]);
+        let mut verify = vec![5, 3, 0, 72];
+        verify.extend_from_slice(&[k; 72]);
+        for (msg_type, seq, body) in [
+            (message::CLIENT_KEY_EXCHANGE, 2, key_exchange),
+            (message::CERTIFICATE_VERIFY, 3, verify),
+        ] {
+            let d = fragment_record(msg_type, seq, body.len() as u32, 0, &body, rseq);
+            rseq += 1;
+            p.feed(&[d]).expect("forged");
+        }
+    }
+    assert_eq!(p.server.buffered(), 568, "every later slot is held");
+    completes(&mut p, &recs);
+    crypto_once(&p);
+}
