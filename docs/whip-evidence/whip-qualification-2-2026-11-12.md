@@ -57,7 +57,9 @@ The owner's choices of 15 November 2026, with what each settles:
    memory, A4.2 is settled.
 7. **A4.4 findings 7 to 10: "Before WHIP faces users".** They are to be
    fixed before WHIP is offered to users, and stay open while WHIP is off
-   by default. A4.4 stays not met until then.
+   by default. A4.4 stays not met until then. (Later the same day they
+   were fixed, and A4.4 was met on the narrowed scope after review round
+   8; see the [A4.4 record](a4.4-security-review-2026-11-12.md).)
 8. **A4.4 residuals: "Accept them".** The owner accepts in writing the
    residuals the [A4.4 record](a4.4-security-review-2026-11-12.md) states
    as inherent: a plausible substituted message that arrives before the

@@ -1786,9 +1786,9 @@ Implementation notes (11 November 2026):
 - **Review.** On 11 November 2026 a review of this crate found no defect in
   the protocol or crypto code, and asked for fixes. Those fixes are made.
   That review was by an agent of the same session as the crate's author,
-  which A4.4 excludes, so it does not count towards A4.4. A4.4 still needs
-  an independent review of `sapflow-dtls` and of SRTP in `sapflow-rtp`,
-  with every finding recorded.
+  which A4.4 excludes, so it does not count towards A4.4. The independent
+  A4.4 review that followed is recorded in
+  [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
 - **For W3.**
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
@@ -2684,7 +2684,8 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
-  - Status, 15 November 2026: **not met yet.** Reviewed in seven rounds,
+  - Status, 15 November 2026: **met on the narrowed scope.** Round 8, on
+    `35607aa`, found no in-scope issue. Reviewed in eight rounds,
     recorded in
     [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
     The findings of rounds 1 to 3 are fixed. Round 4's four
@@ -2700,8 +2701,8 @@ that the inbound queue's back-pressure stays with the slow reader.
     decided on 15 November 2026 that A4.4 covers `sapflow-dtls` as WHIP
     builds it, without the experimental, off-by-default `hello-verify`
     feature that now holds the cookie exchange, plus SRTP; 13 and 14 stay
-    open against that feature, outside A4.4. A4.4 needs a round 8
-    independent review of that scope before it can be met.
+    open against that feature, outside A4.4. Round 8 reviewed that
+    scope and found nothing.
     The owner accepted the residuals the record states as inherent in
     writing on 15 November 2026.
 
