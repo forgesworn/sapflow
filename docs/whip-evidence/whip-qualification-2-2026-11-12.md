@@ -42,6 +42,9 @@ The owner's choices of 15 November 2026, with what each settles:
    to 10, before WHIP faces users. The default `SAPFLOW_WHIP_JITTER` stays
    200 ms until then.
 
+   Measured on 15 November 2026: [the A4.1 retest](whip-a41-retest-2026-11-15.md).
+   No default was changed and A4.1 is not declared met there.
+
    Arithmetic, not a measurement: at a 60 ms round trip only two NACK tries
    come back within the 200 ms wait. With 5% loss on each NACK and on each
    retransmission, about 1% of lost packets stay unrepaired, about 4 of
@@ -66,7 +69,7 @@ The owner's choices of 15 November 2026, with what each settles:
 | A3.10 OBS keyframes | OBS 32.0.4 does not answer PLI: in five runs its keyframes came every 10 s, or 7 s, as its own keyframe interval was set, whether Sapflow asked every 2 s or not at all (a control) | Recorded: **no** |
 | A3.10 OBS rate | OBS's video stayed at 2.50 to 2.53 Mbit/s with receiver reports claiming 25% loss and with REMB at 500 kbit/s, as without either. The same stimuli took headless Chrome from about 1 Mbit/s to 0.03 and to 0.42 Mbit/s | Recorded: **no** change on either |
 | A3.8 sync, 4 s start hold | Chrome 157: 20 of 20 runs within (UDP and ICE-TCP 10 each), audio -0.6 to +17.5 ms against the video, every run aligned by sender reports. FFmpeg: 10 of 10 at 0 to 0.5 ms, aligned at once | **Met** |
-| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. Parked by the owner (decision 5): faster NACK repeats and a 400 ms wait are to be measured before WHIP faces users |
+| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. Parked by the owner (decision 5): faster NACK repeats and a 400 ms wait are to be measured before WHIP faces users. Measured in [the A4.1 retest](whip-a41-retest-2026-11-15.md); decision still the owner's |
 | A4.2 memory | accepted by the owner in writing (decision 4) | Accepted |
 | A4.2 CPU, Linux container | 27 of 27 runs under the load gate, none skipped. WHIP's CPU per stream against SRT's: 0.74 to 0.84 at 1 stream, 0.83 to 0.96 at 50, and at 10 streams 0.75 and 0.83 with one round at 1.11. WHIP was below SRT in 8 of 9 rounds | **Met** at 1 and 50 streams by the rule. At 10 the rounds disagree (one of three above); accepted by the owner (decision 6) |
 
