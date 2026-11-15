@@ -457,7 +457,9 @@ function hits(text, s) {
   const plain = logText.replace(/\x1b\[[0-9;]*m/g, '');
   check('the session ended, deleted, with nothing lost', /WHIP session ended reason="?deleted"? count=\d+ lost=0/.test(plain));
   // Every file, not any one of them.
-  const finished = plain.split('\n').filter((l) => l.includes('recording finished'));
+  // Not the shutdown line, "stopped: every recording finished and every
+  // callback sent or failed", which names no file.
+  const finished = plain.split('\n').filter((l) => l.includes('recording finished') && !l.includes('every recording finished'));
   if (loop) {
     // A file keeps its first reason only, so the file that ran out can read
     // another; every incomplete one must have one, and one must be the
