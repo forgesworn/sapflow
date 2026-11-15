@@ -148,7 +148,8 @@ pub(crate) fn sha256(data: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// HMAC-SHA256 of `data` under `key`.
+/// HMAC-SHA256 of `data` under `key` (the cookie).
+#[cfg(feature = "hello-verify")]
 pub(crate) fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> Result<[u8; 32], Error> {
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).map_err(|_| Error::Internal)?;
     for d in data {

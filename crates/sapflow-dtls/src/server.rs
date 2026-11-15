@@ -1,6 +1,7 @@
 //! The DTLS 1.2 server state machine, sans-IO.
 //!
-//! Flights (RFC 6347 section 4.2.4), with an optional cookie exchange:
+//! Flights (RFC 6347 section 4.2.4), with an optional cookie exchange
+//! (only with the experimental `hello-verify` feature):
 //!
 //! ```text
 //! ClientHello                 -->
@@ -57,12 +58,14 @@ const AHEAD: u16 = 4;
 /// 4.2.1 has it answer each with a new hello), so after
 /// [`Config::max_transmissions`] of them its hello can be that far on.
 fn window(config: &Config) -> u16 {
+    #[cfg(feature = "hello-verify")]
     if config.hello_verify {
         let hellos = u16::try_from(config.max_transmissions).unwrap_or(u16::MAX);
-        AHEAD.max(hellos.saturating_add(1))
-    } else {
-        AHEAD
+        return AHEAD.max(hellos.saturating_add(1));
     }
+    #[cfg(not(feature = "hello-verify"))]
+    let _ = config;
+    AHEAD
 }
 
 /// The shortest ClientHello `ClientHello::parse` accepts: version, random,
@@ -135,6 +138,12 @@ pub struct Config {
     /// the address before any DTLS datagram is accepted, and that is what
     /// the cookie is for (RFC 6347 section 4.2.1 allows turning it off
     /// where amplification is not a problem). Off saves a round trip.
+    ///
+    /// Experimental, and present only with the `hello-verify` feature,
+    /// which is off by default and which WHIP never enables. It is outside
+    /// the A4.4 security review and has known open findings (see the
+    /// crate README).
+    #[cfg(feature = "hello-verify")]
     pub hello_verify: bool,
     /// Largest handshake message accepted, by declared length. 512 to
     /// 65536; default 8192 (Chrome's ClientHello is 1413 bytes).
@@ -160,6 +169,7 @@ impl Default for Config {
             max_retransmit: Duration::from_secs(60),
             min_resend_interval: Duration::from_millis(200),
             max_transmissions: 6,
+            #[cfg(feature = "hello-verify")]
             hello_verify: false,
             max_message_len: 8192,
             max_fragments: 32,
@@ -292,6 +302,8 @@ enum Stage {
 
 enum Phase {
     Hello {
+        /// HelloVerifyRequests sent for distinct hellos.
+        #[cfg(feature = "hello-verify")]
         hello_verifies: u32,
     },
     Flight5 {
@@ -328,6 +340,7 @@ enum Taken {
     /// A hello without a valid cookie, answered with a HelloVerifyRequest.
     /// It commits nothing: the hello expected is still one with a valid
     /// cookie, at any seq in reach.
+    #[cfg(feature = "hello-verify")]
     Answered,
     /// Refused without ending the handshake: it is unauthenticated, so a
     /// forger could have sent it, and the genuine message may follow.
@@ -341,6 +354,7 @@ pub struct Server {
     /// One to [`MAX_EXPECTED_FINGERPRINTS`] acceptable fingerprints.
     expected: Vec<Fingerprint>,
     entropy: Entropy,
+    #[cfg(feature = "hello-verify")]
     cookie_secret: Option<Zeroizing<[u8; 32]>>,
     phase: Phase,
     reassembler: Reassembler,
@@ -468,8 +482,10 @@ impl Server {
             expire_after: Some(config.initial_retransmit),
             reclaim_every: Some(config.initial_retransmit),
         };
+        #[cfg_attr(not(feature = "hello-verify"), allow(unused_mut))]
         let mut reassembler = Reassembler::new(limits);
         // Until a hello has a valid cookie, each hello stands alone.
+        #[cfg(feature = "hello-verify")]
         reassembler.set_unordered(config.hello_verify);
         Ok(Self {
             interval: config.initial_retransmit,
@@ -477,8 +493,12 @@ impl Server {
             identity,
             expected,
             entropy,
+            #[cfg(feature = "hello-verify")]
             cookie_secret: None,
-            phase: Phase::Hello { hello_verifies: 0 },
+            phase: Phase::Hello {
+                #[cfg(feature = "hello-verify")]
+                hello_verifies: 0,
+            },
             reassembler,
             hs: None,
             read: None,
@@ -942,6 +962,7 @@ impl Server {
         while let Some(m) = self.reassembler.take() {
             let seq = m.seq;
             match self.message(now, record_seq, m)? {
+                #[cfg(feature = "hello-verify")]
                 Taken::Answered => self.refused = None,
                 Taken::Accepted => {
                     self.refused = None;
@@ -996,6 +1017,7 @@ impl Server {
         }
     }
 
+    #[cfg(feature = "hello-verify")]
     fn cookie(&mut self, hello: &ClientHello<'_>) -> Result<[u8; 32], Error> {
         let secret = match &self.cookie_secret {
             Some(s) => s.clone(),
@@ -1047,6 +1069,7 @@ impl Server {
             }
             self.seqs.epoch0 = record_seq;
         }
+        #[cfg(feature = "hello-verify")]
         if self.config.hello_verify {
             let cookie = self.cookie(&hello)?;
             if !bool::from(hello.cookie.ct_eq(&cookie)) {

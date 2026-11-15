@@ -511,6 +511,14 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-dtls
 
+- Breaking for embedders: the DTLS cookie exchange is now behind the
+  experimental `hello-verify` cargo feature, off by default. Without it,
+  `Config` has no `hello_verify` field and the cookie code is not compiled;
+  code that names the field needs the feature. `Limit::HelloVerify` stays,
+  produced only with the feature. WHIP never used the exchange and does not
+  enable the feature. The feature is outside the A4.4 review and has two
+  known open findings (13 and 14 in
+  `docs/whip-evidence/a4.4-security-review-2026-11-12.md`).
 - A connected server now refuses every renegotiation with one warning-level
   `no_renegotiation`. It used to answer only a ClientHello whose
   `message_seq` was above the last Finished's, but DTLS 1.2 starts each

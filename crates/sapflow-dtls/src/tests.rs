@@ -1626,6 +1626,7 @@ fn unpolled_output_is_bounded() {
     assert!(p.server.stats().output_dropped > 0);
 }
 
+#[cfg(feature = "hello-verify")]
 #[test]
 fn cookie_exchange() {
     let config = Config {
@@ -1671,6 +1672,7 @@ fn cookie_exchange() {
     );
 }
 
+#[cfg(feature = "hello-verify")]
 fn cookie_pair() -> Pair {
     let config = Config {
         hello_verify: true,
@@ -1681,6 +1683,7 @@ fn cookie_pair() -> Pair {
 
 /// A copy of a one-record hello datagram with its `message_seq` and record
 /// sequence number replaced, as an injector would send it.
+#[cfg(feature = "hello-verify")]
 fn reseq(gram: &[u8], seq: u16, rseq: u64) -> Vec<u8> {
     let mut g = gram.to_vec();
     g[5..11].copy_from_slice(&rseq.to_be_bytes()[2..]);
@@ -1689,6 +1692,7 @@ fn reseq(gram: &[u8], seq: u16, rseq: u64) -> Vec<u8> {
 }
 
 /// The number of HelloVerifyRequest messages in `grams`.
+#[cfg(feature = "hello-verify")]
 fn hello_verifies(grams: &[Vec<u8>]) -> usize {
     flight_types(grams)
         .iter()
@@ -1698,6 +1702,7 @@ fn hello_verifies(grams: &[Vec<u8>]) -> usize {
 
 /// The genuine hello at `p.now`, its HelloVerifyRequest delivered, and the
 /// client's cookie-bearing hello held back.
+#[cfg(feature = "hello-verify")]
 fn hello_verify_and_held_cookie_hello(p: &mut Pair) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let hello = p.client.start();
     assert_eq!(hello.len(), 1, "one datagram");
@@ -1714,6 +1719,7 @@ fn hello_verify_and_held_cookie_hello(p: &mut Pair) -> (Vec<Vec<u8>>, Vec<Vec<u8
 /// Delivers the client's cookie-bearing hello, then a retransmission of it
 /// a second later, and runs the rest of the handshake, which must complete
 /// with one signature, one ECDH and one verification.
+#[cfg(feature = "hello-verify")]
 fn cookie_hello_completes(p: &mut Pair, cookie_hello: &[Vec<u8>], name: &str) {
     p.feed(cookie_hello).expect("cookie hello");
     let first = p.drain();
@@ -1762,6 +1768,7 @@ fn cookie_hello_completes(p: &mut Pair, cookie_hello: &[Vec<u8>], name: &str) {
 /// empty-cookie copy at seq 1, another hello with a wrong cookie at seq 1,
 /// copies at seq 1 and 2 (and at 2 and 3) ahead of the genuine one, and
 /// copies spending the rest of the HelloVerifyRequest budget.
+#[cfg(feature = "hello-verify")]
 #[test]
 fn an_invalid_cookie_hello_does_not_take_the_cookie_hellos_seq() {
     type Inject = fn(&[u8]) -> Vec<Vec<u8>>;
@@ -1796,6 +1803,7 @@ fn an_invalid_cookie_hello_does_not_take_the_cookie_hellos_seq() {
 /// A retransmitted first hello, now reassembled afresh rather than seen as
 /// old, still only repeats the same HelloVerifyRequest, spaced and within
 /// the flight's six sends, and spends none of the budget of answers.
+#[cfg(feature = "hello-verify")]
 #[test]
 fn a_retransmitted_first_hello_repeats_one_hello_verify_request() {
     let mut p = cookie_pair();
@@ -1812,6 +1820,10 @@ fn a_retransmitted_first_hello_repeats_one_hello_verify_request() {
         let again = p.drain();
         if !again.is_empty() {
             assert_eq!(flight_types(&again), flight_types(&first));
+            // Finding 14 of the A4.4 review (round 7, open): RFC 6347
+            // section 4.2.1 has a HelloVerifyRequest mirror the record
+            // number of the hello it answers. This pins today's behaviour,
+            // which counts on instead.
             assert_ne!(again, first, "new record numbers");
         }
         sent += hello_verifies(&again);
@@ -1827,6 +1839,7 @@ fn a_retransmitted_first_hello_repeats_one_hello_verify_request() {
 /// A forged first hello at seq 0, here another client's, answered before
 /// the genuine one arrives, no longer leaves the genuine hello at seq 0 old
 /// and unanswered: it gets its own HelloVerifyRequest.
+#[cfg(feature = "hello-verify")]
 #[test]
 fn a_forged_first_hello_does_not_exclude_the_genuine_one() {
     let mut p = cookie_pair();
@@ -1842,6 +1855,7 @@ fn a_forged_first_hello_does_not_exclude_the_genuine_one() {
 /// After the whole budget of six, the client's hello at seq 6 is still in
 /// reach and completes; no HelloVerifyRequest is ever sent for a seq whose
 /// answer could not be.
+#[cfg(feature = "hello-verify")]
 #[test]
 fn a_client_moved_on_by_every_hello_verify_request_still_completes() {
     let mut p = cookie_pair();
@@ -1869,6 +1883,7 @@ fn a_client_moved_on_by_every_hello_verify_request_still_completes() {
 
 /// The last seq in reach is never answered with a HelloVerifyRequest,
 /// whose follow-up would be out of reach, and nothing past it is kept.
+#[cfg(feature = "hello-verify")]
 #[test]
 fn no_hello_verify_request_for_a_seq_whose_answer_is_out_of_reach() {
     let mut p = cookie_pair();
@@ -1886,6 +1901,7 @@ fn no_hello_verify_request_for_a_seq_whose_answer_is_out_of_reach() {
 /// While a valid cookie is awaited, hellos are taken at any seq in reach,
 /// so forged incomplete hellos at other seqs must not hold the buffer
 /// against the cookie hello: it takes their room at once.
+#[cfg(feature = "hello-verify")]
 #[test]
 fn forged_hellos_at_other_seqs_do_not_hold_the_buffer() {
     let mut p = cookie_pair();
@@ -2016,6 +2032,7 @@ fn load_run(name: &'static str) -> Run {
 fn interop_config(name: &str) -> Config {
     Config {
         mtu: if name.contains("mtu300") { 300 } else { 1200 },
+        #[cfg(feature = "hello-verify")]
         hello_verify: name.contains("cookie"),
         ..Config::default()
     }
@@ -2028,6 +2045,10 @@ fn interop_config(name: &str) -> Config {
 fn openssl_runs_replay_byte_for_byte() {
     let seed: [u8; 32] = testing::unhex(INTEROP_SEED).try_into().expect("seed");
     for name in RUNS {
+        if name.contains("cookie") && !cfg!(feature = "hello-verify") {
+            // The cookie run needs the experimental hello-verify server.
+            continue;
+        }
         let run = load_run(name);
         assert_eq!(run.openssl, run.sapflow, "{name}: the live run matched");
         let id = Arc::new(Identity::generate_seeded(seed, TEST_TIME).expect("identity"));

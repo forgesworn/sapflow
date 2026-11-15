@@ -38,3 +38,8 @@ required-features = ["testing"]
 # Test helpers (a deterministic DTLS client, seeded randomness) and the fuzz
 # entry points. Not for production use.
 testing = []
+# Experimental: the HelloVerifyRequest cookie exchange
+# (`Config::hello_verify`). Off by default, and WHIP never turns it on:
+# ICE proves return routability before DTLS starts. Outside the A4.4
+# security review; known open findings are in the README.
+hello-verify = []

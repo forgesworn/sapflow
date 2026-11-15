@@ -20,21 +20,33 @@ cleanup() {
   if [ -d "$HOME/.Trash" ]; then mv "$work" "$HOME/.Trash/sapflow-dtls-interop-$(basename "$work")"; else rm -rf "$work"; fi
 }
 trap cleanup EXIT
+# Two builds of the example: the default one, as WHIP builds the crate,
+# for every run but the cookie run, and one with the experimental
+# hello-verify feature for that. Both land at the same path, so each is
+# copied out before the next build.
+build=(--features testing)
+built=target/debug/examples/udp_server
 if [ -n "${TARGET:-}" ]; then
-  cargo build -q -p sapflow-dtls --features testing --example udp_server --target "$TARGET"
-  bin=target/$TARGET/debug/examples/udp_server
-else
-  cargo build -q -p sapflow-dtls --features testing --example udp_server
-  bin=target/debug/examples/udp_server
+  build+=(--target "$TARGET")
+  built=target/$TARGET/debug/examples/udp_server
 fi
+cargo build -q -p sapflow-dtls "${build[@]}" --example udp_server
+cp "$built" "$work/udp_server"
+cargo build -q -p sapflow-dtls "${build[@]}" --features hello-verify --example udp_server
+cp "$built" "$work/udp_server-hello-verify"
 "$openssl" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -subj /CN=openssl-test-client -days 2 -keyout "$work/client.key" -out "$work/client.pem" 2>/dev/null
 fp=$("$openssl" x509 -in "$work/client.pem" -noout -fingerprint -sha256 | sed 's/^.*=//')
 seed=5361706c6f77445444534f70656e53534c496e7465726f7000000000000000${port: -2}
 status=0
+# Without the feature, cookie mode cannot be turned on.
+if "$work/udp_server" --hello-verify >/dev/null 2>&1; then
+  echo "the default build accepted --hello-verify"; status=1
+fi
 run() {
   local name=$1 profiles=$2 len=$3; shift 3
-  local rec="$work/$name.record"
+  local rec="$work/$name.record" bin="$work/udp_server"
+  case " $* " in *" --hello-verify "*) bin="$work/udp_server-hello-verify" ;; esac
   "$bin" --bind "127.0.0.1:$port" --expect "$fp" --seed "$seed" --record "$rec" "$@" >"$work/$name.server" 2>&1 &
   local pid=$!
   for _ in $(seq 50); do
