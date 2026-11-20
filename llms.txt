@@ -8,6 +8,13 @@ Measured against mediamtx 1.21.2 on one machine (medians of three runs, 250 / 75
 
 Choose mediamtx instead for RTSP, WebRTC, pulling from cameras, codecs beyond H.264/AAC, RTMPS, an HTTP API or metrics, delta playlists or several renditions.
 
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/sapflow): Canonical source repository, documentation and release information.
+- [relayswarm](https://github.com/forgesworn/relayswarm): Add optional peer-assisted delivery at the HLS player.
+
 ## Start here
 
 - [README](https://github.com/forgesworn/sapflow/blob/main/README.md): what it does, the comparison table, how to run it
