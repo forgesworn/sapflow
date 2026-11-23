@@ -16,12 +16,13 @@
 //! giving up on the packets ends it unreported, as it would a reported one.
 
 use crate::seq::Seq;
+use std::collections::VecDeque;
 
 /// Re-requests closer together than one round trip, per loss.
 pub const MAX_FAST_REQUESTS: u32 = 8;
-/// Ranges tracked at most. The list is scanned on every packet, so a
-/// sender that leaves every other packet missing must not grow it with the
-/// buffer; gaps beyond this are reported once and then left to the
+/// Ranges tracked at most. The list is scanned whenever a request is due,
+/// which a long list makes nearly every packet, so a sender that leaves
+/// every other packet missing must not grow it with the buffer; gaps beyond this are reported once and then left to the
 /// too-late drop. A held loss pushed off the list is reported at the next
 /// [`LossList::due`] all the same.
 pub const MAX_RANGES: usize = 1024;
@@ -92,13 +93,49 @@ impl Timing {
 /// [`MAX_RANGES`].
 #[derive(Debug, Default, Clone)]
 pub struct LossList {
-    /// Sorted, not overlapping.
-    entries: Vec<Loss>,
+    /// Sorted, not overlapping. A deque: losses are found at the leading
+    /// edge and given up at the trailing one.
+    entries: VecDeque<Loss>,
     /// Held losses that had to leave `entries` to keep it bounded, before
     /// their first report: [`due`](Self::due) reports them first. Each holds
     /// sequence numbers that left `entries`, so between them the two never
     /// hold more missing numbers than were listed.
     pushed_out: Vec<(Seq, Seq)>,
+    /// The earliest next request over `entries`, as a scan at `now` with
+    /// timing `t` would find it; `None` when not known. It lets
+    /// [`due`](Self::due) and [`next_due`](Self::next_due) answer without a
+    /// scan while nothing is due, which with a fragmented list is most calls.
+    schedule: Option<Schedule>,
+}
+
+/// What a scan of the entries found, and for which clock and timing.
+#[derive(Debug, Clone, Copy)]
+struct Schedule {
+    t: Timing,
+    now: i64,
+    /// The least of each entry's next request, none earlier than `now`;
+    /// `None` when no entry has one.
+    next: Option<i64>,
+}
+
+impl Schedule {
+    /// The answer at `now` with timing `t`, if this scan still gives it.
+    ///
+    /// When a request is next made does not depend on the clock; only
+    /// whether it is still useful does, and that can only lapse as the
+    /// clock advances. So a later clock keeps a `None`, and keeps a time
+    /// that is still ahead: the entry it came from is still useful, and no
+    /// other entry's request is earlier.
+    fn at(&self, now: i64, t: Timing) -> Option<Option<i64>> {
+        if self.t != t || now < self.now {
+            return None;
+        }
+        match self.next {
+            None => Some(None),
+            Some(next) if next > now || now == self.now => Some(Some(next)),
+            Some(_) => None,
+        }
+    }
 }
 
 impl LossList {
@@ -108,6 +145,7 @@ impl LossList {
     }
 
     /// Whether nothing is missing and no report is owed.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.pushed_out.is_empty()
     }
@@ -133,7 +171,7 @@ impl LossList {
 
     /// The earliest missing sequence number, if any.
     pub fn first(&self) -> Option<Seq> {
-        self.entries.first().map(|e| e.first)
+        self.entries.front().map(|e| e.first)
     }
 
     /// Records `first..=last` as lost, asked for once at `now`.
@@ -178,6 +216,26 @@ impl LossList {
             })
     }
 
+    /// The schedule gains `e`.
+    fn scheduled(&mut self, e: &Loss) {
+        if let Some(s) = &mut self.schedule
+            && let Some(at) = e.request_from(s.now, s.t)
+        {
+            s.next = Some(s.next.map_or(at, |next| next.min(at)));
+        }
+    }
+
+    /// The schedule loses `e`, as it was when it was counted. If `e` may
+    /// have been the earliest, only a scan can say what is.
+    fn unscheduled(&mut self, e: &Loss) {
+        if let Some(s) = &self.schedule
+            && let Some(at) = e.request_from(s.now, s.t)
+            && s.next.is_none_or(|next| at <= next)
+        {
+            self.schedule = None;
+        }
+    }
+
     /// Lists `e`; false if the list is full, the range is empty or it
     /// overlaps one already listed.
     fn insert(&mut self, e: Loss) -> bool {
@@ -195,17 +253,21 @@ impl LossList {
             return false;
         }
         self.entries.insert(at, e);
+        self.scheduled(&e);
         true
     }
 
     /// Keeps the list within [`MAX_RANGES`], dropping the latest losses; a
     /// held one is kept to be reported at the next [`due`](Self::due).
-    fn bound(entries: &mut Vec<Loss>, pushed_out: &mut Vec<(Seq, Seq)>) {
+    /// Returns whether any were dropped.
+    fn bound(entries: &mut VecDeque<Loss>, pushed_out: &mut Vec<(Seq, Seq)>) -> bool {
+        let over = entries.len() > MAX_RANGES;
         for e in entries.drain(MAX_RANGES.min(entries.len())..) {
             if e.requests == 0 {
                 pushed_out.push((e.first, e.last));
             }
         }
+        over
     }
 
     /// `s` arrived. Returns whether it was on the list.
@@ -226,12 +288,17 @@ impl LossList {
             .entries
             .iter()
             .position(|e| e.first <= s && s <= e.last)?;
-        let e = self.entries.get_mut(i)?;
+        let before = *self.entries.get(i)?;
         let taken = Taken {
-            found: e.found,
-            reported: e.requests > 0,
+            found: before.found,
+            reported: before.requests > 0,
         };
-        match (e.first == s, e.last == s) {
+        // Only the sequence numbers change in an entry cut at its start.
+        if before.first != s || before.last == s {
+            self.unscheduled(&before);
+        }
+        let e = self.entries.get_mut(i)?;
+        match (before.first == s, before.last == s) {
             (true, true) => {
                 self.entries.remove(i);
             }
@@ -241,6 +308,8 @@ impl LossList {
                 if e.requests == 0 {
                     e.deadline = e.deadline.min(delivers_at);
                 }
+                let after = *e;
+                self.scheduled(&after);
             }
             (false, false) => {
                 let mut tail = *e;
@@ -248,10 +317,15 @@ impl LossList {
                 if e.requests == 0 {
                     e.deadline = e.deadline.min(delivers_at);
                 }
+                let after = *e;
                 tail.first = s.next();
                 self.entries.insert(i + 1, tail);
+                self.scheduled(&after);
+                self.scheduled(&tail);
                 // At the limit the latest losses are no longer tracked.
-                Self::bound(&mut self.entries, &mut self.pushed_out);
+                if Self::bound(&mut self.entries, &mut self.pushed_out) {
+                    self.schedule = None;
+                }
             }
         }
         Some(taken)
@@ -259,24 +333,32 @@ impl LossList {
 
     /// Forgets everything before `s` (delivered or given up on).
     pub fn remove_before(&mut self, s: Seq) {
-        self.entries.retain_mut(|e| {
+        // The entries are sorted and do not overlap, so those wholly before
+        // `s` lead the list and at most the next one straddles it.
+        while let Some(e) = self.entries.front().copied() {
             if e.last < s {
-                return false;
+                self.entries.pop_front();
+                self.unscheduled(&e);
+            } else {
+                break;
             }
-            if e.first < s {
-                e.first = s;
-            }
-            true
-        });
-        self.pushed_out.retain_mut(|(first, last)| {
-            if *last < s {
-                return false;
-            }
-            if *first < s {
-                *first = s;
-            }
-            true
-        });
+        }
+        if let Some(e) = self.entries.front_mut()
+            && e.first < s
+        {
+            e.first = s;
+        }
+        if !self.pushed_out.is_empty() {
+            self.pushed_out.retain_mut(|(first, last)| {
+                if *last < s {
+                    return false;
+                }
+                if *first < s {
+                    *first = s;
+                }
+                true
+            });
+        }
     }
 
     /// Forgets `first..=last` (the sender said it no longer has them).
@@ -284,20 +366,21 @@ impl LossList {
         if last < first {
             return;
         }
-        let mut kept = Vec::with_capacity(self.entries.len() + 1);
+        self.schedule = None;
+        let mut kept = VecDeque::with_capacity(self.entries.len() + 1);
         for e in self.entries.drain(..) {
             if e.last < first || last < e.first {
-                kept.push(e);
+                kept.push_back(e);
                 continue;
             }
             if e.first < first {
-                kept.push(Loss {
+                kept.push_back(Loss {
                     last: first.prev(),
                     ..e
                 });
             }
             if last < e.last {
-                kept.push(Loss {
+                kept.push_back(Loss {
                     first: last.next(),
                     ..e
                 });
@@ -325,29 +408,42 @@ impl LossList {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.pushed_out.clear();
+        self.schedule = None;
     }
 
     /// The losses to ask for at `now`, marked as asked; at most `limit`
     /// ranges: held losses pushed off the list first, then the rest earliest
     /// first.
     pub fn due(&mut self, now: i64, t: Timing, limit: usize) -> Vec<(Seq, Seq)> {
+        if self.pushed_out.is_empty()
+            && let Some(known) = self.schedule.and_then(|s| s.at(now, t))
+            && known.is_none_or(|next| next > now)
+        {
+            // Nothing is due, so nothing is marked.
+            return Vec::new();
+        }
         let rtt = t.rtt.max(1);
         let owed = self.pushed_out.len().min(limit);
         let mut out: Vec<(Seq, Seq)> = self.pushed_out.drain(..owed).collect();
+        let mut next: Option<i64> = None;
         for e in &mut self.entries {
-            if out.len() >= limit {
-                break;
+            let mut request = e.next_request(now, t);
+            if out.len() < limit && request.is_some_and(|at| at <= now) {
+                if e.near(now, rtt) && e.fast_requests < MAX_FAST_REQUESTS {
+                    e.fast_requests += 1;
+                }
+                e.last_request = now;
+                e.requests = e.requests.saturating_add(1);
+                out.push((e.first, e.last));
+                request = e.next_request(now, t);
             }
-            if !matches!(e.next_request(now, t), Some(at) if at <= now) {
-                continue;
+            // The same pass leaves the schedule as the list now stands.
+            if let Some(at) = request {
+                let at = at.max(now);
+                next = Some(next.map_or(at, |next| next.min(at)));
             }
-            if e.near(now, rtt) && e.fast_requests < MAX_FAST_REQUESTS {
-                e.fast_requests += 1;
-            }
-            e.last_request = now;
-            e.requests = e.requests.saturating_add(1);
-            out.push((e.first, e.last));
         }
+        self.schedule = Some(Schedule { t, now, next });
         out
     }
 
@@ -358,10 +454,15 @@ impl LossList {
         if !self.pushed_out.is_empty() {
             return Some(now);
         }
+        if self.entries.is_empty() {
+            return None;
+        }
+        if let Some(known) = self.schedule.and_then(|s| s.at(now, t)) {
+            return known;
+        }
         self.entries
             .iter()
-            .filter_map(|e| e.next_request(now, t))
-            .map(|at| at.max(now))
+            .filter_map(|e| e.request_from(now, t))
             .min()
     }
 }
@@ -374,6 +475,11 @@ fn hold_limit(deadline: i64, rtt: i64) -> i64 {
 }
 
 impl Loss {
+    /// [`next_request`](Self::next_request), never earlier than `now`.
+    fn request_from(&self, now: i64, t: Timing) -> Option<i64> {
+        self.next_request(now, t).map(|at| at.max(now))
+    }
+
     /// Within three round trips of the deadline at `t`.
     fn near(&self, t: i64, rtt: i64) -> bool {
         self.deadline.saturating_sub(t) < NEAR_DEADLINE_RTTS * rtt
@@ -794,5 +900,470 @@ mod tests {
         assert_eq!(d, vec![(s(0), s(0)), (s(2), s(2)), (s(4), s(4))]);
         // The rest are still due.
         assert_eq!(l.due(RTT, Timing::rtt(RTT), 100).len(), 7);
+    }
+
+    // --- The scanning list this one replaced, kept as the reference. ---
+
+    /// The list as it was before the cached schedule: every query scans.
+    /// The differential test below holds the current list to its answers.
+    #[derive(Debug, Default, Clone)]
+    pub struct ScanLossList {
+        /// Sorted, not overlapping.
+        entries: Vec<Loss>,
+        /// Held losses that had to leave `entries` to keep it bounded, before
+        /// their first report: [`due`](Self::due) reports them first. Each holds
+        /// sequence numbers that left `entries`, so between them the two never
+        /// hold more missing numbers than were listed.
+        pushed_out: Vec<(Seq, Seq)>,
+    }
+
+    impl ScanLossList {
+        /// An empty list.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Whether nothing is missing and no report is owed.
+        pub fn is_empty(&self) -> bool {
+            self.entries.is_empty() && self.pushed_out.is_empty()
+        }
+
+        /// Number of ranges on the list; [`count`](Self::count) gives the number
+        /// of sequence numbers.
+        pub fn ranges(&self) -> usize {
+            self.entries.len()
+        }
+
+        /// Sequence numbers missing in all.
+        pub fn count(&self) -> u64 {
+            self.entries
+                .iter()
+                .map(|e| e.first.distance_to(e.last) as u64 + 1)
+                .sum()
+        }
+
+        /// Whether `s` is a missing sequence number on the list.
+        pub fn contains(&self, s: Seq) -> bool {
+            self.entries.iter().any(|e| e.first <= s && s <= e.last)
+        }
+
+        /// The earliest missing sequence number, if any.
+        pub fn first(&self) -> Option<Seq> {
+            self.entries.first().map(|e| e.first)
+        }
+
+        /// Records `first..=last` as lost, asked for once at `now`.
+        pub fn add(&mut self, first: Seq, last: Seq, now: i64, deadline: i64) {
+            self.insert(Loss {
+                first,
+                last,
+                deadline,
+                last_request: now,
+                requests: 1,
+                fast_requests: 0,
+                found: now,
+            });
+        }
+
+        /// Records `first..=last` as lost at `now` without asking for it yet:
+        /// its first report is held until `until`, in case the packets are only
+        /// late, but never into the last three round trips before `deadline`,
+        /// where a loss is asked for every quarter round trip. Returns whether it
+        /// was listed. It is not when the list is full, the range overlaps one
+        /// already listed, or the deadline leaves no time to hold; the caller
+        /// must then ask for it at once.
+        pub fn hold(
+            &mut self,
+            first: Seq,
+            last: Seq,
+            now: i64,
+            deadline: i64,
+            until: i64,
+            t: Timing,
+        ) -> bool {
+            let until = until.min(hold_limit(deadline, t.rtt.max(1)));
+            until > now
+                && self.insert(Loss {
+                    first,
+                    last,
+                    deadline,
+                    last_request: until,
+                    requests: 0,
+                    fast_requests: 0,
+                    found: now,
+                })
+        }
+
+        /// Lists `e`; false if the list is full, the range is empty or it
+        /// overlaps one already listed.
+        fn insert(&mut self, e: Loss) -> bool {
+            if e.last < e.first || self.entries.len() >= MAX_RANGES {
+                return false;
+            }
+            // Gaps are found at the leading edge, so this is nearly always a push.
+            let at = self
+                .entries
+                .iter()
+                .rposition(|x| x.last < e.first)
+                .map_or(0, |i| i + 1);
+            if self.entries.get(at).is_some_and(|x| x.first <= e.last) {
+                // Overlaps what is already known; keep the existing record.
+                return false;
+            }
+            self.entries.insert(at, e);
+            true
+        }
+
+        /// Keeps the list within [`MAX_RANGES`], dropping the latest losses; a
+        /// held one is kept to be reported at the next [`due`](Self::due).
+        fn bound(entries: &mut Vec<Loss>, pushed_out: &mut Vec<(Seq, Seq)>) {
+            for e in entries.drain(MAX_RANGES.min(entries.len())..) {
+                if e.requests == 0 {
+                    pushed_out.push((e.first, e.last));
+                }
+            }
+        }
+
+        /// `s` arrived. Returns whether it was on the list.
+        pub fn remove(&mut self, s: Seq) -> bool {
+            self.take(s, i64::MAX).is_some()
+        }
+
+        /// `s` arrived, to be delivered at `delivers_at`: takes it off the list,
+        /// and says when its loss was found and whether it had been asked for;
+        /// `None` if it was not listed.
+        ///
+        /// The part of a held loss before `s` is due no later than `s` itself,
+        /// which can be well before the deadline of the packet that revealed
+        /// the loss, so its hold is bounded by that instead. A reported loss
+        /// keeps the deadline it had.
+        pub fn take(&mut self, s: Seq, delivers_at: i64) -> Option<Taken> {
+            let i = self
+                .entries
+                .iter()
+                .position(|e| e.first <= s && s <= e.last)?;
+            let e = self.entries.get_mut(i)?;
+            let taken = Taken {
+                found: e.found,
+                reported: e.requests > 0,
+            };
+            match (e.first == s, e.last == s) {
+                (true, true) => {
+                    self.entries.remove(i);
+                }
+                (true, false) => e.first = s.next(),
+                (false, true) => {
+                    e.last = s.prev();
+                    if e.requests == 0 {
+                        e.deadline = e.deadline.min(delivers_at);
+                    }
+                }
+                (false, false) => {
+                    let mut tail = *e;
+                    e.last = s.prev();
+                    if e.requests == 0 {
+                        e.deadline = e.deadline.min(delivers_at);
+                    }
+                    tail.first = s.next();
+                    self.entries.insert(i + 1, tail);
+                    // At the limit the latest losses are no longer tracked.
+                    Self::bound(&mut self.entries, &mut self.pushed_out);
+                }
+            }
+            Some(taken)
+        }
+
+        /// Forgets everything before `s` (delivered or given up on).
+        pub fn remove_before(&mut self, s: Seq) {
+            self.entries.retain_mut(|e| {
+                if e.last < s {
+                    return false;
+                }
+                if e.first < s {
+                    e.first = s;
+                }
+                true
+            });
+            self.pushed_out.retain_mut(|(first, last)| {
+                if *last < s {
+                    return false;
+                }
+                if *first < s {
+                    *first = s;
+                }
+                true
+            });
+        }
+
+        /// Forgets `first..=last` (the sender said it no longer has them).
+        pub fn remove_range(&mut self, first: Seq, last: Seq) {
+            if last < first {
+                return;
+            }
+            let mut kept = Vec::with_capacity(self.entries.len() + 1);
+            for e in self.entries.drain(..) {
+                if e.last < first || last < e.first {
+                    kept.push(e);
+                    continue;
+                }
+                if e.first < first {
+                    kept.push(Loss {
+                        last: first.prev(),
+                        ..e
+                    });
+                }
+                if last < e.last {
+                    kept.push(Loss {
+                        first: last.next(),
+                        ..e
+                    });
+                }
+            }
+            Self::bound(&mut kept, &mut self.pushed_out);
+            self.entries = kept;
+            let mut owed = Vec::with_capacity(self.pushed_out.len());
+            for (a, b) in self.pushed_out.drain(..) {
+                if b < first || last < a {
+                    owed.push((a, b));
+                    continue;
+                }
+                if a < first {
+                    owed.push((a, first.prev()));
+                }
+                if last < b {
+                    owed.push((last.next(), b));
+                }
+            }
+            self.pushed_out = owed;
+        }
+
+        /// Forgets every loss.
+        pub fn clear(&mut self) {
+            self.entries.clear();
+            self.pushed_out.clear();
+        }
+
+        /// The losses to ask for at `now`, marked as asked; at most `limit`
+        /// ranges: held losses pushed off the list first, then the rest earliest
+        /// first.
+        pub fn due(&mut self, now: i64, t: Timing, limit: usize) -> Vec<(Seq, Seq)> {
+            let rtt = t.rtt.max(1);
+            let owed = self.pushed_out.len().min(limit);
+            let mut out: Vec<(Seq, Seq)> = self.pushed_out.drain(..owed).collect();
+            for e in &mut self.entries {
+                if out.len() >= limit {
+                    break;
+                }
+                if !matches!(e.next_request(now, t), Some(at) if at <= now) {
+                    continue;
+                }
+                if e.near(now, rtt) && e.fast_requests < MAX_FAST_REQUESTS {
+                    e.fast_requests += 1;
+                }
+                e.last_request = now;
+                e.requests = e.requests.saturating_add(1);
+                out.push((e.first, e.last));
+            }
+            out
+        }
+
+        /// When [`due`](Self::due) next has something to send, given that it
+        /// has just run at `now`: never earlier than `now`, and nothing for a
+        /// loss a retransmission could no longer fill in time.
+        pub fn next_due(&self, now: i64, t: Timing) -> Option<i64> {
+            if !self.pushed_out.is_empty() {
+                return Some(now);
+            }
+            self.entries
+                .iter()
+                .filter_map(|e| e.next_request(now, t))
+                .map(|at| at.max(now))
+                .min()
+        }
+    }
+
+    /// A small deterministic generator (xorshift64*).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn same(new: &LossList, old: &ScanLossList, step: usize) {
+        assert_eq!(new.ranges(), old.ranges(), "ranges at step {step}");
+        assert_eq!(new.count(), old.count(), "count at step {step}");
+        assert_eq!(new.first(), old.first(), "first at step {step}");
+        assert_eq!(new.is_empty(), old.is_empty(), "is_empty at step {step}");
+        assert!(
+            new.entries.iter().eq(old.entries.iter()),
+            "entries at step {step}"
+        );
+        assert_eq!(new.pushed_out, old.pushed_out, "pushed out at step {step}");
+    }
+
+    /// Every answer and every stored record matches the scanning list,
+    /// through holds, arrivals, drops, delivery, a full list, changing
+    /// timing, a clock that sometimes steps back and the sequence wrap.
+    fn matches_the_scanning_list(seed: u64, start: u32, dense: bool, steps: usize) {
+        let mut rng = Rng(seed);
+        let mut new = LossList::new();
+        let mut old = ScanLossList::new();
+        let mut now: i64 = 1_000_000;
+        let mut t = Timing {
+            rtt: 40_000,
+            retry: 50_000,
+        };
+        // The receiver's window: losses lie between `head` and `edge`.
+        let mut head = Seq::new(start);
+        let mut edge = head;
+        for step in 0..steps {
+            now += rng.below(if dense { 300 } else { 4_000 }) as i64;
+            let at = if rng.below(16) == 0 {
+                now - rng.below(20_000) as i64
+            } else {
+                now
+            };
+            let inside = |rng: &mut Rng| {
+                let span = head.distance_to(edge).max(1) as u64;
+                head.add(rng.below(span + 4) as u32)
+            };
+            match rng.below(if dense { 24 } else { 16 }) {
+                0..=4 => {
+                    // A gap at the leading edge, reported or held.
+                    let first = edge.add(1 + rng.below(3) as u32);
+                    let last = first.add(rng.below(if dense { 2 } else { 6 }) as u32);
+                    let deadline = at + 20_000 + rng.below(400_000) as i64;
+                    if rng.below(2) == 0 {
+                        new.add(first, last, at, deadline);
+                        old.add(first, last, at, deadline);
+                    } else {
+                        let until = at + rng.below(60_000) as i64 - 5_000;
+                        assert_eq!(
+                            new.hold(first, last, at, deadline, until, t),
+                            old.hold(first, last, at, deadline, until, t),
+                            "hold at step {step}"
+                        );
+                    }
+                    edge = last.add(1);
+                }
+                5 => {
+                    // An overlapping or out-of-order add.
+                    let first = inside(&mut rng);
+                    let last = first.add(rng.below(4) as u32);
+                    new.add(first, last, at, at + 100_000);
+                    old.add(first, last, at, at + 100_000);
+                }
+                6..=8 => {
+                    let s = inside(&mut rng);
+                    let delivers = at + rng.below(300_000) as i64;
+                    assert_eq!(
+                        new.take(s, delivers),
+                        old.take(s, delivers),
+                        "take at step {step}"
+                    );
+                }
+                9 => {
+                    let s = inside(&mut rng);
+                    assert_eq!(new.remove(s), old.remove(s), "remove at step {step}");
+                    assert_eq!(new.contains(s), old.contains(s));
+                }
+                10 if !dense || rng.below(8) == 0 => {
+                    let ahead = head.distance_to(edge).max(1) as u64;
+                    head = head.add(rng.below(ahead.min(40)) as u32);
+                    new.remove_before(head);
+                    old.remove_before(head);
+                }
+                11 if rng.below(4) == 0 => {
+                    let first = inside(&mut rng);
+                    let last = first.add(rng.below(30) as u32);
+                    new.remove_range(first, last);
+                    old.remove_range(first, last);
+                }
+                12 => {
+                    t = Timing {
+                        rtt: rng.below(120_000) as i64,
+                        retry: rng.below(150_000) as i64,
+                    };
+                }
+                13 if rng.below(64) == 0 => {
+                    new.clear();
+                    old.clear();
+                }
+                _ => {}
+            }
+            // The receiver's own order of questions, and the reverse.
+            let limit = [0, 1, 3, 64, 512][rng.below(5) as usize];
+            match rng.below(4) {
+                0 => {
+                    assert_eq!(new.next_due(at, t), old.next_due(at, t), "next at {step}");
+                    assert_eq!(
+                        new.due(at, t, limit),
+                        old.due(at, t, limit),
+                        "due at {step}"
+                    );
+                }
+                1 => {
+                    assert_eq!(
+                        new.due(at, t, limit),
+                        old.due(at, t, limit),
+                        "due at {step}"
+                    );
+                    assert_eq!(new.next_due(now, t), old.next_due(now, t), "next at {step}");
+                }
+                2 => assert_eq!(new.next_due(now, t), old.next_due(now, t), "next at {step}"),
+                _ => {}
+            }
+            same(&new, &old, step);
+        }
+    }
+
+    #[test]
+    fn the_cached_schedule_matches_the_scanning_list() {
+        for seed in 1..=24 {
+            matches_the_scanning_list(
+                u64::wrapping_mul(seed, 0x9e37_79b9_7f4a_7c15),
+                1_000,
+                false,
+                20_000,
+            );
+        }
+    }
+
+    #[test]
+    fn the_cached_schedule_matches_the_scanning_list_when_full() {
+        // Short gaps found far faster than they are delivered: the list
+        // reaches its bound and pushes held losses out.
+        let mut full = LossList::new();
+        for seed in 1..=6 {
+            matches_the_scanning_list(
+                u64::wrapping_mul(seed, 0xd1b5_4a32_d192_ed03),
+                5,
+                true,
+                30_000,
+            );
+        }
+        for i in 0..(MAX_RANGES as u32 + 5) {
+            full.add(s(i * 2), s(i * 2), 0, 1_000_000);
+        }
+        assert_eq!(full.ranges(), MAX_RANGES);
+    }
+
+    #[test]
+    fn the_cached_schedule_matches_the_scanning_list_across_the_wrap() {
+        for seed in 1..=8 {
+            matches_the_scanning_list(
+                u64::wrapping_mul(seed, 0xa076_1d64_78bd_642f),
+                0x7fff_f000,
+                false,
+                20_000,
+            );
+        }
     }
 }
