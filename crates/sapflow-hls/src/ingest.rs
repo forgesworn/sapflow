@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -144,22 +145,73 @@ struct Program {
     aac: bool,
 }
 
-#[derive(Default)]
+/// The one transport packet [`Feed`] has handed to the maintained reader.
 struct Slot {
-    buf: Vec<u8>,
+    /// Counts the packets posted, so the reader knows when its copy is stale
+    /// without taking the lock.
+    posted: AtomicU64,
+    packet: Mutex<[u8; TS_SIZE]>,
+}
+
+/// The posting side of a [`Slot`].
+#[derive(Clone)]
+struct SlotWriter(Arc<Slot>);
+
+impl SlotWriter {
+    /// Replaces whatever the reader had, read or not, with `packet`.
+    fn post(&self, packet: &[u8; TS_SIZE]) -> Option<()> {
+        let mut held = self.0.packet.lock().ok()?;
+        *held = *packet;
+        self.0.posted.fetch_add(1, Ordering::Release);
+        Some(())
+    }
+}
+
+/// The reading side of a [`Slot`]: the maintained reader's byte stream.
+///
+/// That reader takes a packet in many small reads. Each is served from this
+/// side's own copy of the packet; the lock is taken once per packet, to
+/// fetch a newly posted one.
+struct SlotReader {
+    slot: Arc<Slot>,
+    /// The value of [`Slot::posted`] `packet` was copied at.
+    seen: u64,
+    packet: [u8; TS_SIZE],
+    /// Bytes of `packet` posted so far (none before the first post).
+    len: usize,
     pos: usize,
 }
 
-#[derive(Clone, Default)]
-struct SlotReader(Arc<Mutex<Slot>>);
+impl SlotReader {
+    fn new() -> (SlotWriter, Self) {
+        let slot = Arc::new(Slot {
+            posted: AtomicU64::new(0),
+            packet: Mutex::new([0; TS_SIZE]),
+        });
+        let reader = Self {
+            slot: slot.clone(),
+            seen: 0,
+            packet: [0; TS_SIZE],
+            len: 0,
+            pos: 0,
+        };
+        (SlotWriter(slot), reader)
+    }
+}
 
 impl Read for SlotReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let mut slot = self.0.lock().map_err(|_| io::ErrorKind::Other)?;
-        let n = out.len().min(slot.buf.len() - slot.pos);
-        let start = slot.pos;
-        out[..n].copy_from_slice(&slot.buf[start..start + n]);
-        slot.pos += n;
+        if self.slot.posted.load(Ordering::Acquire) != self.seen {
+            let held = self.slot.packet.lock().map_err(|_| io::ErrorKind::Other)?;
+            self.packet = *held;
+            self.seen = self.slot.posted.load(Ordering::Acquire);
+            self.len = TS_SIZE;
+            self.pos = 0;
+        }
+        let n = out.len().min(self.len - self.pos);
+        let start = self.pos;
+        out[..n].copy_from_slice(&self.packet[start..start + n]);
+        self.pos += n;
         Ok(n)
     }
 }
@@ -189,7 +241,7 @@ struct PesBoundary {
 
 struct Feed {
     input: Arc<Mutex<Input>>,
-    slot: SlotReader,
+    slot: SlotWriter,
     inner: TsPacketReader<SlotReader>,
     continuity: HashMap<Pid, (u8, [u8; TS_SIZE])>,
     pending: Option<Box<TsPacket>>,
@@ -384,12 +436,7 @@ impl ReadTsPacket for Feed {
                 input.start += TS_SIZE;
                 p
             };
-            {
-                let mut slot = self.slot.0.lock().map_err(|_| starved())?;
-                slot.buf.clear();
-                slot.buf.extend_from_slice(&packet);
-                slot.pos = 0;
-            }
+            self.slot.post(&packet).ok_or_else(starved)?;
             match self.inner.read_ts_packet() {
                 Ok(Some(mut p)) => {
                     if !Self::normalize_pes_length(&mut p, &packet) {
@@ -1170,11 +1217,11 @@ impl TsIngest {
     /// first supported media after the program's topology is known.
     pub fn new(cfg: MuxerConfig) -> Self {
         let input = Arc::new(Mutex::new(Input::default()));
-        let slot = SlotReader::default();
+        let (slot, reader) = SlotReader::new();
         let feed = Feed {
             input: input.clone(),
-            slot: slot.clone(),
-            inner: TsPacketReader::new(slot),
+            slot,
+            inner: TsPacketReader::new(reader),
             continuity: HashMap::new(),
             pending: None,
             boundaries: HashMap::new(),
@@ -1946,6 +1993,43 @@ mod tests {
     use crate::muxer::LEADING_GAPS;
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/testsrc-3s.ts");
+
+    /// The maintained reader's many small reads see exactly the packet last
+    /// posted, from its start: nothing before the first post, nothing past
+    /// its end, and nothing left over from a packet that was replaced
+    /// before it was read through.
+    #[test]
+    fn the_slot_serves_the_last_posted_packet_from_its_start() {
+        let (writer, mut reader) = SlotReader::new();
+        let mut out = [0u8; 300];
+        assert_eq!(reader.read(&mut out).expect("read"), 0, "before any post");
+
+        let mut first = [0u8; TS_SIZE];
+        first.iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        writer.post(&first).expect("post");
+        let mut got = Vec::new();
+        for want in [1, 3, 0, 7, 100, 300] {
+            let n = reader.read(&mut out[..want]).expect("read");
+            got.extend_from_slice(&out[..n]);
+        }
+        assert_eq!(got, first, "small reads, then the rest and no more");
+        assert_eq!(reader.read(&mut out).expect("read"), 0, "exhausted");
+
+        // Replaced half read, twice over: only the last one is seen.
+        let second = [0xaa; TS_SIZE];
+        let third = [0x55; TS_SIZE];
+        writer.post(&first).expect("post");
+        assert_eq!(reader.read(&mut out[..90]).expect("read"), 90);
+        writer.post(&second).expect("post");
+        writer.post(&third).expect("post");
+        assert_eq!(reader.read(&mut out).expect("read"), TS_SIZE);
+        assert_eq!(out[..TS_SIZE], third);
+        assert_eq!(reader.read(&mut out).expect("read"), 0);
+
+        // The same packet posted again is a new packet.
+        writer.post(&third).expect("post");
+        assert_eq!(reader.read(&mut out).expect("read"), TS_SIZE);
+    }
 
     fn ingest_in_chunks(chunk: usize) -> TsIngest {
         let mut ing = TsIngest::new(MuxerConfig::default());
