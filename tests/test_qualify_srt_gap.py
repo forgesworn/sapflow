@@ -98,6 +98,22 @@ class GateTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertTrue(result["profiles"]["clean-stream"]["median_pass"])
 
+    def test_a_campaign_names_the_profiles_it_must_improve(self):
+        rows, workloads = campaign()
+        # The burst arm improves in this campaign; the fragmented one does not.
+        result = RUNNER.qualify(rows, workloads, ("fragmented-stream",))
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["profiles"]["fragmented-stream"]["guard"], "benefit")
+        self.assertFalse(result["profiles"]["fragmented-stream"]["median_pass"])
+        self.assertEqual(result["profiles"]["bursty-stream"]["guard"], "nominal")
+        for row in rows:
+            if row["profile"] == "fragmented-stream" and row["arm"] == "candidate":
+                row["result"]["elapsed_ns"] = 2_000_000_000 + 1_000_000_000
+        self.assertTrue(RUNNER.qualify(rows, workloads, ("fragmented-stream",))["passed"])
+        self.assertTrue(RUNNER.qualify(rows, workloads, ("fragmented-stream", "bursty-stream"))["passed"])
+        for bad in ((), ("timer",)):
+            self.assertFalse(RUNNER.qualify(rows, workloads, bad)["passed"])
+
     def test_burst_requires_every_pair_not_to_regress(self):
         rows, workloads = campaign()
         rows[5]["result"]["elapsed_ns"] = 5_010_000_000
@@ -164,7 +180,7 @@ class RecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             try:
                 os.chdir(directory)
-                for name in (RUNNER.RECEIVER, RUNNER.EXAMPLE, "Cargo.toml", "Cargo.lock",
+                for name in (*RUNNER.RUNTIME, RUNNER.EXAMPLE, "Cargo.toml", "Cargo.lock",
                              "crates/sapflow-srt/Cargo.toml"):
                     path = Path(name)
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,8 +190,9 @@ class RecoveryTests(unittest.TestCase):
                 def fake_git(*args):
                     return {"rev-parse": revision, "status": "", "diff": RUNNER.RECEIVER}[args[0]]
 
-                def failed_build(source, executable, receiver, output, report, label):
-                    receiver.write_bytes(b"baseline installed before compile failure")
+                def failed_build(sources, executable, output, report, label):
+                    for path in sources:
+                        Path(path).write_bytes(b"baseline installed before compile failure")
                     raise ValueError("simulated compiler failure")
 
                 with mock.patch.object(RUNNER, "git", side_effect=fake_git), \
@@ -183,14 +200,15 @@ class RecoveryTests(unittest.TestCase):
                      mock.patch.object(RUNNER.platform, "platform", return_value="test Linux"), \
                      mock.patch.object(RUNNER.platform, "machine", return_value="test machine"), \
                      mock.patch.object(RUNNER, "cpu_snapshot", return_value=[1] * 8), \
-                     mock.patch.object(RUNNER.subprocess, "check_output", side_effect=["rustc test", b"baseline"]), \
+                     mock.patch.object(RUNNER.subprocess, "check_output", side_effect=["rustc test", b"baseline", b"baseline"]), \
                      mock.patch.object(RUNNER, "build_arm", side_effect=failed_build), \
                      mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": ""}), \
                      mock.patch("sys.argv", ["qualify", "--baseline", "b" * 40, "--candidate", revision,
                                              "--output", "target/result.json"]), \
                      mock.patch("builtins.print"):
                     self.assertEqual(RUNNER.main(), 1)
-                self.assertEqual(Path(RUNNER.RECEIVER).read_bytes(), b"candidate")
+                for path in RUNNER.RUNTIME:
+                    self.assertEqual(Path(path).read_bytes(), b"candidate")
                 receipt = RUNNER.json.loads(Path("target/result.json").read_text())
                 self.assertEqual(receipt["status"], "invalid")
                 self.assertIn("simulated compiler failure", receipt["error"])

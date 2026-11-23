@@ -8,6 +8,14 @@ on:
         required: true
         default: aee2a526c26f8837266857e139b46d40591d5da2
         type: string
+      srt_benefit:
+        description: SRT profile the change must improve; the others must not regress
+        required: true
+        default: bursty-stream
+        type: choice
+        options:
+          - bursty-stream
+          - fragmented-stream
 
 permissions:
   contents: read
@@ -20,6 +28,7 @@ env:
   CARGO_INCREMENTAL: '0'
   CARGO_TERM_COLOR: never
   QUALIFICATION_BASELINE: ${{ inputs.baseline || 'aee2a526c26f8837266857e139b46d40591d5da2' }}
+  QUALIFICATION_SRT_BENEFIT: ${{ inputs.srt_benefit || 'bursty-stream' }}
 
 jobs:
   http:
@@ -80,6 +89,7 @@ jobs:
         run: |
           python3 -B scripts/qualify-srt-gap.py \
             --baseline "$QUALIFICATION_BASELINE" --candidate "$GITHUB_SHA" \
+            --benefit "$QUALIFICATION_SRT_BENEFIT" \
             --output target/performance-qualification/srt.json
       - name: Retain compact results, including failed guards
         if: always()
