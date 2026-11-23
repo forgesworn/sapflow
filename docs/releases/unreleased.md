@@ -265,6 +265,17 @@ Notes for the release after 0.2.0-rc.1.
   v4v's reason messages do not yet name `server-interrupted`; it shows its
   generic recording-fault note until they do.
 
+- The recording outbox now reads entries in format version 2 as well as the
+  version 1 it writes. Version 2 is reserved for version 1 with fields added
+  that a reader may leave out, so a later release can store more about a
+  recording (what was lost, say) without stranding its reports on a
+  rollback: a sapflow with this change reports a version 2 entry with the
+  fields it knows and keeps the entry as written until v4v answers 2xx.
+  Nothing writes version 2 yet. Until this release is the oldest one a host
+  can be rolled back to, an older sapflow still leaves version 2 unsent
+  ("written by a newer sapflow") for the newer one to send. Version 1 stays
+  strict, and version 3 or later is still left for the sapflow that wrote it.
+
 - Callbacks treated a 408 or 429 as a refusal and gave up at once. They are
   now retried, after as long as `Retry-After` or the JSON body's
   `retryAfterMs` (as v4v's rate limiter sends) asks: up to 10 s for a live

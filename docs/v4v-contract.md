@@ -326,6 +326,21 @@ while encoders connect:
 - A file that has gone, or is older than `SAPFLOW_RECORD_DELETE_AFTER`, is
   not reported, and what it owed is forgotten.
 
+Each owed callback is stored with a format version. This sapflow writes
+version 1 and also reads version 2, which is version 1 with fields added
+that a reader may leave out. That matters after a rollback: an entry a newer
+sapflow left in version 2 is reported by this one with the fields it knows
+(the same `recordingState`, `recordingReason`, `segmentDuration`,
+`segmentPath` and identity) and without what the newer sapflow added. Until
+v4v answers 2xx the entry stays on disk exactly as it was written, so the
+newer sapflow, started again, still reports all of it. This is the one case
+where a resend can differ from the body first sent: a callback the newer
+sapflow had already sent, and v4v had not answered, comes again without the
+added fields. Match completions by `recordingId`, or for the legacy contract
+by the file, never by comparing bodies. An entry in version 3 or later is
+left unsent for the sapflow that wrote it; sapflow before this change left
+version 2 unsent in the same way.
+
 These callbacks go one at a time, at least a second apart (60 a minute at
 most, half of the 120 v4v takes from one address, leaving the rest to live
 stages), on a sender of their own, so a slow answer never holds up a live
