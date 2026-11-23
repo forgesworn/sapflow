@@ -157,6 +157,18 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- A live `recordSegmentComplete` no longer holds up the other callbacks.
+  It used to be sent on the one live queue with five seconds an attempt,
+  while v4v copies and hashes the whole file before it answers: a long
+  recording timed out and was sent again, and until it was done with (up
+  to four attempts) every stage's `publish`, `unpublish` and `health`
+  waited behind it. It still waits its turn in that queue, so a stage's
+  `unpublish` is sent first, and is then passed to a sender of its own
+  with up to ten minutes an attempt, as a recovered completion has. A stop
+  waits for it within its deadline as before, and what is unanswered by
+  then stays owed. The app can now hear a stage's next `publish` before
+  the `recordSegmentComplete` of the stream that ended
+  ([the v4v contract](../v4v-contract.md#the-callback)).
 - The live publisher's request that sapflow sends the app again, when a
   newer publisher's claim would be refused while it sends, now carries
   `"recheck":"holder"`, and no other request does. An app can then answer
