@@ -259,13 +259,17 @@ content-type: application/json
 | Stream ready to play | `{"event":"publish","path":"live/<eventId>"}` |
 | Stream gone | `{"event":"unpublish","path":"live/<eventId>"}` |
 | Recording finished | `{"event":"recordSegmentComplete","path":"live/<eventId>","segmentPath":"/recordings/live/<eventId>/<unix-start>.mp4","segmentDuration":"3723.5","recordingState":"finalised","recordingReason":null}` |
-| While live, every `SAPFLOW_HEALTH_INTERVAL` (sapflow only; default 30 s) | `{"event":"health","path":"live/<eventId>","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":0}}` |
+| While live, every `SAPFLOW_HEALTH_INTERVAL` (sapflow only; default 30 s) | `{"event":"health","path":"live/<eventId>","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":0,"transportDropped":0}}` |
 
 v4v reads `health.bitrateKbps` (Studio's bitrate and its lagging and
 unstable thresholds) and leaves the stage's status alone for an event name
 it does not know. It works out the keyframe interval from the playlist
 itself, so `keyframeIntervalMs`, `audio` and `breaks` are not yet read by
-v4v. The callback endpoint allows 120 requests a minute from one address:
+v4v. `transportDropped` is sent for an SRT publisher only: the packets the
+receiver gave up on since that connection began, which never arrived even
+resent. It starts again from zero when the encoder reconnects. A count that
+climbs by thousands at a time, with a break each time, means the encoder is
+discarding media its uplink cannot carry, and the cure is a lower bitrate. The callback endpoint allows 120 requests a minute from one address:
 at 30 s, 16 live stages use 32.
 
 When an encoder drops, sapflow sends `unpublish` at once and holds the

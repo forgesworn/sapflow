@@ -330,6 +330,11 @@ pub struct Health {
     pub audio: bool,
     /// Breaks in the media (stalls, reconnects) since the publisher connected.
     pub breaks: u64,
+    /// Packets the transport gave up on since the publisher connected: they
+    /// never arrived, even resent. Absent where the transport does not count
+    /// them (only SRT does). A count that climbs while little is resent
+    /// means the encoder is discarding media its uplink cannot carry.
+    pub transport_dropped: Option<u64>,
 }
 
 impl StreamEvent {
@@ -360,13 +365,19 @@ impl StreamEvent {
                 json_escape(segment_path),
                 duration_secs
             )),
-            Self::Health(h) => s.push_str(&format!(
-                ",\"health\":{{\"bitrateKbps\":{},\"keyframeIntervalMs\":{},\"audio\":{},\"breaks\":{}}}",
-                h.bitrate_kbps,
-                h.keyframe_interval_ms.map_or_else(|| "null".to_owned(), |value| value.to_string()),
-                h.audio,
-                h.breaks
-            )),
+            Self::Health(h) => {
+                s.push_str(&format!(
+                    ",\"health\":{{\"bitrateKbps\":{},\"keyframeIntervalMs\":{},\"audio\":{},\"breaks\":{}",
+                    h.bitrate_kbps,
+                    h.keyframe_interval_ms.map_or_else(|| "null".to_owned(), |value| value.to_string()),
+                    h.audio,
+                    h.breaks
+                ));
+                if let Some(dropped) = h.transport_dropped {
+                    s.push_str(&format!(",\"transportDropped\":{dropped}"));
+                }
+                s.push('}');
+            }
             Self::Publish | Self::Unpublish => {}
         }
         s.push('}');
@@ -605,12 +616,25 @@ mod tests {
             keyframe_interval_ms: Some(1000),
             audio: true,
             breaks: 2,
+            transport_dropped: None,
         });
         // v4v reads `health.bitrateKbps` and leaves the stage's status as it
         // is for an event name it does not know.
         assert_eq!(
             health.callback_body(&p),
             r#"{"event":"health","path":"live/event-a1","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":2}}"#
+        );
+        // Only a transport that counts its drops reports them.
+        let srt = StreamEvent::Health(Health {
+            bitrate_kbps: 2620,
+            keyframe_interval_ms: Some(1000),
+            audio: true,
+            breaks: 2,
+            transport_dropped: Some(3600),
+        });
+        assert_eq!(
+            srt.callback_body(&p),
+            r#"{"event":"health","path":"live/event-a1","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":2,"transportDropped":3600}}"#
         );
     }
 
@@ -622,6 +646,7 @@ mod tests {
             keyframe_interval_ms: None,
             audio: true,
             breaks: 0,
+            transport_dropped: None,
         });
         assert_eq!(
             event.callback_body(&path),

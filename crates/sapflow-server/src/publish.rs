@@ -3,6 +3,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sapflow_core::limits::RateCap;
@@ -126,6 +127,8 @@ pub struct Publication {
     published: bool,
     connected: Instant,
     last_health: Instant,
+    /// The transport's count of packets it gave up on, where it keeps one.
+    transport_dropped: Option<Arc<AtomicU64>>,
     rate: RateCap,
     scope: Option<ScopedLease>,
     callbacks: Callbacks,
@@ -198,12 +201,27 @@ fn health_of(m: &sapflow_hls::Muxer) -> Option<Health> {
         keyframe_interval_ms: m.video().map(|_| keyframe.as_millis() as u64),
         audio: m.audio_config().is_some(),
         breaks: m.breaks(),
+        transport_dropped: None,
     })
+}
+
+/// What the transport's counter reads now, if it keeps one.
+fn dropped_so_far(counter: Option<&AtomicU64>) -> Option<u64> {
+    counter.map(|dropped| dropped.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
 mod health_tests {
     use super::*;
+
+    #[test]
+    fn health_reports_drops_only_for_a_transport_that_counts_them() {
+        assert_eq!(dropped_so_far(None), None);
+        let counter = AtomicU64::new(0);
+        assert_eq!(dropped_so_far(Some(&counter)), Some(0));
+        counter.store(3600, Ordering::Relaxed);
+        assert_eq!(dropped_so_far(Some(&counter)), Some(3600));
+    }
     use sapflow_hls::codec::{AudioConfig, OpusConfig};
 
     #[test]
@@ -612,6 +630,7 @@ impl Publication {
             published: false,
             connected: now,
             last_health: now,
+            transport_dropped: None,
             rate: RateCap::new(max_bps, Duration::from_secs(5)),
             scope,
             callbacks,
@@ -694,6 +713,14 @@ impl Publication {
                 .mark_incomplete(IncompleteReason::OverRate);
             Err(OverRate)
         }
+    }
+
+    /// A counter the transport keeps at the packets it has given up on for
+    /// this connection; the health callback then reports it.
+    pub fn transport_drops(&mut self) -> Arc<AtomicU64> {
+        self.transport_dropped
+            .get_or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
     }
 
     pub fn loss_notice(&self) -> PublicationLoss {
@@ -820,13 +847,14 @@ impl Publication {
             return;
         }
         self.last_health = Instant::now();
-        let health = {
+        let mut health = {
             let st = self.stream.lock();
             let Some(health) = st.ingest.muxer().and_then(health_of) else {
                 return;
             };
             health
         };
+        health.transport_dropped = dropped_so_far(self.transport_dropped.as_deref());
         self.callbacks
             .send(&self.stream.path, StreamEvent::Health(health));
     }
