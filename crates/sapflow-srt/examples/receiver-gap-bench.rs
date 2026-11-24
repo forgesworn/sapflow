@@ -144,10 +144,46 @@ fn bursty_stream(cycles: u32) {
     );
 }
 
+/// Every other packet missing: the loss list stays near its range cap, the
+/// case a single large gap does not exercise. Each packet is followed by the
+/// timer and reschedule calls an embedding makes.
+fn fragmented_stream(packets: u32) {
+    let mut r = receiver();
+    let payload = [0x46; 1200];
+    let mut delivered = 0u32;
+    let mut marked = 0u32;
+    let started = Instant::now();
+    for n in 0..packets {
+        let now = i64::from(n) * 200;
+        r.on_data(now, &packet(n * 2, now as u32, &payload));
+        r.on_timer(now);
+        black_box(r.next_timer());
+        while let Some((bytes, lost)) = r.take_delivery() {
+            assert_eq!(bytes, payload);
+            delivered += 1;
+            marked += u32::from(lost);
+        }
+        while r.take_send().is_some() {}
+    }
+    r.on_control(i64::from(packets) * 200, &Control::Shutdown);
+    while let Some((bytes, lost)) = r.take_delivery() {
+        assert_eq!(bytes, payload);
+        delivered += 1;
+        marked += u32::from(lost);
+    }
+    let elapsed = started.elapsed().as_nanos();
+    assert_eq!(delivered, packets);
+    let stats = r.stats();
+    println!(
+        "{{\"profile\":\"fragmented-stream\",\"payload_bytes\":1200,\"operations\":{packets},\"elapsed_ns\":{elapsed},\"verified_deliveries\":{delivered},\"marked\":{marked},\"lost\":{},\"dropped\":{},\"naks_sent\":{}}}",
+        stats.lost, stats.dropped, stats.naks_sent
+    );
+}
+
 fn selected(args: &[String]) -> Result<(), String> {
     let [profile_flag, profile, work_flag, work] = args else {
         return Err(
-            "use --profile clean-stream|pending-and-timer|bursty-stream --work COUNT".into(),
+            "use --profile clean-stream|pending-and-timer|bursty-stream|fragmented-stream --work COUNT".into(),
         );
     };
     if profile_flag != "--profile" || work_flag != "--work" {
@@ -167,6 +203,7 @@ fn selected(args: &[String]) -> Result<(), String> {
             usize::try_from(work).map_err(|_| "work exceeds this platform's count range")?,
         ),
         "bursty-stream" if work <= 1_000_000 => bursty_stream(work as u32),
+        "fragmented-stream" if work <= 100_000_000 => fragmented_stream(work as u32),
         _ => return Err("unknown profile or work exceeds the profile's safety cap".into()),
     }
     Ok(())
@@ -190,5 +227,6 @@ fn main() -> std::process::ExitCode {
     }
     clean_stream(STREAM_PACKETS);
     bursty_stream(256);
+    fragmented_stream(1_000_000);
     std::process::ExitCode::SUCCESS
 }

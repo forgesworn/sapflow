@@ -171,6 +171,18 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- A live `recordSegmentComplete` no longer holds up the other callbacks.
+  It used to be sent on the one live queue with five seconds an attempt,
+  while v4v copies and hashes the whole file before it answers: a long
+  recording timed out and was sent again, and until it was done with (up
+  to four attempts) every stage's `publish`, `unpublish` and `health`
+  waited behind it. It still waits its turn in that queue, so a stage's
+  `unpublish` is sent first, and is then passed to a sender of its own
+  with up to ten minutes an attempt, as a recovered completion has. A stop
+  waits for it within its deadline as before, and what is unanswered by
+  then stays owed. The app can now hear a stage's next `publish` before
+  the `recordSegmentComplete` of the stream that ended
+  ([the v4v contract](../v4v-contract.md#the-callback)).
 - The live publisher's request that sapflow sends the app again, when a
   newer publisher's claim would be refused while it sends, now carries
   `"recheck":"holder"`, and no other request does. An app can then answer
@@ -278,6 +290,17 @@ Notes for the release after 0.2.0-rc.1.
   the [v4v contract](../v4v-contract.md#recordings-reported-after-a-restart).
   v4v's reason messages do not yet name `server-interrupted`; it shows its
   generic recording-fault note until they do.
+
+- The recording outbox now reads entries in format version 2 as well as the
+  version 1 it writes. Version 2 is reserved for version 1 with fields added
+  that a reader may leave out, so a later release can store more about a
+  recording (what was lost, say) without stranding its reports on a
+  rollback: a sapflow with this change reports a version 2 entry with the
+  fields it knows and keeps the entry as written until v4v answers 2xx.
+  Nothing writes version 2 yet. Until this release is the oldest one a host
+  can be rolled back to, an older sapflow still leaves version 2 unsent
+  ("written by a newer sapflow") for the newer one to send. Version 1 stays
+  strict, and version 3 or later is still left for the sapflow that wrote it.
 
 - Callbacks treated a 408 or 429 as a refusal and gave up at once. They are
   now retried, after as long as `Retry-After` or the JSON body's

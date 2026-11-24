@@ -167,6 +167,10 @@ struct Last {
     ext: i64,
     rtp: u32,
     pts: i64,
+    /// The latest arrival of the stream's frames so far, not the last
+    /// frame's: frames come in sequence order, so arrivals can step back,
+    /// and continuing by arrival from an earlier one would count the same
+    /// time twice.
     arrival: u64,
 }
 
@@ -537,7 +541,7 @@ impl Timeline {
             ext,
             rtp,
             pts,
-            arrival,
+            arrival: t.last.map_or(arrival, |l| l.arrival.max(arrival)),
         });
         Stamp {
             pts: u64::try_from(pts).unwrap_or(0),
@@ -691,6 +695,30 @@ mod tests {
             t.try_align(5 * MS, 0, false),
             Some(Alignment::Arrival(Fallback::Timeout))
         );
+    }
+
+    /// Frames come in sequence order, so their arrivals can step back. A
+    /// sender whose timestamps leave the mapped range at every frame, with
+    /// 300 ms of reordering, must not ratchet the stream ahead of arrival
+    /// time by counting the same time twice (fuzz: `sr_timeline`).
+    #[test]
+    fn arrivals_stepping_back_do_not_ratchet_ahead() {
+        let mut t = Timeline::new(TimelineConfig {
+            start_hold: Duration::ZERO,
+            ..TimelineConfig::default()
+        });
+        t.add_track(90_000, true);
+        t.note_packet(0, 0, 0);
+        assert!(t.try_align(0, 0, false).is_some());
+        let mut latest = 0;
+        for k in 0..200u64 {
+            for (rtp, ms) in [(1_000_000, k * 66 + 300), (0, k * 66)] {
+                latest = latest.max(ms * MS);
+                let pts = t.stamp(0, rtp, ms * MS).pts;
+                let bound = t.bound(latest);
+                assert!(pts as i64 <= bound, "pair {k}: {pts} beyond {bound}");
+            }
+        }
     }
 
     #[test]

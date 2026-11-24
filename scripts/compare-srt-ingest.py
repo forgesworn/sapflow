@@ -50,14 +50,19 @@ def cpu_seconds(pid):
     return total
 
 
-def peak_rss_mib(pid):
+def status_mib(pid, field):
+    """A memory figure from /proc/PID/status, where there is one."""
     status = Path(f"/proc/{pid}/status")
     if not status.exists():
         return None
     for line in status.read_text().splitlines():
-        if line.startswith("VmHWM:"):
+        if line.startswith(field + ":"):
             return int(line.split()[1]) / 1024
     return None
+
+
+def peak_rss_mib(pid):
+    return status_mib(pid, "VmHWM")
 
 
 def media_sequence(opener, url):
@@ -76,7 +81,7 @@ def media_sequence(opener, url):
     return None if first is None else first + sum(line.startswith("#EXTINF:") for line in lines)
 
 
-def trial(binary, clip, publishers, seconds, work):
+def trial(binary, clip, publishers, seconds, work, extra_env=None):
     children, logs = [], []
 
     def launch(command, name, env=None):
@@ -96,6 +101,7 @@ def trial(binary, clip, publishers, seconds, work):
                    SAPFLOW_SRT_ADDR=f"127.0.0.1:{srt}", SAPFLOW_RTMP_ADDR="off",
                    SAPFLOW_MAX_PUBLISHERS=str(max(16, publishers)),
                    SAPFLOW_MAX_FRAGMENT_BYTES=str(4 << 30), RUST_LOG="error")
+        env.update(extra_env or {})
         server = launch([str(binary)], "server.log", env)
         deadline = time.monotonic() + 10
         while True:
@@ -156,6 +162,8 @@ def trial(binary, clip, publishers, seconds, work):
             raise RuntimeError(f"a stream advanced only {min(advanced)} segments")
         return dict(qualified=True, cpu_seconds=cpu, wall_seconds=wall,
                     cpu_percent=100 * cpu / wall, peak_rss_mib=peak_rss_mib(server.pid),
+                    # At the end of the window, with every stream's window full.
+                    rss_mib=status_mib(server.pid, "VmRSS"), rss_anon_mib=status_mib(server.pid, "RssAnon"),
                     segments_advanced_min=min(advanced), segments_advanced_max=max(advanced))
     finally:
         for child in reversed(children):
@@ -176,7 +184,15 @@ def summarise(trials, pairs):
         return dict(complete=False)
     lookup = {(row["pair"], row["variant"]): row["cpu_seconds"] / row["wall_seconds"] for row in trials}
     ratios = [lookup[pair, "candidate"] / lookup[pair, "baseline"] for pair in range(pairs)]
-    return dict(complete=True, cpu_ratios=ratios, median_cpu_ratio=statistics.median(ratios),
+    memory = {}
+    for field in ("peak_rss_mib", "rss_mib"):
+        held = {(row["pair"], row["variant"]): row.get(field) for row in trials}
+        if all(value for value in held.values()):
+            memory[f"{field}_ratios"] = [held[pair, "candidate"] / held[pair, "baseline"] for pair in range(pairs)]
+            for variant in ("baseline", "candidate"):
+                memory[f"{variant}_{field}_median"] = statistics.median(
+                    value for (_, v), value in held.items() if v == variant)
+    return dict(complete=True, cpu_ratios=ratios, median_cpu_ratio=statistics.median(ratios), **memory,
                 maximum_cpu_ratio=max(ratios), minimum_cpu_ratio=min(ratios),
                 baseline_cpu_percent_median=statistics.median(
                     row["cpu_percent"] for row in trials if row["variant"] == "baseline"),
@@ -192,8 +208,16 @@ def main():
     parser.add_argument("--bitrate-kbit", type=int, default=6000)
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--pairs", type=int, default=4)
+    parser.add_argument("--candidate-env", action="append", default=[], metavar="KEY=VALUE",
+                        help="set for the candidate's server only, to compare one binary under two settings")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    candidate_env = {}
+    for item in args.candidate_env:
+        key, separator, value = item.partition("=")
+        if not separator or not key:
+            parser.error("--candidate-env takes KEY=VALUE")
+        candidate_env[key] = value
     if not (1 <= args.publishers <= 64 and 5 <= args.seconds <= 300 and 1 <= args.pairs <= 12
             and 500 <= args.bitrate_kbit <= 20_000):
         parser.error("bounded publishers, seconds, pairs and bitrate required")
@@ -209,6 +233,7 @@ def main():
                 binaries={name: digest(path) for name, path in binaries.items()},
                 harness_sha256=digest(__file__), publishers=args.publishers,
                 video_kbit=args.bitrate_kbit, seconds=args.seconds, pairs=args.pairs,
+                candidate_env=candidate_env,
                 notes="Loopback SRT, generated 720p30 H.264/AAC remuxed in real time, no viewers. "
                       "Server and publishers share the host. One server CPU interval per trial.",
                 trials=[])
@@ -230,7 +255,8 @@ def main():
                 work = Path(scratch) / f"trial-{pair}-{variant}"
                 work.mkdir()
                 try:
-                    row.update(trial(binaries[variant], clip, args.publishers, args.seconds, work))
+                    row.update(trial(binaries[variant], clip, args.publishers, args.seconds, work,
+                                     candidate_env if variant == "candidate" else None))
                 except (RuntimeError, OSError, subprocess.SubprocessError) as error:
                     row.update(qualified=False, error=str(error))
                     for name in ("server.log", "sender-0.log", "publisher-0.log"):

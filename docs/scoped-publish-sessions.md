@@ -311,7 +311,10 @@ dedupes on it sees the same event; live sequences have no gap. A completion
 that was finished before the restart keeps its state and reason; one whose
 writer never finished is `incomplete` with `server-interrupted`, a different
 body for the same `recordingId`, which the receiver must accept as the
-recording's report rather than refuse as a conflict.
+recording's report rather than refuse as a conflict. After a rollback a
+resend can also lack fields that a newer sapflow had added to the body, for
+the same `recordingId` and `eventSequence`
+([format versions](v4v-contract.md#recordings-reported-after-a-restart)).
 
 The V4V connector supports explicit acknowledgement to abandon automatic
 recording adoption after a terminal incomplete/failed receipt. It rechecks fresh
