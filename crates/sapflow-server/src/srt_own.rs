@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use sapflow_core::PublishRequest;
@@ -36,6 +37,8 @@ struct Publisher {
     tx: mpsc::Sender<Payload>,
     scope: Option<ScopedLease>,
     loss: PublicationLoss,
+    /// Packets the receiver has given up on, for the health callback.
+    dropped: Arc<AtomicU64>,
 }
 impl Publisher {
     fn closed(self, reason: Option<CloseReason>, dropped: u64) {
@@ -348,6 +351,12 @@ async fn run(
                 } => {
                     let received = Instant::now();
                     let arrived = listener.last_received(id).unwrap_or(received);
+                    if after_loss
+                        && let Some(publisher) = publishers.get(&id)
+                        && let Some(stats) = listener.connection_stats(id)
+                    {
+                        publisher.dropped.store(stats.dropped, Ordering::Relaxed);
+                    }
                     if let Some(publisher) = publishers.get(&id)
                         && !publisher.enqueue(Payload {
                             bytes: payload,
@@ -557,7 +566,7 @@ fn start(
     publishers: &mut HashMap<ConnId, Publisher>,
     ended: &mpsc::Sender<ConnId>,
     id: ConnId,
-    (publication, scope, capacity, encryption): (
+    (mut publication, scope, capacity, encryption): (
         Publication,
         Option<ScopedLease>,
         usize,
@@ -566,7 +575,16 @@ fn start(
 ) {
     let (tx, rx) = mpsc::channel(capacity.clamp(1, QUEUE));
     let loss = publication.loss_notice();
-    publishers.insert(id, Publisher { tx, scope, loss });
+    let dropped = publication.transport_drops();
+    publishers.insert(
+        id,
+        Publisher {
+            tx,
+            scope,
+            loss,
+            dropped,
+        },
+    );
     let (encryption, key_len) = encryption.label();
     tracing::info!(
         latency_ms = listener.latency(id).map(|d| d.as_millis() as u64),
@@ -975,6 +993,7 @@ mod tests {
                 tx,
                 scope: None,
                 loss: publication.loss_notice(),
+                dropped: publication.transport_drops(),
             };
             let incomplete = !matches!(cause, "closed" | "shutdown");
             let status = publication
@@ -1085,6 +1104,7 @@ mod tests {
                 tx,
                 scope: None,
                 loss: publication.loss_notice(),
+                dropped: publication.transport_drops(),
             }
             .closed(Some(CloseReason::Shutdown), dropped);
             publication.end();

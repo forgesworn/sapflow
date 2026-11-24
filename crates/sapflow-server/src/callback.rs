@@ -979,6 +979,7 @@ mod tests {
             keyframe_interval_ms: Some(1000),
             audio: true,
             breaks: 0,
+            transport_dropped: None,
         })
     }
     fn completion() -> StreamEvent {
