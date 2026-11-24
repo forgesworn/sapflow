@@ -35,7 +35,8 @@ instrumented=$(find "$work/instrumented" -path '*release/sapflow' -type f | head
 [ -x "$instrumented" ] || { echo "no instrumented binary" >&2; exit 1; }
 
 export LLVM_PROFILE_FILE="$work/raw/sapflow-%p-%m.profraw"
-revision=$(git rev-parse HEAD)
+# An image build has no .git; the harness only records this identity.
+revision=$(git rev-parse HEAD 2>/dev/null || printf '%040d' 0)
 python3 -B scripts/compare-srt-ingest.py --baseline "$instrumented" --candidate "$instrumented" \
   --publishers 4 --bitrate-kbit 4000 --seconds "$seconds" --pairs 1 --output "$work/train-srt.json"
 python3 -B scripts/compare-http-efficiency.py --baseline "$instrumented" --candidate "$instrumented" \
