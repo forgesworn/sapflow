@@ -2,6 +2,18 @@
 
 Notes for the release after 0.2.0-rc.1.
 
+## Container image
+
+- The image's server is now built with profile-guided optimisation: the
+  build stage trains an instrumented server on generated SRT and RTMP
+  traffic on loopback, then builds again with that profile
+  (`scripts/build-pgo.sh`). On hosted Linux x86-64 runners the
+  profile-guided server used 8% less CPU for SRT ingest (12 publishers at
+  6 Mbit/s, four paired trials, ratios 0.911 to 0.933) and 2 to 11% less
+  for HTTP serving, with peak RSS no higher. The image takes about three
+  times as long to build. `docker build --build-arg PGO=0` builds the
+  server once, as before.
+
 ## sapflow-client
 
 - The MPEG-TS muxer that the SRT publishers use writes each PES
