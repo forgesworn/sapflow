@@ -33,6 +33,19 @@
 //! removes an entry whose recording has gone or is older than
 //! `SAPFLOW_RECORD_DELETE_AFTER`; the recordings expiry itself only touches
 //! `live/*/` and so never this directory.
+//!
+//! Entries carry a format version. This sapflow writes version 1 and reads
+//! versions 1 and 2. Version 2 is version 1 with fields added, at the top
+//! level or inside `scoped` or `finished`, that a reader may leave out: every
+//! version 1 field keeps its meaning and its allowed values. An entry in
+//! version 2 is reported with the fields known here and is never written
+//! back, so a newer sapflow started later still finds what it wrote. Version
+//! 1 stays strict, where an unknown field is damage, and version 3 or later
+//! is left for the sapflow that wrote it. So is a version 2 entry this one
+//! cannot read after all: it is the newer sapflow's to report, never called
+//! damage. A format that changes what a field means, or adds one a reader
+//! must not leave out, takes version 3. In every version an entry is at most
+//! 8 KiB; a larger one is refused before its version is looked at.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -55,8 +68,30 @@ use crate::recorder::IncompleteReason;
 /// The outbox's directory inside the recordings directory.
 pub const DIRECTORY: &str = ".sapflow-outbox";
 const LOCK: &str = ".lock";
-/// The entry format this sapflow writes and reads.
+/// The entry format this sapflow writes.
 const VERSION: u32 = 1;
+/// The newest entry format this sapflow reads. It never writes it.
+const READ_VERSION: u32 = 2;
+/// The fields of [`VERSION`]: what an entry in [`READ_VERSION`] is cut down
+/// to before it is read. `fields_match_what_is_written` holds them to the
+/// structs below.
+const ENTRY_FIELDS: &[&str] = &[
+    "version",
+    "file",
+    "hasVideo",
+    "hasAudio",
+    "audioRate",
+    "scoped",
+    "finished",
+];
+const SCOPED_FIELDS: &[&str] = &[
+    "eventGeneration",
+    "sessionId",
+    "connectionEpoch",
+    "eventSequence",
+    "recordingId",
+];
+const FINISHED_FIELDS: &[&str] = &["complete", "reason", "durationMs"];
 /// Far above any entry: paths are at most a couple of hundred bytes.
 const MAX_ENTRY_BYTES: u64 = 8 * 1024;
 /// The largest JavaScript-safe integer, as the callback contract bounds
@@ -126,6 +161,12 @@ impl Entry {
         }
     }
 
+    /// Whether a newer sapflow wrote this entry, in a format this one reads:
+    /// it may have carried fields that were left out when it was read.
+    pub fn written_by_newer(&self) -> bool {
+        self.version > VERSION
+    }
+
     /// The stage path the file belongs to, if the entry is well formed.
     pub fn stream_path(&self) -> Option<StreamPath> {
         self.check().then(|| self.parts()).flatten().map(|(p, _)| p)
@@ -172,11 +213,18 @@ impl Entry {
                     (Some(reason), false) => IncompleteReason::from_name(reason).is_some(),
                 }
         });
-        self.version == VERSION
+        (VERSION..=READ_VERSION).contains(&self.version)
             && path.event_id().len() <= 128
             && name_ok
             && tracks_ok
             && finished_ok
+    }
+
+    /// What this sapflow may write: a well formed entry in its own version.
+    /// One read in a newer version is never written back, since that would
+    /// drop the fields it was read without.
+    fn writable(&self) -> bool {
+        self.version == VERSION && self.check()
     }
 }
 
@@ -246,7 +294,8 @@ fn io_error(operation: &'static str, source: impl Into<io::Error>) -> OutboxErro
 pub enum ReadError {
     /// Gone since it was listed.
     Missing,
-    /// Written by a newer sapflow.
+    /// Written by a newer sapflow, in a format this one does not read or
+    /// with something in it this one cannot.
     Newer,
     /// Not a private regular file, too large, malformed, or not matching
     /// its name.
@@ -395,7 +444,7 @@ impl Outbox {
         if self.fail_writes.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(io::Error::other("test fault"));
         }
-        if !entry.check() {
+        if !entry.writable() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let bytes = serde_json::to_vec(entry).map_err(io::Error::other)?;
@@ -556,25 +605,53 @@ impl Outbox {
     }
 }
 
-/// Strictly what [`Outbox::write`] wrote for the entry `name`.
+/// Strictly what [`Outbox::write`] wrote for the entry `name`, or what a
+/// newer sapflow wrote in [`READ_VERSION`], without the fields added there.
 fn decode(bytes: &[u8], name: &OsStr) -> Result<Entry, ReadError> {
     if bytes.len() as u64 > MAX_ENTRY_BYTES {
         return Err(ReadError::Unusable);
     }
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| ReadError::Unusable)?;
-    if value
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|version| version > u64::from(VERSION))
-    {
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    if version.is_some_and(|version| version > u64::from(READ_VERSION)) {
         return Err(ReadError::Newer);
     }
-    let entry: Entry = serde_json::from_value(value).map_err(|_| ReadError::Unusable)?;
+    let newer = version.is_some_and(|version| version > u64::from(VERSION));
+    if newer {
+        forget_added_fields(&mut value);
+    }
+    // What a newer sapflow wrote and this one cannot read is still that
+    // sapflow's to report, as it was before this one read version 2 at all.
+    let unreadable = || {
+        if newer {
+            ReadError::Newer
+        } else {
+            ReadError::Unusable
+        }
+    };
+    let entry: Entry = serde_json::from_value(value).map_err(|_| unreadable())?;
     if !entry.check() || name.as_encoded_bytes() != entry_name(&entry.file).as_bytes() {
-        return Err(ReadError::Unusable);
+        return Err(unreadable());
     }
     Ok(entry)
+}
+
+/// Cuts an entry in a newer format down to the fields of [`VERSION`], which
+/// are then read as strictly as an entry of this sapflow's own.
+fn forget_added_fields(value: &mut serde_json::Value) {
+    let Some(entry) = value.as_object_mut() else {
+        return;
+    };
+    entry.retain(|field, _| ENTRY_FIELDS.contains(&field.as_str()));
+    for (inner, fields) in [("scoped", SCOPED_FIELDS), ("finished", FINISHED_FIELDS)] {
+        if let Some(inner) = entry
+            .get_mut(inner)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            inner.retain(|field, _| fields.contains(&field.as_str()));
+        }
+    }
 }
 
 /// One recording's entry, carried by its writer and then its callback, so
@@ -813,7 +890,7 @@ pub(crate) mod tests {
             outbox.read(OsStr::new(&other)).expect_err("misnamed"),
             ReadError::Unusable
         );
-        let newer = br#"{"version":2,"file":"live/event-a/3.mp4"}"#;
+        let newer = br#"{"version":3,"file":"live/event-a/3.mp4"}"#;
         let newer_name = entry_name("live/event-a/3.mp4");
         private(&dir.join(&newer_name), newer);
         assert_eq!(
@@ -898,6 +975,151 @@ pub(crate) mod tests {
         assert!(!junk.exists());
         // The recordings themselves are never touched by the outbox.
         assert!(event.join("100.mp4").exists() && event.join("200.mp4").exists());
+    }
+
+    /// A finished entry, scoped or not, as JSON a newer sapflow might have
+    /// written: version 2, with a field added at each level.
+    fn newer(mut entry: Entry) -> (Entry, Vec<u8>) {
+        entry.finished = Some(Finished {
+            complete: false,
+            reason: Some("media-loss".into()),
+            duration_ms: 3_210,
+        });
+        let mut value = serde_json::to_value(&entry).expect("json");
+        value["version"] = 2.into();
+        value["loss"] = serde_json::json!({ "packets": 12, "longestGapMs": 480 });
+        value["finished"]["lostMs"] = 480.into();
+        if entry.scoped.is_some() {
+            value["scoped"]["route"] = "srt".into();
+        }
+        entry.version = 2;
+        (entry, serde_json::to_vec(&value).expect("json"))
+    }
+
+    #[test]
+    fn fields_match_what_is_written() {
+        // The lists a newer entry is cut down to are exactly what this
+        // sapflow writes: a field added to a struct and not to its list
+        // would be dropped from every newer entry.
+        let (entry, _) = newer(scoped(100));
+        let value = serde_json::to_value(&entry).expect("json");
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<String> =
+                value.as_object().expect("object").keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let sorted = |fields: &[&str]| {
+            let mut fields: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
+            fields.sort();
+            fields
+        };
+        assert_eq!(keys(&value), sorted(ENTRY_FIELDS));
+        assert_eq!(keys(&value["scoped"]), sorted(SCOPED_FIELDS));
+        assert_eq!(keys(&value["finished"]), sorted(FINISHED_FIELDS));
+    }
+
+    #[test]
+    fn a_version_2_entry_is_read_without_the_fields_added_to_it() {
+        for entry in [scoped(100), legacy("live/event-b/200.mp4")] {
+            let name = entry_name(&entry.file);
+            let (expected, bytes) = newer(entry);
+            let read = decode(&bytes, OsStr::new(&name)).expect("version 2 is read");
+            assert_eq!(read, expected, "every version 1 field, and nothing else");
+            assert!(read.written_by_newer());
+            assert!(
+                read.stream_path().is_some(),
+                "well formed, so it can be reported"
+            );
+        }
+        assert!(!scoped(100).written_by_newer());
+    }
+
+    #[test]
+    fn version_1_stays_strict_and_a_version_2_entry_it_cannot_read_is_left_for_its_writer() {
+        let entry = scoped(100);
+        let name = entry_name(&entry.file);
+        let read = |value: &serde_json::Value| {
+            decode(&serde_json::to_vec(value).expect("json"), OsStr::new(&name))
+        };
+        let (_, bytes) = newer(entry);
+        let good: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(read(&good).is_ok());
+
+        // The same added fields in version 1 are damage, as before.
+        let mut old = good.clone();
+        old["version"] = 1.into();
+        assert_eq!(read(&old).expect_err("version 1"), ReadError::Unusable);
+
+        // Version 2 adds fields; it does not relax a version 1 field. An
+        // entry that breaks one is not reported, and not called damage
+        // either: it is left, as every version 2 entry used to be, for the
+        // sapflow that wrote it.
+        let mut missing = good.clone();
+        missing.as_object_mut().expect("object").remove("file");
+        assert_eq!(read(&missing).expect_err("no file"), ReadError::Newer);
+        let mut reason = good.clone();
+        reason["finished"]["reason"] = "a-reason-added-later".into();
+        assert_eq!(read(&reason).expect_err("reason"), ReadError::Newer);
+        let mut typed = good.clone();
+        typed["hasVideo"] = "yes".into();
+        assert_eq!(read(&typed).expect_err("type"), ReadError::Newer);
+        let mut elsewhere = good.clone();
+        elsewhere["file"] = "live/event-a/999.mp4".into();
+        assert_eq!(read(&elsewhere).expect_err("name"), ReadError::Newer);
+
+        // The size limit holds in every version, before the version is read.
+        let mut large = good.clone();
+        large["loss"]["note"] = "x".repeat(MAX_ENTRY_BYTES as usize).into();
+        assert_eq!(read(&large).expect_err("too large"), ReadError::Unusable);
+
+        // And the version after it is still someone else's.
+        let mut later = good;
+        later["version"] = 3.into();
+        assert_eq!(read(&later).expect_err("version 3"), ReadError::Newer);
+    }
+
+    #[test]
+    fn an_entry_from_a_newer_sapflow_is_never_written_back() {
+        let scratch = Scratch::new("never-rewritten");
+        let outbox = Arc::new(Outbox::open(&scratch.0).expect("open"));
+        let entry = scoped(100);
+        let name = entry_name(&entry.file);
+        let (_, as_written) = newer(entry);
+        let stored = scratch.0.join(DIRECTORY).join(&name);
+        std::fs::write(&stored, &as_written).expect("write");
+        std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o600)).expect("mode");
+
+        let (read, _) = outbox.read(OsStr::new(&name)).expect("read");
+        assert_eq!(read.version, 2);
+        // Writing it would store version 1 fields under version 2's number
+        // and lose what the newer sapflow recorded.
+        assert_eq!(
+            outbox.write(&read).expect_err("refused").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read(&stored).expect("read"), as_written);
+
+        // Nor does the handle a callback carries rewrite it.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut carried = OutboxEntry::new(outbox.clone(), read);
+            carried
+                .finish(Finished {
+                    complete: true,
+                    reason: None,
+                    duration_ms: 1,
+                })
+                .await;
+        });
+        assert_eq!(
+            std::fs::read(&stored).expect("read"),
+            as_written,
+            "byte for byte what the newer sapflow wrote"
+        );
     }
 }
 

@@ -133,7 +133,8 @@ pub struct Summary {
     pub failed: usize,
     /// Entries removed unsent: the recording gone, expired or empty.
     pub dropped: usize,
-    /// Entries left unsent: unreadable, or written by a newer sapflow.
+    /// Entries left unsent: unreadable, or written by a newer sapflow in a
+    /// format this one does not read.
     pub left: usize,
     /// Sends whose app could not be reached at all.
     pub unreachable: usize,
@@ -311,6 +312,12 @@ async fn send_one(
     };
     let next = Instant::now() + interval;
     let file = entry.file.clone();
+    if entry.written_by_newer() {
+        tracing::info!(
+            file,
+            "recording outbox entry from a newer sapflow reported without the fields added since"
+        );
+    }
     let outcome =
         match callbacks.send_recovered(&path, body, OutboxEntry::new(outbox.clone(), entry)) {
             Some(done) => done.await.unwrap_or(Delivery::Failed),
