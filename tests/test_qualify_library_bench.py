@@ -17,7 +17,7 @@ def campaign(name="ts-ingest", candidate=4.0, baseline=5.0):
         for arm in (("baseline", "candidate") if pair % 2 else ("candidate", "baseline")):
             seconds = candidate if arm == "candidate" else baseline
             rows.append({"pair": pair, "arm": arm, "exit": 0, "host": {"valid": True},
-                         "result": {"profile": name, "elapsed_ns": round(seconds * 1e9),
+                         "result": {"profile": spec.get("profile", name), "elapsed_ns": round(seconds * 1e9),
                                     "operations": spec["rounds"] * spec["operations_per_round"]}})
     return rows
 

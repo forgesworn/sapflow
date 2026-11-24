@@ -110,7 +110,7 @@ jobs:
       matrix:
         # chunk-reassembly stays available to the script; its campaign was
         # rejected on 2026-11-24 and its runtime change removed.
-        bench: [ts-ingest]
+        bench: [ts-ingest, ts-ingest-codec]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

@@ -27,6 +27,10 @@ BENCHES = {
     "ts-ingest": {"package": "sapflow-hls", "example": "ts-ingest-bench",
                   "runtime": "crates/sapflow-hls/src/ingest.rs", "rounds": 40_000,
                   "operations_per_round": 428},
+    # The same example as ts-ingest, for a change to access-unit splitting.
+    "ts-ingest-codec": {"package": "sapflow-hls", "example": "ts-ingest-bench", "profile": "ts-ingest",
+                        "runtime": "crates/sapflow-hls/src/codec.rs", "rounds": 40_000,
+                        "operations_per_round": 428},
     "chunk-reassembly": {"package": "sapflow-rtmp", "example": "chunk-reassembly-bench",
                          "runtime": "crates/sapflow-rtmp/src/chunk.rs", "rounds": 30_000_000,
                          "operations_per_round": 1},
@@ -45,7 +49,7 @@ def validate_sample(sample, name):
     for key in ("operations", "elapsed_ns"):
         if type(sample.get(key)) is not int or sample[key] <= 0:
             raise ValueError(f"invalid {key}")
-    if sample.get("profile") != name:
+    if sample.get("profile") != spec.get("profile", name):
         raise ValueError("profile mismatch")
     if sample["operations"] != spec["rounds"] * spec["operations_per_round"]:
         raise ValueError("fixed-work mismatch")
