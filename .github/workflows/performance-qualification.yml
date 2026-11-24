@@ -256,3 +256,35 @@ jobs:
             target/performance-qualification/http-vs-main.json
           if-no-files-found: warn
           retention-days: 7
+
+  allocator-settings:
+    name: One build under default and tuned glibc allocator settings (SRT ingest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned compiler, media tools and the SRT publisher
+        run: |
+          rustup toolchain install --profile minimal
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg srt-tools
+      - name: Build the server once
+        run: cargo build --locked --release -p sapflow -j 2
+      - name: Paired SRT ingest CPU and peak RSS, larger mmap and trim thresholds for the candidate
+        run: |
+          mkdir -p target/performance-qualification
+          python3 -B scripts/compare-srt-ingest.py \
+            --baseline target/release/sapflow --candidate target/release/sapflow \
+            --candidate-env "GLIBC_TUNABLES=glibc.malloc.mmap_threshold=8388608:glibc.malloc.trim_threshold=67108864" \
+            --publishers 12 --bitrate-kbit 6000 --seconds 30 --pairs 4 \
+            --output target/performance-qualification/allocator-settings.json
+      - name: Retain compact results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: allocator-settings
+          path: target/performance-qualification/allocator-settings.json
+          if-no-files-found: warn
+          retention-days: 7

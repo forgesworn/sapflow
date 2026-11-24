@@ -76,7 +76,7 @@ def media_sequence(opener, url):
     return None if first is None else first + sum(line.startswith("#EXTINF:") for line in lines)
 
 
-def trial(binary, clip, publishers, seconds, work):
+def trial(binary, clip, publishers, seconds, work, extra_env=None):
     children, logs = [], []
 
     def launch(command, name, env=None):
@@ -96,6 +96,7 @@ def trial(binary, clip, publishers, seconds, work):
                    SAPFLOW_SRT_ADDR=f"127.0.0.1:{srt}", SAPFLOW_RTMP_ADDR="off",
                    SAPFLOW_MAX_PUBLISHERS=str(max(16, publishers)),
                    SAPFLOW_MAX_FRAGMENT_BYTES=str(4 << 30), RUST_LOG="error")
+        env.update(extra_env or {})
         server = launch([str(binary)], "server.log", env)
         deadline = time.monotonic() + 10
         while True:
@@ -192,8 +193,16 @@ def main():
     parser.add_argument("--bitrate-kbit", type=int, default=6000)
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--pairs", type=int, default=4)
+    parser.add_argument("--candidate-env", action="append", default=[], metavar="KEY=VALUE",
+                        help="set for the candidate's server only, to compare one binary under two settings")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    candidate_env = {}
+    for item in args.candidate_env:
+        key, separator, value = item.partition("=")
+        if not separator or not key or key.startswith("SAPFLOW_"):
+            parser.error("--candidate-env takes KEY=VALUE, and not a SAPFLOW_ setting")
+        candidate_env[key] = value
     if not (1 <= args.publishers <= 64 and 5 <= args.seconds <= 300 and 1 <= args.pairs <= 12
             and 500 <= args.bitrate_kbit <= 20_000):
         parser.error("bounded publishers, seconds, pairs and bitrate required")
@@ -209,6 +218,7 @@ def main():
                 binaries={name: digest(path) for name, path in binaries.items()},
                 harness_sha256=digest(__file__), publishers=args.publishers,
                 video_kbit=args.bitrate_kbit, seconds=args.seconds, pairs=args.pairs,
+                candidate_env=candidate_env,
                 notes="Loopback SRT, generated 720p30 H.264/AAC remuxed in real time, no viewers. "
                       "Server and publishers share the host. One server CPU interval per trial.",
                 trials=[])
@@ -230,7 +240,8 @@ def main():
                 work = Path(scratch) / f"trial-{pair}-{variant}"
                 work.mkdir()
                 try:
-                    row.update(trial(binaries[variant], clip, args.publishers, args.seconds, work))
+                    row.update(trial(binaries[variant], clip, args.publishers, args.seconds, work,
+                                     candidate_env if variant == "candidate" else None))
                 except (RuntimeError, OSError, subprocess.SubprocessError) as error:
                     row.update(qualified=False, error=str(error))
                     for name in ("server.log", "sender-0.log", "publisher-0.log"):
