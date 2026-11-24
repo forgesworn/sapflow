@@ -150,3 +150,109 @@ jobs:
             cargo test --locked --release -p sapflow-rtp --lib kept_nack_times_microbenchmark -j 2 \
               -- --ignored --nocapture | grep '"gaps"'
           done
+
+  profile:
+    name: Where SRT ingest CPU goes (perf, 12 publishers, no viewers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned compiler, media tools, the SRT publisher and perf
+        run: |
+          rustup toolchain install --profile minimal
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg srt-tools \
+            linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          ls /usr/lib/linux-tools/*/perf
+      - name: Build the server with symbols and frame pointers
+        run: |
+          RUSTFLAGS="-C force-frame-pointers=yes" cargo build --locked --profile profiling -p sapflow -j 2
+      - name: Record the whole host while the ingest harness runs
+        run: |
+          perf=$(ls /usr/lib/linux-tools/*/perf | head -1)
+          mkdir -p target/performance-qualification/profile
+          out=target/performance-qualification/profile
+          sudo "$perf" record -F 499 -a -g -o "$out/perf.data" &
+          sleep 2
+          python3 -B scripts/compare-srt-ingest.py \
+            --baseline target/profiling/sapflow --candidate target/profiling/sapflow \
+            --publishers 12 --bitrate-kbit 6000 --seconds 40 --pairs 1 \
+            --output "$out/ingest.json"
+          sudo pkill -INT -x perf || true
+          sleep 5
+          sudo chmod a+r "$out/perf.data"
+          sudo "$perf" report -i "$out/perf.data" --comm tokio-rt-worker --percentage relative --no-children \
+            --sort dso --stdio -g none 2>/dev/null | grep -v '^$' | head -60 > "$out/by-dso.txt"
+          sudo "$perf" report -i "$out/perf.data" --comm tokio-rt-worker --percentage relative --no-children \
+            --sort dso,symbol --stdio -g none 2>/dev/null | grep -v '^$' | head -700 > "$out/self-by-symbol.txt"
+          sudo "$perf" report -i "$out/perf.data" --comm tokio-rt-worker --percentage relative --children \
+            --sort symbol --stdio -g none 2>/dev/null | grep -v '^$' | head -700 > "$out/inclusive-by-symbol.txt"
+          sudo "$perf" report -i "$out/perf.data" --no-children --sort comm --stdio -g none \
+            2>/dev/null | grep -v '^$' | head -40 > "$out/by-process.txt"
+          sudo "$perf" report -i "$out/perf.data" --comm tokio-rt-worker --percentage relative --no-children \
+            --sort symbol --stdio -g caller,0.5,callee --percent-limit 0.8 2>/dev/null \
+            | grep -v '^$' | head -2500 > "$out/callers-of-hot-symbols.txt"
+          sudo "$perf" script -i "$out/perf.data" --comms tokio-rt-worker -F ip,sym 2>/dev/null \
+            | python3 -B scripts/perf-children.py 'srt_own::publish' 'srt_own::run' 'TsIngest::drain' \
+                read_ts_packet access_unit 'Muxer::push_video' 'Muxer::place_video' 'Muxer::rotate_part' \
+                'EsIngest::video' 'LiveStream::render' park_internal \
+            > "$out/children.txt"
+          head -30 "$out/by-process.txt"
+          rm -f "$out/perf.data"
+      - name: Retain the text reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: srt-ingest-profile
+          path: target/performance-qualification/profile
+          if-no-files-found: warn
+          retention-days: 7
+
+  ingest-vs-main:
+    name: Server CPU and memory against the baseline (SRT ingest, then HTTP)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned compiler, media tools and the SRT publisher
+        run: |
+          rustup toolchain install --profile minimal
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg srt-tools
+      - name: Verify the harness
+        run: python3 -B tests/test_compare_srt_ingest.py
+      - name: Build the exact baseline and candidate sequentially
+        run: bash scripts/build-http-comparison.sh "$QUALIFICATION_BASELINE" "$GITHUB_SHA"
+      - name: Paired SRT ingest CPU and peak RSS (12 publishers, 6 Mbit/s each, no viewers)
+        run: |
+          python3 -B scripts/compare-srt-ingest.py \
+            --baseline target/performance-qualification/baseline-sapflow \
+            --candidate target/release/sapflow \
+            --publishers 12 --bitrate-kbit 6000 --seconds 30 --pairs 4 \
+            --output target/performance-qualification/ingest-vs-main.json
+      - name: Paired HTTP screening (one stream, 32 viewers; eight streams, 16 each)
+        if: always()
+        run: |
+          python3 -B scripts/compare-http-efficiency.py \
+            --baseline target/performance-qualification/baseline-sapflow \
+            --candidate target/release/sapflow \
+            --bench target/release/sapflow-bench \
+            --baseline-source "$QUALIFICATION_BASELINE" --candidate-source "$GITHUB_SHA" \
+            --pairs 4 --seconds 30 --threads 4 \
+            --output target/performance-qualification/http-vs-main.json
+      - name: Retain compact results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: server-vs-main
+          path: |
+            target/performance-qualification/ingest-vs-main.json
+            target/performance-qualification/http-vs-main.json
+          if-no-files-found: warn
+          retention-days: 7
