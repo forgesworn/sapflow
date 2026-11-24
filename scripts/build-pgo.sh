@@ -40,7 +40,7 @@ python3 -B scripts/compare-srt-ingest.py --baseline "$instrumented" --candidate 
   --publishers 4 --bitrate-kbit 4000 --seconds "$seconds" --pairs 1 --output "$work/train-srt.json"
 python3 -B scripts/compare-http-efficiency.py --baseline "$instrumented" --candidate "$instrumented" \
   --bench target/release/sapflow-bench --baseline-source "$revision" --candidate-source "$revision" \
-  --pairs 1 --seconds "$seconds" --threads 4 --output "$work/train-http.json"
+  --pairs 2 --seconds "$seconds" --threads 4 --output "$work/train-http.json"
 unset LLVM_PROFILE_FILE
 ls "$work"/raw/*.profraw >/dev/null 2>&1 || { echo "training wrote no profile" >&2; exit 1; }
 "$profdata" merge -o "$work/merged.profdata" "$work"/raw/*.profraw
