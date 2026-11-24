@@ -6,12 +6,10 @@
 //! the Opus packet framing check (RFC 6716 sections 3.1 to 3.4), which reads
 //! only the TOC byte, frame count, frame lengths and padding.
 
-use std::io::Read;
-
 use h264_reader::annexb::AnnexBReader;
 use h264_reader::nal::sps::SeqParameterSet;
-use h264_reader::nal::{Nal, RefNal, UnitType};
-use h264_reader::push::NalInterest;
+use h264_reader::nal::{Nal, NalHeader, RefNal, UnitType};
+use h264_reader::push::NalFragmentHandler;
 
 /// Upper bound on one NAL unit, so a hostile stream cannot grow a buffer
 /// without limit. 4 MiB is far above any 1080p I-frame slice.
@@ -94,49 +92,78 @@ pub struct AccessUnit {
     pub pps: Option<Vec<u8>>,
 }
 
+/// Takes the NAL units of one Annex B buffer from the maintained reader's
+/// start-code scan, as fragments of that buffer, and files each into the
+/// access unit.
+///
+/// A unit that arrives whole is filed from the buffer itself. One that
+/// arrives in pieces (the last unit always does: the reader cannot know it
+/// has ended until it is told) is joined in `pending` first, which has room
+/// for the whole buffer from the start, so nothing grows while it is used.
+struct Units<'a> {
+    au: &'a mut AccessUnit,
+    pending: Vec<u8>,
+}
+
+impl Units<'_> {
+    fn file(au: &mut AccessUnit, nal: &[u8]) {
+        let Some(&first) = nal.first() else {
+            return;
+        };
+        let Ok(header) = NalHeader::new(first) else {
+            return;
+        };
+        if nal.len() > MAX_NAL {
+            return;
+        }
+        match header.nal_unit_type() {
+            UnitType::SeqParameterSet => au.sps = Some(nal.to_vec()),
+            UnitType::PicParameterSet => au.pps = Some(nal.to_vec()),
+            UnitType::AccessUnitDelimiter
+            | UnitType::EndOfSeq
+            | UnitType::EndOfStream
+            | UnitType::FillerData => {}
+            t => {
+                if t == UnitType::SliceLayerWithoutPartitioningIdr {
+                    au.idr = true;
+                }
+                if let Ok(len) = u32::try_from(nal.len()) {
+                    au.data.extend_from_slice(&len.to_be_bytes());
+                    au.data.extend_from_slice(nal);
+                }
+            }
+        }
+    }
+}
+
+impl NalFragmentHandler for Units<'_> {
+    fn nal_fragment(&mut self, bufs: &[&[u8]], end: bool) {
+        if end
+            && self.pending.is_empty()
+            && let [whole] = bufs
+        {
+            Self::file(self.au, whole);
+            return;
+        }
+        for buf in bufs {
+            self.pending.extend_from_slice(buf);
+        }
+        if end {
+            Self::file(self.au, &self.pending);
+            self.pending.clear();
+        }
+    }
+}
+
 /// Splits an Annex B buffer (one PES payload) into an access unit.
 pub fn access_unit(annexb: &[u8]) -> AccessUnit {
     let mut au = AccessUnit::default();
-    {
-        let mut reader = AnnexBReader::accumulate(|nal: RefNal<'_>| {
-            if !nal.is_complete() {
-                return NalInterest::Buffer;
-            }
-            let Ok(header) = nal.header() else {
-                return NalInterest::Ignore;
-            };
-            let mut bytes = Vec::new();
-            if nal
-                .reader()
-                .take(MAX_NAL as u64 + 1)
-                .read_to_end(&mut bytes)
-                .is_err()
-                || bytes.len() > MAX_NAL
-            {
-                return NalInterest::Ignore;
-            }
-            match header.nal_unit_type() {
-                UnitType::SeqParameterSet => au.sps = Some(bytes),
-                UnitType::PicParameterSet => au.pps = Some(bytes),
-                UnitType::AccessUnitDelimiter
-                | UnitType::EndOfSeq
-                | UnitType::EndOfStream
-                | UnitType::FillerData => {}
-                t => {
-                    if t == UnitType::SliceLayerWithoutPartitioningIdr {
-                        au.idr = true;
-                    }
-                    if let Ok(len) = u32::try_from(bytes.len()) {
-                        au.data.extend_from_slice(&len.to_be_bytes());
-                        au.data.extend_from_slice(&bytes);
-                    }
-                }
-            }
-            NalInterest::Ignore
-        });
-        reader.push(annexb);
-        reader.reset();
-    }
+    let mut reader = AnnexBReader::for_fragment_handler(Units {
+        au: &mut au,
+        pending: Vec::with_capacity(annexb.len()),
+    });
+    reader.push(annexb);
+    reader.reset();
     au
 }
 
@@ -600,6 +627,8 @@ fn channel_config(h: &adts_reader::AdtsHeader<'_>) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h264_reader::push::NalInterest;
+    use std::io::Read;
 
     #[test]
     fn audio_specific_config_for_aac_lc_48k_stereo() {
@@ -845,5 +874,140 @@ mod tests {
         let au = access_unit(&[0, 0, 0, 1, 0x41, 0x9a, 0x00, 0x10]);
         assert!(!au.idr);
         assert_eq!(au.data, vec![0, 0, 0, 4, 0x41, 0x9a, 0x00, 0x10]);
+    }
+
+    /// [`access_unit`] as it was: every unit accumulated by the reader, read
+    /// out into its own buffer, then copied into the access unit.
+    fn access_unit_reference(annexb: &[u8]) -> AccessUnit {
+        let mut au = AccessUnit::default();
+        {
+            let mut reader = AnnexBReader::accumulate(|nal: RefNal<'_>| {
+                if !nal.is_complete() {
+                    return NalInterest::Buffer;
+                }
+                let Ok(header) = nal.header() else {
+                    return NalInterest::Ignore;
+                };
+                let mut bytes = Vec::new();
+                if nal
+                    .reader()
+                    .take(MAX_NAL as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .is_err()
+                    || bytes.len() > MAX_NAL
+                {
+                    return NalInterest::Ignore;
+                }
+                match header.nal_unit_type() {
+                    UnitType::SeqParameterSet => au.sps = Some(bytes),
+                    UnitType::PicParameterSet => au.pps = Some(bytes),
+                    UnitType::AccessUnitDelimiter
+                    | UnitType::EndOfSeq
+                    | UnitType::EndOfStream
+                    | UnitType::FillerData => {}
+                    t => {
+                        if t == UnitType::SliceLayerWithoutPartitioningIdr {
+                            au.idr = true;
+                        }
+                        if let Ok(len) = u32::try_from(bytes.len()) {
+                            au.data.extend_from_slice(&len.to_be_bytes());
+                            au.data.extend_from_slice(&bytes);
+                        }
+                    }
+                }
+                NalInterest::Ignore
+            });
+            reader.push(annexb);
+            reader.reset();
+        }
+        au
+    }
+
+    /// A small deterministic generator (xorshift64*).
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    fn same_access_unit(annexb: &[u8], what: &str) {
+        let (new, old) = (access_unit(annexb), access_unit_reference(annexb));
+        assert_eq!(new.data, old.data, "data: {what}");
+        // The ingest charges startup memory by this capacity.
+        assert_eq!(new.data.capacity(), old.data.capacity(), "capacity: {what}");
+        assert_eq!(new.idr, old.idr, "idr: {what}");
+        assert_eq!(new.sps, old.sps, "sps: {what}");
+        assert_eq!(new.pps, old.pps, "pps: {what}");
+    }
+
+    /// Every field, and the capacity the ingest accounts for, match the
+    /// previous splitting: on generated buffers thick with start codes,
+    /// zero runs, emulation bytes, forbidden headers and empty units, and
+    /// on every prefix of them.
+    #[test]
+    fn access_units_match_the_accumulating_reader() {
+        for (name, buf) in [
+            ("empty", vec![]),
+            ("no start code", vec![0x65, 1, 2, 3]),
+            ("only zeros", vec![0; 9]),
+            ("only start codes", vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 1]),
+            ("trailing zeros", vec![0, 0, 1, 0x41, 9, 0, 0, 0]),
+            ("forbidden bit", vec![0, 0, 1, 0xe5, 1, 0, 0, 1, 0x41, 2]),
+        ] {
+            same_access_unit(&buf, name);
+        }
+        let headers = [
+            0x09, 0x67, 0x68, 0x65, 0x41, 0x06, 0x0c, 0x0a, 0x0b, 0x01, 0xe5, 0x00, 0x7f,
+        ];
+        for seed in 1..=400u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut buf = Vec::new();
+            for _ in 0..rng.below(9) {
+                match rng.below(8) {
+                    0 => buf.extend([0, 0, 0, 1]),
+                    1..=4 => buf.extend([0, 0, 1]),
+                    5 => buf.extend(std::iter::repeat_n(0, rng.below(6) as usize)),
+                    _ => {}
+                }
+                if rng.below(7) != 0 {
+                    buf.push(headers[rng.below(headers.len() as u64) as usize]);
+                }
+                let len = match rng.below(5) {
+                    0 => 0,
+                    1 => rng.below(4),
+                    2 => rng.below(40),
+                    _ => rng.below(3000),
+                };
+                for _ in 0..len {
+                    // Few distinct values: zero runs and 00 00 03 are common.
+                    buf.push([0, 0, 0, 1, 3, 0x80, 0xff][rng.below(7) as usize]);
+                }
+            }
+            same_access_unit(&buf, &format!("seed {seed}"));
+            if seed <= 60 {
+                for cut in 0..buf.len().min(300) {
+                    same_access_unit(&buf[..cut], &format!("seed {seed} cut {cut}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_unit_is_left_out_and_the_rest_kept() {
+        let mut buf = vec![0, 0, 1, 0x41];
+        buf.extend(std::iter::repeat_n(0x55, MAX_NAL));
+        buf.extend([0, 0, 1, 0x41, 7, 7]);
+        same_access_unit(&buf, "over the limit by one");
+        assert_eq!(access_unit(&buf).data, vec![0, 0, 0, 3, 0x41, 7, 7]);
+        // Exactly at the limit it is kept.
+        same_access_unit(&buf[1..], "shifted");
+        let mut at = vec![0, 0, 1, 0x41];
+        at.extend(std::iter::repeat_n(0x55, MAX_NAL - 1));
+        same_access_unit(&at, "at the limit");
+        assert_eq!(access_unit(&at).data.len(), 4 + MAX_NAL);
     }
 }
