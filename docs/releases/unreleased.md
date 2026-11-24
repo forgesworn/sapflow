@@ -10,8 +10,10 @@ Notes for the release after 0.2.0-rc.1.
   (`scripts/build-pgo.sh`). On hosted Linux x86-64 runners the
   profile-guided server used 8% less CPU for SRT ingest (12 publishers at
   6 Mbit/s, four paired trials, ratios 0.911 to 0.933) and 2 to 11% less
-  for HTTP serving, with peak RSS no higher. The image takes about three
-  times as long to build. `docker build --build-arg PGO=0` builds the
+  for HTTP serving, with peak RSS no higher. The server taken from the
+  image itself measured 5% less SRT ingest CPU than the image built
+  without it (median of four pairs, ratios 0.914 to 1.000), peak RSS
+  unchanged. The image takes about three times as long to build. `docker build --build-arg PGO=0` builds the
   server once, as before.
 
 ## sapflow-client
