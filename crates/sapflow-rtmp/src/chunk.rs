@@ -768,35 +768,4 @@ mod tests {
         r.abort(2);
         assert_eq!(r.reserved, 0);
     }
-
-    /// Manual: the cost of reading one message back from its chunks.
-    #[test]
-    #[ignore = "bounded manual microbenchmark; run in release with --ignored --nocapture"]
-    fn reassembly_microbenchmark() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        const ROUNDS: u32 = 20_000;
-        for (len, size) in [
-            (1_400usize, 4096u32),
-            (12_000, 4096),
-            (60_000, 4096),
-            (60_000, 128),
-        ] {
-            let payload = vec![0x5a; len];
-            let mut w = ChunkWriter::default();
-            w.set_chunk_size(size);
-            let mut bytes = Vec::new();
-            w.write(&mut bytes, 6, 9, 1, 40, &payload);
-            let mut r = ChunkReader::new(40 << 20);
-            r.set_chunk_size(size).expect("valid size");
-            let started = Instant::now();
-            for _ in 0..ROUNDS {
-                let msgs = read_all(&mut r, black_box(&bytes));
-                assert_eq!(msgs.len(), 1);
-                black_box(msgs);
-            }
-            let ns = started.elapsed().as_nanos() / u128::from(ROUNDS);
-            println!("{{\"message_bytes\":{len},\"chunk_size\":{size},\"ns_per_message\":{ns}}}");
-        }
-    }
 }

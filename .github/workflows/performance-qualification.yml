@@ -99,3 +99,52 @@ jobs:
           path: target/performance-qualification/srt.json
           if-no-files-found: warn
           retention-days: 7
+
+  library:
+    name: Paired library benchmark qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        bench: [ts-ingest, chunk-reassembly]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned compiler
+        run: rustup toolchain install --profile minimal
+      - name: Verify the measurement harness
+        run: python3 -B tests/test_qualify_library_bench.py
+      - name: Build and run the paired campaign
+        run: |
+          python3 -B scripts/qualify-library-bench.py --bench "${{ matrix.bench }}" \
+            --baseline "$QUALIFICATION_BASELINE" --candidate "$GITHUB_SHA" \
+            --output "target/performance-qualification/${{ matrix.bench }}.json"
+      - name: Retain compact results, including failed guards
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: library-${{ matrix.bench }}-qualification
+          path: target/performance-qualification/${{ matrix.bench }}.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  rtp:
+    name: RTP NACK query microbenchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install the pinned compiler
+        run: rustup toolchain install --profile minimal
+      - name: Scan against kept NACK times, in one binary
+        run: |
+          for round in 1 2 3; do
+            cargo test --locked --release -p sapflow-rtp --lib kept_nack_times_microbenchmark -j 2 \
+              -- --ignored --nocapture | grep '"gaps"'
+          done
