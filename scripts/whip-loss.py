@@ -12,7 +12,10 @@ retransmission, and by the next 1 s keyframe.
 
 - SRT: ffmpeg -re (copy) into UDP, srt-live-transmit (libsrt) to sapflow's
   SRT listener through the proxy (--protocol srt: everything but the
-  handshake impaired), latency 200 ms on both ends.
+  handshake impaired), latency 200 ms on both ends unless an arm sets
+  `latency=N` (--arms), which srt-live-transmit asks for; sapflow's
+  listener gives a caller asking for more what it asks, and the latency it
+  accepted (its "SRT publisher accepted" line) is kept with the trial.
 - WHIP: through the proxy (--protocol whip: only SRTP and SRTCP impaired),
   the answer's only candidate being the proxy. Sapflow's jitter wait is its
   default unless an arm sets SAPFLOW_WHIP_JITTER or the experimental
@@ -48,9 +51,12 @@ delays without reordering (the proxy's --jitter-order keep): for example
 --arms replaces --protocols with named arms, each a protocol and any
 environment for sapflow, run in the order given for each seed: for example
 base=whip,srt=srt,nack30=whip+SAPFLOW_WHIP_NACK_REPEAT=30,
-wait400=whip+SAPFLOW_WHIP_JITTER=400. Each arm has its own clean runs. The
+wait400=whip+SAPFLOW_WHIP_JITTER=400. An SRT arm can set its latency
+instead: srt400=srt+latency=400. Each arm has its own clean runs. The
 summary gives each arm against the SRT arm and, for WHIP arms, against the
-first WHIP arm (the baseline), with a Welch t each.
+first WHIP arm (the baseline), with a Welch t each. With more than one SRT
+arm, "the SRT arm" is the first, and each further SRT arm gets its own
+pair of columns (minus_NAME, welch_t_vs_NAME) at the end.
 
 --max-load holds each trial until the one-minute load average is below it
 (0, the default, never waits); the load at the start, the wait and the load
@@ -244,7 +250,7 @@ def wait_for_load(limit):
 
 
 def trial(args, arm, profile, seed, out):
-    name, protocol, arm_env = arm
+    name, protocol, arm_env, latency = arm
     loss, jitter, keep = profile
     tag = f"{name}-l{loss}-j{jitter}{'k' if keep else ''}-s{seed}"
     d = out / "trials" / tag
@@ -264,6 +270,7 @@ def trial(args, arm, profile, seed, out):
            "RUST_LOG": "info,sapflow::whip=debug", **arm_env}
     waited = wait_for_load(args.max_load)
     row = {"arm": name, "protocol": protocol, "loss_pct": loss, "seed": seed, "jitter_ms": jitter,
+           "srt_latency_ms": latency if protocol == "srt" else "",
            "jitter_order": "keep" if keep else "reorder", "env": " ".join(f"{k}={v}" for k, v in arm_env.items()),
            "delay_ms": args.delay_ms, "load": round(os.getloadavg()[0], 2), "load_wait_s": waited,
            "started": time.strftime("%H:%M:%S")}
@@ -277,13 +284,13 @@ def trial(args, arm, profile, seed, out):
                                   "--loss", "none" if loss == 0 else f"random:{loss}", "--delay-ms", str(args.delay_ms),
                                   "--jitter-ms", str(jitter), "--jitter-order", "keep" if keep else "reorder",
                                   "--protocol", protocol,
-                                  "--latency-ms", str(LATENCY_MS), "--seed", str(seed), "--stats", str(d / "proxy.txt")],
+                                  "--latency-ms", str(latency), "--seed", str(seed), "--stats", str(d / "proxy.txt")],
                                  stdout=subprocess.DEVNULL, stderr=open(d / "proxy.log", "w"))
         procs.append(proxy)
         time.sleep(0.5)
         if protocol == "srt":
             snd = subprocess.Popen(["srt-live-transmit", "-a:no", "-c:1316", f"udp://127.0.0.1:{port['udp']}",
-                                    f"srt://127.0.0.1:{port['proxy']}?latency={LATENCY_MS}&streamid=publish:live/event-loss:{user}:{pw}"],
+                                    f"srt://127.0.0.1:{port['proxy']}?latency={latency}&streamid=publish:live/event-loss:{user}:{pw}"],
                                    stdout=open(d / "snd.log", "w"), stderr=subprocess.STDOUT)
             procs.append(snd)
             for _ in range(50):
@@ -295,7 +302,7 @@ def trial(args, arm, profile, seed, out):
                                       stderr=open(d / "ff.log", "w"))
             procs.append(feeder)
             row["publisher_exit"] = feeder.wait(CLIP_SECONDS + 40)
-            time.sleep(LATENCY_MS / 1000 + 2)
+            time.sleep(latency / 1000 + 2)
             stop(snd)
         elif args.whip_publisher == "chrome":
             report = chrome_publish(d, f"http://127.0.0.1:{port['whip']}/whip/live/event-loss", f"{user}:{pw}", port["page"])
@@ -353,6 +360,9 @@ def trial(args, arm, profile, seed, out):
                          "video_skipped", "audio_lost"):
                     row[f"sapflow_{k}"] = int(v)
     else:
+        accepted = re.findall(r"^.*SRT publisher accepted.*$", text, re.M)
+        got = re.search(r"latency_ms=(\d+)", accepted[-1]) if accepted else None
+        row["sapflow_srt_latency_ms"] = int(got.group(1)) if got else ""
         m = re.findall(r"SRT connection closed .*?received=(\d+) retransmitted=(\d+) lost=(\d+) dropped=(\d+)", text)
         if m:
             r_, t_, l_, dr = m[-1]
@@ -373,7 +383,10 @@ def welch(a, b):
 
 
 def parse_arms(text):
-    """NAME=PROTOCOL[+KEY=VALUE...],... into (name, protocol, env) tuples."""
+    """NAME=PROTOCOL[+KEY=VALUE...],... into (name, protocol, env, latency) tuples.
+
+    latency=N (SRT arms only) is the SRT latency in ms; every other pair is
+    sapflow's environment."""
     arms = []
     for item in text.split(","):
         name, _, rest = item.partition("=")
@@ -381,12 +394,18 @@ def parse_arms(text):
         if not name or protocol not in ("srt", "whip"):
             raise SystemExit(f"--arms: {item!r} is not NAME=srt|whip[+KEY=VALUE...]")
         env = {}
+        latency = LATENCY_MS
         for pair in pairs:
             k, eq, v = pair.partition("=")
+            if k == "latency" and eq:
+                if protocol != "srt" or not v.isdigit() or not 20 <= int(v) <= 8000:
+                    raise SystemExit(f"--arms: {item!r}: latency=N (20 to 8000 ms) is for SRT arms only")
+                latency = int(v)
+                continue
             if not eq or not k.startswith("SAPFLOW_"):
                 raise SystemExit(f"--arms: {pair!r} is not SAPFLOW_KEY=VALUE")
             env[k] = v
-        arms.append((name, protocol, env))
+        arms.append((name, protocol, env, latency))
     if len({a[0] for a in arms}) != len(arms):
         raise SystemExit("--arms: names must differ")
     return arms
@@ -417,7 +436,7 @@ def main():
         arms = parse_arms(args.arms)
         interleave = "fixed"
     else:
-        arms = [(p, p, {}) for p in args.protocols.split(",")]
+        arms = [(p, p, {}, LATENCY_MS) for p in args.protocols.split(",")]
         interleave = "flip"
     clean = (0, 0, False)
     if args.profiles:
@@ -448,12 +467,14 @@ def main():
     key = lambda r: (r["loss_pct"], r["jitter_ms"], r["jitter_order"] == "keep")
     names = [a[0] for a in arms]
     srt = next((a[0] for a in arms if a[1] == "srt"), None)
+    more_srt = [a[0] for a in arms if a[1] == "srt"][1:]
     baseline = next((a[0] for a in arms if a[1] == "whip"), None)
     fmt = lambda x, n=1: "" if x is None else round(x, n)
     with open(args.out / "summary.tsv", "w") as f:
         f.write("loss_pct\tjitter_ms\tjitter_order\tarm\tprotocol\truns\tunrecovered_mean\tunrecovered_sd\tunrecovered\t"
                 "share_of_sent_pct\tvs_clean_mean\tminus_srt\twelch_t_vs_srt\tminus_baseline\twelch_t_vs_baseline\t"
-                "never_ready\tload\tretransmits\treordered\n")
+                "never_ready\tload\tretransmits\treordered"
+                + "".join(f"\tminus_{x}\twelch_t_vs_{x}" for x in more_srt) + "\n")
         order = ([clean] if args.clean else []) + [p for p in profiles if p != clean]
         groups = {(prof, n): [r for r in rows if r["arm"] == n and key(r) == prof] for prof in order for n in names}
         un_of = lambda g: [r.get("unrecovered") for r in g if r.get("unrecovered") is not None]
@@ -483,7 +504,8 @@ def main():
                         f"{sum(1 for r in g if not r.get('ready'))}\t"
                         f"{f'{min(loads)} to {max(loads)}' if loads else ''}\t"
                         f"{' '.join(str(r.get('proxy_retransmits', '')) for r in g)}\t"
-                        f"{' '.join(str(r.get('proxy_reordered', '')) for r in g)}\n")
+                        f"{' '.join(str(r.get('proxy_reordered', '')) for r in g)}"
+                        + "".join(f"\t{fmt(d)}\t{fmt(t, 2)}" for d, t in (against(x) for x in more_srt)) + "\n")
     print((args.out / "summary.tsv").read_text())
     return 0
 
