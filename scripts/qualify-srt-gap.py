@@ -55,6 +55,18 @@ def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
+def cpu_model():
+    """The processor's name, where Linux reports one: hosted runners differ,
+    and so do their results."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
 def cpu_snapshot():
     try:
         fields = Path("/proc/stat").read_text().splitlines()[0].split()
@@ -255,7 +267,7 @@ def main():
                            "benefit_median_limit": 0.95, "benefit_pair_limit": 1.0,
                            "maximum_steal_fraction": MAX_STEAL, "maximum_external_busy_cores": MAX_EXTERNAL_CORES},
               "environment": {"platform": platform.platform(), "machine": platform.machine(),
-                              "logical_cpus": os.cpu_count()},
+                              "logical_cpus": os.cpu_count(), "cpu_model": cpu_model()},
               "identities": {"example_sha256": digest(Path(EXAMPLE).read_bytes())},
               "pilots": [], "workloads": {}, "rows": [],
               "limitations": ["Library elapsed time, not network or whole-server performance.",

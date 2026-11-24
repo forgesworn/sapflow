@@ -144,7 +144,7 @@ def main():
                            "maximum_steal_fraction": HOST.MAX_STEAL,
                            "maximum_external_busy_cores": HOST.MAX_EXTERNAL_CORES},
               "environment": {"platform": platform.platform(), "machine": platform.machine(),
-                              "logical_cpus": os.cpu_count()},
+                              "logical_cpus": os.cpu_count(), "cpu_model": HOST.cpu_model()},
               "identities": {}, "rows": [],
               "limitations": ["Library elapsed time, not network or whole-server performance.",
                               "Fixed work chosen before the campaign; no retry or replacement."]}
