@@ -108,6 +108,14 @@ def trial(binary, clip, publishers, seconds, work):
                 if time.monotonic() >= deadline:
                     raise RuntimeError("server readiness timeout") from None
                 time.sleep(.05)
+        def alive():
+            for child, log in zip(children, logs):
+                if child.poll() is not None:
+                    log.flush()
+                    tail = Path(log.name).read_text(errors="replace")[-300:].strip()
+                    raise RuntimeError(f"{Path(log.name).name} exited ({child.returncode}): {tail}")
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         urls = []
         for index in range(publishers):
             port = free_port(socket.SOCK_DGRAM)
@@ -119,15 +127,11 @@ def trial(binary, clip, publishers, seconds, work):
             launch(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-re",
                     "-stream_loop", "-1", "-i", str(clip), "-c", "copy", "-f", "mpegts",
                     f"udp://127.0.0.1:{port}?pkt_size=1316"], f"publisher-{index}.log")
-            urls.append(f"http://127.0.0.1:{http}/live/{name}/index.m3u8")
-
-        def alive():
-            if any(child.poll() is not None for child in children):
-                raise RuntimeError("server or publisher exited")
-
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        deadline = time.monotonic() + 30
-        for url in urls:
+            url = f"http://127.0.0.1:{http}/live/{name}/index.m3u8"
+            urls.append(url)
+            # One at a time: the server refuses a new stream while eight are
+            # still starting, so each is servable before the next begins.
+            deadline = time.monotonic() + 30
             while True:
                 alive()
                 try:
