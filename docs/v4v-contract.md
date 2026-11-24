@@ -275,6 +275,19 @@ v4v holds the gig for `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS` (default
 90). Keep the two equal. `recordSegmentComplete` arrives when the stream
 ends, so up to the grace period after the encoder's last drop.
 
+Live callbacks are sent in the order they happened, one at a time, each
+with up to four attempts of five seconds. A `recordSegmentComplete` waits
+its turn with the rest, so v4v hears a stage's `unpublish` before it, and
+is then sent by a sender of its own: four attempts of up to ten minutes
+each, because v4v copies and hashes the whole file before it answers (a
+four-hour show at 4,000 kbit/s is about 8 GB, some seven minutes at
+20 MB/s). The other callbacks do not wait for that answer, so an import
+never delays another stage's `publish` or `unpublish`, and v4v can hear a
+stage's next `publish` before the `recordSegmentComplete` of the stream
+that ended. Completions are sent one at a time; up to 512 wait for the
+one being imported, and one more than that is not sent now and stays owed,
+as [below](#recordings-reported-after-a-restart).
+
 When sapflow itself is stopped (SIGTERM or ctrl-c, as at a `docker compose
 up` redeploy or a Docker restart), it takes no new encoder and ends every
 stream at once, with no grace:
@@ -291,7 +304,8 @@ With recording off, no `recordSegmentComplete` follows.
 
 sapflow waits up to 7.5 s for its files and callbacks, then exits, inside
 Docker's default 10 s stop timeout. A file still being written or a callback
-still unsent by then (one being retried while v4v is down, say) is reported
+still unanswered by then (one being retried while v4v is down, say, or a
+`recordSegmentComplete` whose file v4v is still copying) is reported
 at the next start instead, as is a file a SIGKILL, an OOM kill, a crash or a
 power cut left unreported: see
 [recordings reported after a restart](#recordings-reported-after-a-restart).
@@ -349,18 +363,20 @@ Every callback, live or recovered, treats 408 and 429 as "try again", not
 as a refusal, and waits as long as a `Retry-After` header (seconds) or a
 `retryAfterMs` in the JSON body asks before its next attempt: up to 10 s
 for a live callback, so one event holds the live queue at most about 50 s,
-and up to a minute for a recovered one. To find `retryAfterMs`, the body of
+and up to a minute for a `recordSegmentComplete`, live or recovered, which
+holds only the completions behind it. To find `retryAfterMs`, the body of
 a 408, 429 or 503 to a callback is read, up to its `content-length`, at most
 1 KiB and for at most 1.5 s; no other body is read, and never one answering
 a publish authorisation request.
 
-v4v follow-up: since every attempt that times out makes v4v copy the file
-again, its importer should answer before it copies (and copy in the
-background), or first check the path, size and modification time against
-a part it already holds and answer at once.
+An attempt that times out is sent again while v4v may still be copying the
+file. v4v's importer shares one copy between reports that overlap, and
+answers at once for a file it already holds (the same path, size and
+times), so a resend costs no second copy.
 
-A live callback that fails while sapflow keeps running (v4v down through all
-four attempts) stays owed too, but is sent only at the next start.
+A live `recordSegmentComplete` that fails while sapflow keeps running (v4v
+down through all four attempts, or 512 already waiting) stays owed too, but
+is sent only at the next start.
 
 Delivery is at least once: a callback v4v answered just before a crash, its
 record not yet removed, is sent again at the next start, as the same body.
