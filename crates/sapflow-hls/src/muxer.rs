@@ -1549,6 +1549,13 @@ impl Muxer {
             let end = current_dts;
             return self.break_stream(end, next, now);
         }
+        if held && next_dts - current_dts > BREAK_GAP {
+            // Not a break, so nothing else says the picture stood still.
+            tracing::warn!(
+                gap_ms = (next_dts - current_dts) / 90,
+                "video withheld after transport damage until this keyframe; the last frame is held across the gap"
+            );
+        }
         let pending_audio_bytes = self.pending_audio.as_ref().map_or(0, |p| p.data.len());
         let seg = self
             .next_segment
