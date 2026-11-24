@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Qualify the SRT receive-slot cache on one otherwise idle Linux runner.
+"""Qualify an SRT receiver change on one otherwise idle Linux runner.
+
+The runtime under test is the receiver and its loss list. Each campaign names
+the profiles its change must improve (--benefit); every other profile must
+not regress.
 
 Build both arms sequentially in this checkout's target/. One fixed pilot per
 arm/profile chooses common work counts before four balanced measured pairs.
@@ -20,6 +24,9 @@ import time
 
 
 RECEIVER = "crates/sapflow-srt/src/receiver.rs"
+LOSS = "crates/sapflow-srt/src/loss.rs"
+# The files a campaign may change between its arms; everything else is common.
+RUNTIME = (RECEIVER, LOSS)
 EXAMPLE = "crates/sapflow-srt/examples/receiver-gap-bench.rs"
 PROFILES = {
     # Fixed before the campaign: lengthen the fast-arm pilots so scheduler tick
@@ -27,7 +34,11 @@ PROFILES = {
     "clean-stream": {"pilot": 20_000_000, "cap": 500_000_000, "multiplier": 1},
     "pending-and-timer": {"pilot": 1_000_000_000, "cap": 8_000_000_000, "multiplier": 1},
     "bursty-stream": {"pilot": 32_768, "cap": 1_000_000, "multiplier": 128},
+    # Every other packet missing: the loss list stays near its range cap.
+    "fragmented-stream": {"pilot": 200_000, "cap": 100_000_000, "multiplier": 1},
 }
+# The slot-cache campaign's benefit profile, and the default.
+DEFAULT_BENEFIT = ("bursty-stream",)
 PAIRS = 4
 TARGET_SECONDS = 5.0
 MIN_SECONDS = 3.0
@@ -42,6 +53,18 @@ def digest(data):
 
 def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
+
+
+def cpu_model():
+    """The processor's name, where Linux reports one: hosted runners differ,
+    and so do their results."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
 
 
 def cpu_snapshot():
@@ -108,8 +131,10 @@ def choose_work(profile, pilots):
     return {"work": count, "predicted_slower_seconds": predicted, "pilot_seconds": durations}
 
 
-def qualify(rows, workloads):
+def qualify(rows, workloads, benefit=DEFAULT_BENEFIT):
     summaries = {}
+    if not benefit or not set(benefit) <= set(PROFILES):
+        return {"passed": False, "reason": "unknown or missing benefit profile", "profiles": summaries}
     if len(rows) != len(PROFILES) * PAIRS * 2 or set(workloads) != set(PROFILES):
         return {"passed": False, "reason": "incomplete campaign", "profiles": summaries}
     for profile in PROFILES:
@@ -135,8 +160,9 @@ def qualify(rows, workloads):
         ratios = [lookup[pair, "candidate"]["elapsed_ns"] / lookup[pair, "baseline"]["elapsed_ns"]
                   for pair in range(1, PAIRS + 1)]
         durations = [row["result"]["elapsed_ns"] / 1e9 for row in samples]
-        burst = profile == "bursty-stream"
+        burst = profile in benefit
         summaries[profile] = {
+            "guard": "benefit" if burst else "nominal",
             "ratios": ratios,
             "median_ratio": statistics.median(ratios),
             "maximum_ratio": max(ratios),
@@ -155,8 +181,9 @@ def save(path, report):
     temporary.replace(path)
 
 
-def build_arm(source, executable, receiver, output, report, label):
-    receiver.write_bytes(source)
+def build_arm(sources, executable, output, report, label):
+    for path, source in sources.items():
+        Path(path).write_bytes(source)
     command = ["cargo", "build", "--locked", "--release", "-p", "sapflow-srt",
                "--example", "receiver-gap-bench", "-j", "2"]
     log = output.parent / "srt-build.log"
@@ -170,10 +197,16 @@ def build_arm(source, executable, receiver, output, report, label):
             report["builds"][-1]["failure_tail"] = "\n".join(log.read_text().splitlines()[-25:]).replace(str(Path.cwd()), "<checkout>")
             raise ValueError(f"{label} build failed")
         shutil.copy2("target/release/examples/receiver-gap-bench", executable)
-        report["identities"][label] = {"receiver_sha256": digest(source),
-                                       "binary_sha256": digest(executable.read_bytes())}
+        report["identities"][label] = {
+            "runtime_sha256": {path: digest(source) for path, source in sources.items()},
+            "binary_sha256": digest(executable.read_bytes())}
     finally:
         log.unlink(missing_ok=True)
+
+
+def restore(sources):
+    for path, source in sources.items():
+        Path(path).write_bytes(source)
 
 
 def trial(executable, profile, work, arm, phase, pair):
@@ -211,7 +244,10 @@ def main():
     parser.add_argument("--baseline", required=True, help="full immutable baseline commit")
     parser.add_argument("--candidate", required=True, help="full immutable checked-out candidate commit")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--benefit", action="append", choices=sorted(PROFILES),
+                        help="profile the change must improve; repeatable (default: bursty-stream)")
     args = parser.parse_args()
+    benefit = tuple(dict.fromkeys(args.benefit or DEFAULT_BENEFIT))
     output = args.output.resolve()
     if output.exists():
         parser.error("refusing to overwrite an existing qualification receipt")
@@ -219,19 +255,19 @@ def main():
         if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
             parser.error("revisions must be full lowercase commit hashes")
     output.parent.mkdir(parents=True, exist_ok=True)
-    receiver = Path(RECEIVER)
-    candidate = receiver.read_bytes()
-    report = {"schema": "sapflow-srt-linux-qualification-v1", "status": "running",
+    candidate = {path: Path(path).read_bytes() for path in RUNTIME}
+    report = {"schema": "sapflow-srt-linux-qualification-v2", "status": "running",
               "baseline_revision": args.baseline, "candidate_revision": args.candidate,
               "protocol": {"pairs": PAIRS, "order": ["AB", "BA", "AB", "BA"],
                            "pilot": "one fixed pilot per arm/profile; common work frozen before timing",
                            "target_seconds": TARGET_SECONDS, "minimum_seconds": MIN_SECONDS,
                            "maximum_predicted_seconds": MAX_SECONDS, "profiles": PROFILES,
+                           "benefit_profiles": list(benefit),
                            "nominal_median_limit": 1.05, "nominal_pair_limit": 1.10,
-                           "burst_median_limit": 0.95, "burst_pair_limit": 1.0,
+                           "benefit_median_limit": 0.95, "benefit_pair_limit": 1.0,
                            "maximum_steal_fraction": MAX_STEAL, "maximum_external_busy_cores": MAX_EXTERNAL_CORES},
               "environment": {"platform": platform.platform(), "machine": platform.machine(),
-                              "logical_cpus": os.cpu_count()},
+                              "logical_cpus": os.cpu_count(), "cpu_model": cpu_model()},
               "identities": {"example_sha256": digest(Path(EXAMPLE).read_bytes())},
               "pilots": [], "workloads": {}, "rows": [],
               "limitations": ["Library elapsed time, not network or whole-server performance.",
@@ -251,25 +287,26 @@ def main():
             raise ValueError("tracked checkout must be clean before qualification")
         changed = set(git("diff", "--name-only", args.baseline, "--", "Cargo.toml", "Cargo.lock",
                           "crates/sapflow-srt/Cargo.toml", "crates/sapflow-srt/src").splitlines())
-        if changed != {RECEIVER}:
+        if not changed or not changed <= set(RUNTIME):
             raise ValueError("baseline differs beyond the receiver runtime under test")
         for path in ("Cargo.toml", "Cargo.lock", "crates/sapflow-srt/Cargo.toml"):
             report["identities"][path] = digest(Path(path).read_bytes())
         report["identities"]["common_source_sha256"] = {
             str(path): digest(path.read_bytes()) for path in sorted(Path("crates/sapflow-srt/src").rglob("*.rs"))
-            if str(path) != RECEIVER}
+            if str(path) not in RUNTIME}
         report["identities"]["runner_sha256"] = digest(Path(__file__).read_bytes())
         report["environment"]["rustc"] = subprocess.check_output(["rustc", "-vV"], text=True).strip()
         report["environment"]["build_env"] = {key: os.environ.get(key) for key in
                                                  ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_INCREMENTAL")}
         scratch.mkdir(parents=True, exist_ok=False)
         created = True
-        baseline = subprocess.check_output(["git", "show", f"{args.baseline}:{RECEIVER}"])
+        baseline = {path: subprocess.check_output(["git", "show", f"{args.baseline}:{path}"])
+                    for path in RUNTIME}
         try:
-            build_arm(baseline, binaries["baseline"], receiver, output, report, "baseline")
-            build_arm(candidate, binaries["candidate"], receiver, output, report, "candidate")
+            build_arm(baseline, binaries["baseline"], output, report, "baseline")
+            build_arm(candidate, binaries["candidate"], output, report, "candidate")
         finally:
-            receiver.write_bytes(candidate)
+            restore(candidate)
         save(output, report)
         for profile, spec in PROFILES.items():
             pilots = {}
@@ -292,18 +329,19 @@ def main():
                         raise ValueError("measured trial failed; not retrying")
                     if not row["host"]["valid"] or row["result"]["elapsed_ns"] < MIN_SECONDS * 1e9:
                         raise ValueError("measured host or duration gate invalid; not retrying")
-        if digest(Path(EXAMPLE).read_bytes()) != report["identities"]["example_sha256"] or receiver.read_bytes() != candidate:
+        if (digest(Path(EXAMPLE).read_bytes()) != report["identities"]["example_sha256"]
+                or any(Path(path).read_bytes() != source for path, source in candidate.items())):
             raise ValueError("benchmark or receiver source changed during qualification")
         for arm, executable in binaries.items():
             if digest(executable.read_bytes()) != report["identities"][arm]["binary_sha256"]:
                 raise ValueError("benchmark executable changed during qualification")
-        report["qualification"] = qualify(report["rows"], report["workloads"])
+        report["qualification"] = qualify(report["rows"], report["workloads"], benefit)
         report["status"] = "passed" if report["qualification"]["passed"] else "failed"
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["status"] = "invalid"
         report["error"] = str(error).replace(str(Path.cwd()), "<checkout>")
     finally:
-        receiver.write_bytes(candidate)
+        restore(candidate)
         if created:
             shutil.rmtree(scratch)
         save(output, report)
