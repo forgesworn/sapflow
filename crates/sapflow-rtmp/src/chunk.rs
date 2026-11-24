@@ -17,11 +17,6 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 128;
 pub const MAX_CHUNK_SIZE: u32 = 1 << 24;
 /// Most chunk streams one connection may use. Encoders use under ten.
 pub const MAX_CHUNK_STREAMS: usize = 64;
-/// The most room set aside for a message when its first chunk arrives. The
-/// length a header advertises is not yet data, so room is only set aside up
-/// to this, and only while everything set aside fits the partial-message
-/// budget; a longer message grows as its chunks arrive, as any did before.
-const MAX_RESERVE: usize = 256 << 10;
 
 /// The 24-bit timestamp value that says "extended timestamp follows".
 const EXTENDED: u32 = 0x00ff_ffff;
@@ -84,8 +79,6 @@ struct StreamState {
     type_id: u8,
     stream_id: u32,
     partial: Vec<u8>,
-    /// Room set aside for `partial` when its message began.
-    reserved: usize,
 }
 
 /// Reads chunks, one at a time.
@@ -94,9 +87,6 @@ pub struct ChunkReader {
     streams: HashMap<u32, StreamState>,
     /// Sum of all partial message lengths.
     buffered: usize,
-    /// Sum of the room set aside for partial messages; never over `budget`
-    /// when more is set aside.
-    reserved: usize,
     /// Most bytes partial messages may hold together.
     budget: usize,
 }
@@ -123,7 +113,6 @@ impl ChunkReader {
             chunk_size: DEFAULT_CHUNK_SIZE,
             streams: HashMap::new(),
             buffered: 0,
-            reserved: 0,
             budget,
         }
     }
@@ -158,9 +147,7 @@ impl ChunkReader {
     pub fn abort(&mut self, csid: u32) {
         if let Some(s) = self.streams.get_mut(&csid) {
             self.buffered = self.buffered.saturating_sub(s.partial.len());
-            self.reserved = self.reserved.saturating_sub(s.reserved);
             s.partial = Vec::new();
-            s.reserved = 0;
         }
     }
 
@@ -267,18 +254,7 @@ impl ChunkReader {
         self.buffered = buffered;
         let s = self.streams.entry(csid).or_default();
         if !continuing {
-            // Room for the whole message at once, where the budget allows,
-            // in place of growing it chunk by chunk.
-            let held = self.reserved.saturating_sub(s.reserved);
-            let room = total.min(MAX_RESERVE);
-            let room = if held.saturating_add(room) <= self.budget {
-                room
-            } else {
-                0
-            };
-            s.partial = Vec::with_capacity(room);
-            s.reserved = room;
-            self.reserved = held + room;
+            s.partial = Vec::new();
         }
         s.field = field;
         s.timestamp = timestamp;
@@ -289,8 +265,6 @@ impl ChunkReader {
 
         let message = if s.partial.len() >= total {
             self.buffered = self.buffered.saturating_sub(s.partial.len());
-            self.reserved = self.reserved.saturating_sub(s.reserved);
-            s.reserved = 0;
             Some(Message {
                 csid,
                 type_id,
@@ -698,74 +672,5 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!((m[0].timestamp, m[0].payload.as_slice()), (9, &[5][..]));
         assert_eq!(r.buffered(), 0);
-    }
-
-    #[test]
-    fn room_is_set_aside_for_a_message_within_the_budget_only() {
-        // One message in many chunks: its room is taken once, and exactly.
-        let payload = vec![7u8; 12_000];
-        let mut w = ChunkWriter::default();
-        w.set_chunk_size(4096);
-        let mut bytes = Vec::new();
-        w.write(&mut bytes, 6, 9, 1, 0, &payload);
-        let mut r = ChunkReader::new(1 << 20);
-        r.set_chunk_size(4096).expect("valid size");
-        let Read::Chunk { consumed, message } = r.read(&bytes).expect("first chunk") else {
-            panic!("a whole chunk");
-        };
-        assert!(message.is_none());
-        assert_eq!(r.reserved, 12_000);
-        assert_eq!(r.streams[&6].partial.capacity(), 12_000);
-        let msgs = read_all(&mut r, &bytes[consumed..]);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].payload, payload);
-        assert_eq!(msgs[0].payload.capacity(), 12_000, "never regrown");
-        assert_eq!((r.buffered(), r.reserved), (0, 0));
-
-        // A long message has room set aside up to the cap, then grows.
-        let long = vec![3u8; MAX_RESERVE + 5000];
-        let mut bytes = Vec::new();
-        w.write(&mut bytes, 6, 9, 1, 0, &long);
-        let mut r = ChunkReader::new(1 << 20);
-        r.set_chunk_size(4096).expect("valid size");
-        let Read::Chunk { .. } = r.read(&bytes).expect("first chunk") else {
-            panic!("a whole chunk");
-        };
-        assert_eq!(r.reserved, MAX_RESERVE);
-        assert_eq!(read_all(&mut r, &bytes)[0].payload, long);
-    }
-
-    #[test]
-    fn advertised_lengths_cannot_set_aside_more_than_the_budget() {
-        // Every chunk stream advertises a huge message and sends one byte.
-        let budget = 300 << 10;
-        let mut r = ChunkReader::new(budget);
-        r.set_chunk_size(1).expect("valid size");
-        let mut started = 0;
-        for csid in 2..(2 + MAX_CHUNK_STREAMS as u8).min(64) {
-            // Type 0 header: timestamp 0, length 0xffffff, type 9, stream 1.
-            let chunk = [csid, 0, 0, 0, 0xff, 0xff, 0xff, 9, 1, 0, 0, 0, 0xaa];
-            assert!(matches!(
-                r.read(&chunk).expect("chunk"),
-                Read::Chunk { message: None, .. }
-            ));
-            started += 1;
-            assert!(r.reserved <= budget, "after {started} streams");
-            let held: usize = r.streams.values().map(|s| s.partial.capacity()).sum();
-            // What is not set aside is one byte's allocation, as before.
-            assert!(held <= budget + started * 16, "after {started} streams");
-        }
-        assert_eq!(
-            r.reserved, MAX_RESERVE,
-            "one fits this budget; the rest get none"
-        );
-
-        // A new header on a stream gives its room back before taking more,
-        // and so does an abort.
-        let again = [2, 0, 0, 0, 0, 0, 2, 9, 1, 0, 0, 0, 0xbb];
-        let _ = r.read(&again).expect("chunk");
-        assert_eq!(r.reserved, 2);
-        r.abort(2);
-        assert_eq!(r.reserved, 0);
     }
 }
