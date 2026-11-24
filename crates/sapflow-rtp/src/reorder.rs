@@ -107,6 +107,12 @@ pub(crate) struct Reorder {
     missing: usize,
     ready: VecDeque<Released>,
     probe: Option<Probe>,
+    /// The earliest NACK time over the missing slots, as a scan with this
+    /// RTT found it: `(rtt, earliest)`, or `None` when not known. A NACK
+    /// time does not depend on the clock, so while nothing is due neither
+    /// [`due_nacks`](Self::due_nacks) nor [`next_nack`](Self::next_nack)
+    /// has to scan the slots.
+    nack_next: Option<(u64, Option<u64>)>,
 }
 
 impl Reorder {
@@ -123,6 +129,7 @@ impl Reorder {
             missing: 0,
             ready: VecDeque::new(),
             probe: None,
+            nack_next: None,
         }
     }
 
@@ -221,7 +228,7 @@ impl Reorder {
                     nacks: 0,
                     last_nack: 0,
                 });
-                self.missing += 1;
+                self.gap_seen(now);
             }
             self.slots.push_front(Slot::Held(Stored {
                 seq: ext,
@@ -235,10 +242,12 @@ impl Reorder {
             return Inserted::New;
         }
         if let Some(Slot::Missing {
-            nacks, last_nack, ..
+            since,
+            nacks,
+            last_nack,
         }) = self.slot(ext)
         {
-            let (nacks, last_nack) = (*nacks, *last_nack);
+            let (since, nacks, last_nack) = (*since, *nacks, *last_nack);
             // Room in bytes, releasing from the front up to this gap only.
             while self.bytes + payload.len() > self.s.max_bytes && self.head < ext {
                 self.pop_front();
@@ -253,7 +262,7 @@ impl Reorder {
                     arrival: now,
                 });
             }
-            self.missing -= 1;
+            self.gap_closed(since, nacks, last_nack);
             self.bytes += payload.len();
             if self.bytes > self.s.max_bytes {
                 // Still over: this gap was the front, so it goes at once.
@@ -291,7 +300,7 @@ impl Reorder {
                 nacks: 0,
                 last_nack: 0,
             });
-            self.missing += 1;
+            self.gap_seen(now);
         }
         self.slots.push_back(Slot::Held(Stored {
             seq: ext,
@@ -303,6 +312,28 @@ impl Reorder {
         self.bytes += payload.len();
         self.highest = self.highest.max(ext);
         Inserted::New
+    }
+
+    /// A gap first seen at `since` joins the missing slots.
+    fn gap_seen(&mut self, since: u64) {
+        self.missing += 1;
+        if let Some((rtt, earliest)) = self.nack_next
+            && let Some(at) = self.nack_time(since, 0, 0, rtt)
+        {
+            self.nack_next = Some((rtt, Some(earliest.map_or(at, |e| e.min(at)))));
+        }
+    }
+
+    /// A missing slot leaves, filled or lost. If it may have been the
+    /// earliest due a NACK, only a scan can say which is now.
+    fn gap_closed(&mut self, since: u64, nacks: u8, last_nack: u64) {
+        self.missing -= 1;
+        if let Some((rtt, earliest)) = self.nack_next
+            && let Some(at) = self.nack_time(since, nacks, last_nack, rtt)
+            && earliest.is_none_or(|e| at <= e)
+        {
+            self.nack_next = None;
+        }
     }
 
     /// Drops the packet set aside, if any.
@@ -372,8 +403,12 @@ impl Reorder {
                 self.bytes -= p.payload.len();
                 self.ready.push_back(Released::Packet(p));
             }
-            Slot::Missing { .. } => {
-                self.missing -= 1;
+            Slot::Missing {
+                since,
+                nacks,
+                last_nack,
+            } => {
+                self.gap_closed(since, nacks, last_nack);
                 self.push_lost(seq, 1);
             }
         }
@@ -436,10 +471,68 @@ impl Reorder {
     /// The missing packets due a NACK at `now`, oldest first: the first
     /// after the reorder delay, then repeats every RTT and a quarter until
     /// the jitter deadline, up to the per-packet cap.
-    pub fn due_nacks(&self, now: u64, rtt: u64) -> Vec<u64> {
+    pub fn due_nacks(&mut self, now: u64, rtt: u64) -> Vec<u64> {
         if self.missing == 0 {
             return Vec::new();
         }
+        if let Some((known, earliest)) = self.nack_next
+            && known == rtt
+            && earliest.is_none_or(|at| at > now)
+        {
+            return Vec::new();
+        }
+        let mut due = Vec::new();
+        let mut earliest: Option<u64> = None;
+        for (n, slot) in self.slots.iter().enumerate() {
+            if let Slot::Missing {
+                since,
+                nacks,
+                last_nack,
+            } = *slot
+                && let Some(at) = self.nack_time(since, nacks, last_nack, rtt)
+            {
+                earliest = Some(earliest.map_or(at, |e| e.min(at)));
+                if at <= now {
+                    due.push(self.head + n as u64);
+                }
+            }
+        }
+        self.nack_next = Some((rtt, earliest));
+        due
+    }
+
+    /// The earliest time a missing packet is due a NACK.
+    pub fn next_nack(&self, rtt: u64) -> Option<u64> {
+        if self.missing == 0 {
+            return None;
+        }
+        if let Some((known, earliest)) = self.nack_next
+            && known == rtt
+        {
+            return earliest;
+        }
+        self.next_nack_scan(rtt)
+    }
+
+    /// [`next_nack`](Self::next_nack) by scanning every slot.
+    fn next_nack_scan(&self, rtt: u64) -> Option<u64> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match *slot {
+                Slot::Missing {
+                    since,
+                    nacks,
+                    last_nack,
+                } => self.nack_time(since, nacks, last_nack, rtt),
+                Slot::Held(_) => None,
+            })
+            .min()
+    }
+
+    /// [`due_nacks`](Self::due_nacks) by scanning every slot, as it was
+    /// before the earliest NACK time was kept.
+    #[cfg(test)]
+    fn due_nacks_scan(&self, now: u64, rtt: u64) -> Vec<u64> {
         let mut due = Vec::new();
         for (n, slot) in self.slots.iter().enumerate() {
             if let Slot::Missing {
@@ -457,26 +550,11 @@ impl Reorder {
         due
     }
 
-    /// The earliest time a missing packet is due a NACK.
-    pub fn next_nack(&self, rtt: u64) -> Option<u64> {
-        if self.missing == 0 {
-            return None;
-        }
-        self.slots
-            .iter()
-            .filter_map(|slot| match *slot {
-                Slot::Missing {
-                    since,
-                    nacks,
-                    last_nack,
-                } => self.nack_time(since, nacks, last_nack, rtt),
-                Slot::Held(_) => None,
-            })
-            .min()
-    }
-
     /// Records a NACK sent at `now` for these extended sequence numbers.
     pub fn mark_nacked(&mut self, seqs: &[u64], now: u64) {
+        if !seqs.is_empty() {
+            self.nack_next = None;
+        }
         for &ext in seqs {
             if let Some(Slot::Missing {
                 nacks, last_nack, ..
@@ -622,7 +700,8 @@ mod tests {
         let mut r = Reorder::new(settings());
         put(&mut r, 0, 1);
         put(&mut r, 0, 3);
-        r.mark_nacked(&r.due_nacks(10 * MS, rtt), 10 * MS);
+        let due = r.due_nacks(10 * MS, rtt);
+        r.mark_nacked(&due, 10 * MS);
         assert_eq!(
             put(&mut r, 35 * MS, 2),
             Inserted::Recovered {
@@ -635,9 +714,11 @@ mod tests {
         put(&mut r, 0, 1);
         put(&mut r, 0, 3);
         let assumed = 100 * MS;
-        r.mark_nacked(&r.due_nacks(10 * MS, assumed), 10 * MS);
+        let due = r.due_nacks(10 * MS, assumed);
+        r.mark_nacked(&due, 10 * MS);
         assert_eq!(r.next_nack(assumed), Some(135 * MS));
-        r.mark_nacked(&r.due_nacks(135 * MS, assumed), 135 * MS);
+        let due = r.due_nacks(135 * MS, assumed);
+        r.mark_nacked(&due, 135 * MS);
         assert_eq!(r.next_nack(assumed), None, "260 ms is past the deadline");
     }
 
@@ -807,5 +888,134 @@ mod tests {
         put(&mut r, 0, 3);
         assert_eq!(r.next_nack(30 * MS), None);
         assert!(r.due_nacks(100 * MS, 30 * MS).is_empty());
+    }
+
+    /// A small deterministic generator (xorshift64*).
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    /// The kept earliest NACK time gives the answers a scan of every slot
+    /// gives: through loss, recovery, reordering, expiry, restarts, a full
+    /// buffer, partial marking and a changing RTT.
+    #[test]
+    fn kept_nack_times_match_a_scan_of_every_slot() {
+        for seed in 1..=16u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut r = Reorder::new(Settings {
+                max_packets: if seed % 2 == 0 { 48 } else { 1024 },
+                max_bytes: 1 << 20,
+                jitter: 200 * MS,
+                reorder_delay: 10 * MS,
+                max_dropout: 3000,
+                max_nacks: 6,
+                nack_repeat: (seed % 4 == 0).then_some(20 * MS),
+            });
+            let mut now = 0u64;
+            let mut rtt = 40 * MS;
+            let mut seq = 65_000u16;
+            for step in 0..30_000 {
+                now += rng.below(3 * MS);
+                match rng.below(20) {
+                    0..=9 => {
+                        seq = seq.wrapping_add(1);
+                        let _ = r.insert(now, seq, 0, false, b"packet");
+                    }
+                    10..=12 => {
+                        // Loss: skip some, then one arrives.
+                        seq = seq.wrapping_add(2 + rng.below(4) as u16);
+                        let _ = r.insert(now, seq, 0, false, b"packet");
+                    }
+                    13..=15 => {
+                        // A retransmission or a late original.
+                        let back = seq.wrapping_sub(rng.below(300) as u16);
+                        let _ = r.insert(now, back, 0, false, b"again");
+                    }
+                    16 => rtt = rng.below(200 * MS),
+                    17 if rng.below(200) == 0 => {
+                        // A restart far away, confirmed by its successor.
+                        seq = seq.wrapping_add(20_000);
+                        let _ = r.insert(now, seq, 0, false, b"probe");
+                        seq = seq.wrapping_add(1);
+                        let _ = r.insert(now, seq, 0, false, b"probe");
+                    }
+                    _ => {}
+                }
+                if rng.below(3) == 0 {
+                    while r.poll(now).is_some() {}
+                }
+                assert_eq!(r.next_nack(rtt), r.next_nack_scan(rtt), "next at {step}");
+                if rng.below(2) == 0 {
+                    let expected = r.due_nacks_scan(now, rtt);
+                    let due = r.due_nacks(now, rtt);
+                    assert_eq!(due, expected, "due at {step}");
+                    assert_eq!(
+                        r.next_nack(rtt),
+                        r.next_nack_scan(rtt),
+                        "after due at {step}"
+                    );
+                    // The receiver marks only what its token bucket allows.
+                    let take = rng.below(due.len() as u64 + 1) as usize;
+                    r.mark_nacked(&due[..take], now);
+                    assert_eq!(r.next_nack(rtt), r.next_nack_scan(rtt), "marked at {step}");
+                }
+            }
+        }
+    }
+
+    /// Manual: the cost of asking a buffer with many gaps, none due, what
+    /// to NACK, against scanning every slot.
+    #[test]
+    #[ignore = "bounded manual microbenchmark; run in release with --ignored --nocapture"]
+    fn kept_nack_times_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut r = Reorder::new(Settings {
+            max_packets: 1024,
+            max_bytes: 1 << 22,
+            jitter: 400 * MS,
+            reorder_delay: 10 * MS,
+            max_dropout: 3000,
+            max_nacks: 6,
+            nack_repeat: None,
+        });
+        // Every other packet missing: 512 gaps, each already asked for.
+        for n in 0..512u16 {
+            let _ = r.insert(0, n * 2, 0, false, &[0; 1200]);
+        }
+        let rtt = 40 * MS;
+        let due = r.due_nacks(10 * MS, rtt);
+        assert_eq!(due.len(), 511);
+        r.mark_nacked(&due, 10 * MS);
+        const ROUNDS: u32 = 200_000;
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            assert!(
+                black_box(&r)
+                    .due_nacks_scan(black_box(11 * MS), rtt)
+                    .is_empty()
+            );
+            black_box(black_box(&r).next_nack_scan(rtt));
+        }
+        let scan = started.elapsed().as_nanos() / u128::from(ROUNDS);
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            assert!(
+                black_box(&mut r)
+                    .due_nacks(black_box(11 * MS), rtt)
+                    .is_empty()
+            );
+            black_box(black_box(&r).next_nack(rtt));
+        }
+        let kept = started.elapsed().as_nanos() / u128::from(ROUNDS);
+        println!(
+            "{{\"gaps\":511,\"scan_ns_per_query_pair\":{scan},\"kept_ns_per_query_pair\":{kept}}}"
+        );
     }
 }

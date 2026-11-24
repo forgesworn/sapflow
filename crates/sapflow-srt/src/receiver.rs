@@ -899,7 +899,10 @@ impl Receiver {
         if let Some(deadline) = self.full_ack_deadline() {
             t = t.min(deadline);
         }
-        if let Some(at) = self.loss.next_due(self.now, self.timing()) {
+        // An empty list has nothing due; most connections lose nothing.
+        if !self.loss.is_empty()
+            && let Some(at) = self.loss.next_due(self.now, self.timing())
+        {
             t = t.min(at);
         }
         if let Some((_, slot)) = self.first_slot() {

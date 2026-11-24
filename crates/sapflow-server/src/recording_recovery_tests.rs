@@ -463,34 +463,40 @@ fn recovered_duration_matches_ffprobe() {
     }
 }
 
+/// A recording that finished, incomplete for media loss, and whose callback
+/// was queued and never delivered. Returns the body that callback carried.
+fn undelivered(dir: &Path, scoped: bool) -> serde_json::Value {
+    block_on(async {
+        let outbox = Arc::new(Outbox::open(dir).expect("outbox"));
+        let scope = scoped.then(|| crate::publish_observer::fixture_scope("a", 1, 11, 3));
+        let (callbacks, mut rx) = match &scope {
+            Some(scope) => crate::callback::test_queue(scope.clone(), 16),
+            None => crate::callback::legacy_test_queue(16),
+        };
+        let callbacks = callbacks.with_outbox(outbox);
+        let (tracks, parts) = fixture_parts();
+        let mut recorder = Recorder::start(dir, &path(), callbacks, 0);
+        recorder.feed(tracks, parts);
+        recorder.mark_incomplete(crate::recorder::IncompleteReason::MediaLoss);
+        drop(recorder);
+        let queued = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("completion deadline")
+            .expect("completion");
+        // Taken from the queue and never delivered: as if the process
+        // stopped while v4v was down.
+        let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
+        drop(queued);
+        body
+    })
+}
+
 #[test]
 fn a_finished_recording_whose_callback_was_lost_is_reported_once_as_it_was() {
     for scoped in [false, true] {
         let scratch = Scratch::new("undelivered");
         let dir = scratch.0.clone();
-        let live = block_on(async {
-            let outbox = Arc::new(Outbox::open(&dir).expect("outbox"));
-            let scope = scoped.then(|| crate::publish_observer::fixture_scope("a", 1, 11, 3));
-            let (callbacks, mut rx) = match &scope {
-                Some(scope) => crate::callback::test_queue(scope.clone(), 16),
-                None => crate::callback::legacy_test_queue(16),
-            };
-            let callbacks = callbacks.with_outbox(outbox);
-            let (tracks, parts) = fixture_parts();
-            let mut recorder = Recorder::start(&dir, &path(), callbacks, 0);
-            recorder.feed(tracks, parts);
-            recorder.mark_incomplete(crate::recorder::IncompleteReason::MediaLoss);
-            drop(recorder);
-            let queued = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-                .await
-                .expect("completion deadline")
-                .expect("completion");
-            // Taken from the queue and never delivered: as if the process
-            // stopped while v4v was down.
-            let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
-            drop(queued);
-            body
-        });
+        let live = undelivered(&dir, scoped);
         assert_eq!(live["recordingState"], "incomplete");
         assert_eq!(live["recordingReason"], "media-loss");
         let stored = entries(&dir);
@@ -532,6 +538,71 @@ fn a_finished_recording_whose_callback_was_lost_is_reported_once_as_it_was() {
             assert_eq!(receiver.bodies().len(), 1);
         });
         assert!(entries(&dir).is_empty());
+    }
+}
+
+/// The outbox's entry files, for a test that leaves one as a newer sapflow
+/// would have.
+fn entry_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join(crate::recording_outbox::DIRECTORY))
+        .expect("outbox")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn an_entry_from_a_newer_sapflow_is_reported_as_far_as_it_is_known_and_kept_as_written() {
+    for scoped in [false, true] {
+        let scratch = Scratch::new("newer-entry");
+        let dir = scratch.0.clone();
+        let live = undelivered(&dir, scoped);
+        // As a newer sapflow would have left it before a rollback to this
+        // one: version 2, with fields added at every level.
+        let stored = entry_files(&dir);
+        assert_eq!(stored.len(), 1);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&stored[0]).expect("entry")).expect("JSON");
+        value["version"] = 2.into();
+        value["loss"] = serde_json::json!({ "packets": 12, "longestGapMs": 480 });
+        value["finished"]["lostMs"] = 480.into();
+        if scoped {
+            value["scoped"]["route"] = "srt".into();
+        }
+        let as_written = serde_json::to_vec(&value).expect("JSON");
+        std::fs::write(&stored[0], &as_written).expect("write");
+        block_on(async {
+            // Refused, then failing: either way the entry stays exactly as
+            // the newer sapflow wrote it, so that sapflow, started again,
+            // still finds its figures.
+            let refusing = Receiver::start(|_, _| Some(401)).await;
+            let summary = restart(&dir, &refusing, Duration::from_millis(10)).await;
+            assert_eq!((summary.refused, summary.left), (1, 0), "{summary:?}");
+            assert_eq!(
+                refusing.bodies(),
+                vec![live.clone()],
+                "the fields known here, as version 1 reports them"
+            );
+            assert_eq!(std::fs::read(&stored[0]).expect("entry"), as_written);
+
+            let failing = Receiver::start(|_, _| Some(503)).await;
+            let summary = restart(&dir, &failing, Duration::from_millis(10)).await;
+            assert_eq!((summary.delivered, summary.deferred), (0, 1), "{summary:?}");
+            assert!(failing.bodies().iter().all(|body| *body == live));
+            assert_eq!(std::fs::read(&stored[0]).expect("entry"), as_written);
+
+            // Answered: reported once more, and only then removed.
+            let receiver = Receiver::start(|_, _| Some(204)).await;
+            let summary = restart(&dir, &receiver, Duration::from_millis(10)).await;
+            assert_eq!(summary.delivered, 1, "{summary:?}");
+            assert_eq!(receiver.bodies(), vec![live.clone()]);
+        });
+        assert!(entry_files(&dir).is_empty());
     }
 }
 

@@ -35,6 +35,9 @@ spec.loader.exec_module(measure)
 
 # Frozen before the first qualified campaign. Failed guards are evidence, not
 # permission to change the workload or replace a trial.
+# Publishers not yet servable at once; below the server's limit of eight
+# starting streams, past which it refuses a new one.
+STARTING_LIMIT = 4
 PROTOCOL = dict(
     version="linux-http-qualification-v1", pairs=4, seconds=60, ramp=5,
     http_threads=2, loader_threads=2,
@@ -270,8 +273,29 @@ def trial(binary, bench, fixture, streams, viewers, seconds, threads, qualify_li
                     time.sleep(.05)
             urls = []
             publishers = []
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            def wait_servable(url, deadline):
+                while True:
+                    if server.poll() is not None or any(p.poll() is not None for p in publishers):
+                        raise RuntimeError("server or publisher exited during media readiness")
+                    try:
+                        with opener.open(url, timeout=.5) as response:
+                            if not response.read().startswith(b"#EXTM3U"):
+                                raise RuntimeError("non-playlist readiness response")
+                        return
+                    except (OSError, TimeoutError):
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("media readiness timeout") from None
+                        time.sleep(.1)
+
             publish_started = time.monotonic()
             for index in range(streams):
+                # The server refuses a new stream while eight are starting.
+                # Keep at most STARTING_LIMIT unservable at once, the same
+                # way for both server variants.
+                if index >= STARTING_LIMIT:
+                    wait_servable(urls[index - STARTING_LIMIT], time.monotonic() + 15)
                 # Spread independent stream changes across the part cadence;
                 # apply the identical launch schedule to both server variants.
                 time.sleep(max(0, publish_started + index * .037 - time.monotonic()))
@@ -284,20 +308,8 @@ def trial(binary, bench, fixture, streams, viewers, seconds, threads, qualify_li
                 publishers.append(publisher)
                 urls.append(f"http://127.0.0.1:{http}/live/{name}/index.m3u8")
             deadline = time.monotonic() + 15
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             for url in urls:
-                while True:
-                    if server.poll() is not None or any(p.poll() is not None for p in publishers):
-                        raise RuntimeError("server or publisher exited during media readiness")
-                    try:
-                        with opener.open(url, timeout=.5) as response:
-                            if not response.read().startswith(b"#EXTM3U"):
-                                raise RuntimeError("non-playlist readiness response")
-                        break
-                    except (OSError, TimeoutError):
-                        if time.monotonic() >= deadline:
-                            raise RuntimeError("media readiness timeout") from None
-                        time.sleep(.1)
+                wait_servable(url, deadline)
             ramp = 5 if qualify_linux else 3
             loaders = []
             started = time.monotonic()
