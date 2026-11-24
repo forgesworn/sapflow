@@ -34,9 +34,11 @@
 //!   at most `amplification_limit` times what it sent, across sessions; a
 //!   stranger that has only sent its own bytes (raw bytes, or checks whose
 //!   MESSAGE-INTEGRITY is corrupted) gets nothing; none over
-//!   1500 bytes. After every step: the deadline index holds each session's
-//!   deadline, every owned tuple's owner is live, and a closed session is
-//!   gone (A3.7).
+//!   1500 bytes; feedback to a publisher authenticates with its keys,
+//!   unless a check or copy for the other session has come from its tuple,
+//!   after which that session's feedback may go there. After every step:
+//!   the deadline index holds each session's deadline, every owned tuple's
+//!   owner is live, and a closed session is gone (A3.7).
 
 #![allow(
     clippy::panic,
@@ -788,6 +790,12 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
     // Tuples that have sent a copy of something, which may then be
     // answered (within the bound); the others have sent only their own.
     let mut copiers: Vec<Tuple> = Vec::new();
+    // Publishers' tuples that a check or a copy has come from for the
+    // other publisher's session. That session may then send there (its
+    // sends follow a nomination until it has had media, whichever session
+    // the router gives the tuple to), so the publisher at that tuple can
+    // get feedback it has no keys for.
+    let mut crossed: Vec<Tuple> = Vec::new();
     let mut pending: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
     let mut started = [false; 2];
     let mut closed = [false; 2];
@@ -799,7 +807,8 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
                      ps: &mut [Publisher; 2],
                      pending: &mut [Vec<Vec<u8>>; 2],
                      from: &HashMap<Tuple, u64>,
-                     copiers: &[Tuple]| {
+                     copiers: &[Tuple],
+                     crossed: &[Tuple]| {
         while let Some(x) = r.poll_transmit() {
             assert!(x.bytes.len() <= 1500, "a datagram within the MTU cap");
             let total = to.entry(x.tuple).or_default();
@@ -818,6 +827,12 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
                     continue;
                 }
                 if classify(&x.bytes) == Kind::Rtcp && !p.has_keys() {
+                    continue;
+                }
+                // The other session's feedback, once a check for it has
+                // come from this tuple: it does not authenticate here.
+                if classify(&x.bytes) == Kind::Rtcp && crossed.contains(&x.tuple) {
+                    let _ = p.try_take_rtcp(&x.bytes);
                     continue;
                 }
                 pending[k].extend(p.take(x.clone()));
@@ -842,6 +857,9 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
                 } else {
                     ps[1 - k].tuple
                 };
+                if from != ps[k].tuple && !crossed.contains(&from) {
+                    crossed.push(from);
+                }
                 sent.push((from, ps[k].check(first & 2 != 0)));
             }
             router_op::DTLS => {
@@ -876,6 +894,9 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
                 if !copiers.contains(&t) {
                     copiers.push(t);
                 }
+                if first & 4 != 0 && !crossed.contains(&t) {
+                    crossed.push(t);
+                }
                 sent.push((t, d));
             }
             router_op::CLOSE => {
@@ -884,14 +905,14 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
             }
             _ => {}
         }
-        let _ = drain(&mut r, &mut ps, &mut pending, &from, &copiers);
+        let _ = drain(&mut r, &mut ps, &mut pending, &from, &copiers, &crossed);
         for (t, d) in sent {
             if history.len() < 256 {
                 history.push(d.clone());
             }
             *from.entry(t).or_default() += d.len() as u64;
             r.handle_datagram(now, t, &d);
-            let _ = drain(&mut r, &mut ps, &mut pending, &from, &copiers);
+            let _ = drain(&mut r, &mut ps, &mut pending, &from, &copiers, &crossed);
         }
         for p in &mut ps {
             p.receive_keys();
@@ -918,7 +939,7 @@ pub fn whip_router_run(data: &[u8]) -> RouterRun {
             }
         }
     }
-    let to = drain(&mut r, &mut ps, &mut pending, &from, &copiers);
+    let to = drain(&mut r, &mut ps, &mut pending, &from, &copiers, &crossed);
     RouterRun {
         connected: connected.iter().filter(|c| **c).count() as u8,
         to_strangers: strangers

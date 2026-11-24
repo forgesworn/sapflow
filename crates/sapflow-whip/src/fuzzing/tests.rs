@@ -78,6 +78,21 @@ fn session_regressions_hold_the_invariants() {
     assert!(n > 0, "regressions for whip_session");
 }
 
+/// Inputs the fuzzer once failed on (`fuzz/regressions/whip_router`) hold
+/// the invariants.
+#[test]
+fn router_regressions_hold_the_invariants() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/whip_router");
+    let mut n = 0;
+    for e in std::fs::read_dir(&dir).expect("regressions") {
+        let path = e.expect("entry").path();
+        let _ = whip_router(&std::fs::read(&path).expect("input"));
+        n += 1;
+    }
+    assert!(n > 0, "regressions for whip_router");
+}
+
 #[test]
 fn forgotten_and_copied_reaches_the_third_tuple() {
     let (_, bytes) = seeds("whip_session")
@@ -159,6 +174,38 @@ fn router_scripts() -> Vec<(&'static str, Vec<u8>)> {
         ("cross-check-and-close", cross),
         ("strangers-only", raw),
     ]
+}
+
+/// A USE-CANDIDATE check for one session from the other publisher's tuple,
+/// before that session has had media, moves its sends there, so its
+/// feedback reaches a publisher that cannot read it (router docs). With
+/// the tuple moved (the other session has had no media from it) and with
+/// it kept (it has), the harness takes that feedback as the other
+/// session's instead of failing on it.
+#[test]
+fn feedback_after_a_check_from_the_other_tuple_holds_the_invariants() {
+    use router_op as r;
+    let connect = |s: &mut Vec<u8>, k: u8| {
+        push_step(s, r::CHECK, &[k | 2]);
+        for _ in 0..3 {
+            push_step(s, r::DTLS, &[k]);
+        }
+    };
+    for kept in [false, true] {
+        let mut s = Vec::new();
+        connect(&mut s, 0);
+        connect(&mut s, 1);
+        if kept {
+            push_step(&mut s, r::MEDIA, &[0]);
+        }
+        // Publisher 1's check from publisher 0's tuple if the tuple is
+        // kept, publisher 0's from publisher 1's if it moves.
+        let k = u8::from(kept);
+        push_step(&mut s, r::CHECK, &[k | 2 | 4]);
+        push_step(&mut s, r::TIME, &[40]);
+        let run = whip_router_run(&s);
+        assert_eq!(run.connected, 2, "kept {kept}: {run:?}");
+    }
 }
 
 /// Unauthenticated checks from a tuple never validated draw nothing in

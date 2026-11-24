@@ -23,7 +23,7 @@ use crate::stun::{self, Builder, Message};
 use sapflow_dtls::testing::{Client, Options};
 use sapflow_dtls::{Fingerprint, Identity};
 use sapflow_rtp::rtp::RtpBuilder;
-use sapflow_rtp::srtp::{Profile, Role, split_keying_material};
+use sapflow_rtp::srtp::{Profile, Role, SrtpError, split_keying_material};
 use sapflow_rtp::{Inbound, Outbound};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -455,17 +455,26 @@ impl Publisher {
                 self.receive_keys();
             }
             Kind::Rtcp => {
-                let mut b = t.bytes.clone();
-                let (_, inbound) = self.srtp.as_mut().expect("SRTCP after keys");
-                let n = inbound
-                    .unprotect_rtcp(&mut b)
+                assert!(self.has_keys(), "SRTCP after keys");
+                self.try_take_rtcp(&t.bytes)
                     .expect("our feedback unprotects");
-                b.truncate(n);
-                self.rtcp.push(b);
             }
             k => panic!("session sent {k:?}"),
         }
         replies
+    }
+
+    /// Unprotects SRTCP sent to us and keeps it, or returns why it does
+    /// not authenticate with our keys. `Ok(false)` without keys.
+    pub fn try_take_rtcp(&mut self, bytes: &[u8]) -> Result<bool, SrtpError> {
+        let Some((_, inbound)) = self.srtp.as_mut() else {
+            return Ok(false);
+        };
+        let mut b = bytes.to_vec();
+        let n = inbound.unprotect_rtcp(&mut b)?;
+        b.truncate(n);
+        self.rtcp.push(b);
+        Ok(true)
     }
 
     /// Derives SRTP keys once the client has connected.
