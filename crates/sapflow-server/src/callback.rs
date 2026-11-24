@@ -5,6 +5,12 @@
 //! Events go through one queue and are sent in order, so an `unpublish`
 //! never overtakes the `publish` before it.
 //!
+//! A `recordSegmentComplete` waits its turn in that queue too, so it is
+//! never sent before the `unpublish` queued ahead of it. When the sender
+//! reaches it, it passes it to a second sender and carries on: v4v copies
+//! and hashes the whole file before it answers, which can take minutes, and
+//! no other stage's `publish` or `unpublish` waits for that.
+//!
 //! A `recordSegmentComplete` can carry its recording's outbox entry
 //! ([`crate::recording_outbox`]): the sender removes the entry once the app
 //! has answered 2xx, and leaves it otherwise, for the next start to send.
@@ -24,14 +30,25 @@ use crate::recording_outbox::{Outbox, OutboxEntry, ScopedIdentity};
 
 const QUEUE: usize = 512;
 const MAX_BODY: usize = 16 * 1024;
+/// The event whose answer waits for the app's import of a file.
+const RECORD_SEGMENT_COMPLETE: &str = "recordSegmentComplete";
 /// Connect, send and read the answer's head, per attempt.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A recovered `recordSegmentComplete`'s attempt. v4v copies and hashes the
-/// whole file before it answers: a four-hour show at its top recommended
-/// bitrate (4,000 kbit/s, about 2 GB an hour) is 8 GB, which storage copying
-/// at 20 MB/s takes about seven minutes over. Ten minutes covers that with a
-/// margin. It holds only the recovered lane, never live callbacks.
-pub(crate) const RECOVERED_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// A `recordSegmentComplete`'s attempt, live or recovered. v4v copies and
+/// hashes the whole file before it answers: a four-hour show at its top
+/// recommended bitrate (4,000 kbit/s, about 2 GB an hour) is 8 GB, which
+/// storage copying at 20 MB/s takes about seven minutes over. Ten minutes
+/// covers that with a margin. It holds only the two senders of completions,
+/// never the live lane.
+const IMPORT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Live completions passed on and waiting for their sender. One import can
+/// take minutes, and meanwhile every stream can finish a file at each codec
+/// roll: a burst of 8, then one a minute, by default
+/// (`SAPFLOW_RECORDING_ROLL_*`). As long as the live queue, which holds that
+/// burst from the default 16 publishers on each of the three protocols. A
+/// full one fails the completion, and its outbox entry stays for the next
+/// start.
+const COMPLETION_QUEUE: usize = QUEUE;
 /// Queued recovered completions: recovery sends one at a time.
 const RECOVERED_QUEUE: usize = 4;
 /// How much of a 408, 429 or 503 body is read, for its `retryAfterMs`.
@@ -50,18 +67,30 @@ struct Lane {
 
 /// Live events: four attempts of five seconds, and hints honoured up to
 /// 10 s, so one event holds the queue at most about 50 s (three waits and
-/// four attempts), not minutes.
+/// four attempts), not minutes. A `recordSegmentComplete` is not sent here:
+/// the live sender passes it to the sender of [`COMPLETIONS`].
 const LIVE: Lane = Lane {
     attempts: 4,
     attempt_timeout: ATTEMPT_TIMEOUT,
     max_hint: Duration::from_secs(10),
+};
+/// A live `recordSegmentComplete`, once the live sender has reached it:
+/// its own sender, so the import it waits for never holds up a live
+/// `publish` or `unpublish`, an attempt as long as a recovered one's, and
+/// hints honoured up to a minute. Four attempts, as for any live event:
+/// nothing sends a failed one again before the next start, so an app that
+/// is restarting is given the same tries as before.
+const COMPLETIONS: Lane = Lane {
+    attempts: LIVE.attempts,
+    attempt_timeout: IMPORT_ATTEMPT_TIMEOUT,
+    max_hint: Duration::from_secs(60),
 };
 /// Recovered completions: their own sender, so a slow import never holds up
 /// a live `publish`, two long attempts, and hints honoured up to a minute;
 /// recovery's rounds retry beyond.
 const RECOVERED: Lane = Lane {
     attempts: 2,
-    attempt_timeout: RECOVERED_ATTEMPT_TIMEOUT,
+    attempt_timeout: IMPORT_ATTEMPT_TIMEOUT,
     max_hint: Duration::from_secs(60),
 };
 /// Interim `1xx` answers skipped before a final one; more is a broken peer.
@@ -70,6 +99,8 @@ const MAX_INTERIM: usize = 4;
 pub(crate) struct Queued {
     path: StreamPath,
     name: &'static str,
+    /// A `recordSegmentComplete`: the live sender passes it on.
+    completion: bool,
     pub(crate) body: Bytes,
     ticket: Option<CallbackTicket>,
     /// A recording's outbox entry, removed once the app has answered 2xx.
@@ -127,15 +158,44 @@ pub struct Callbacks {
 }
 
 impl Callbacks {
-    /// Starts the sender. With no URL configured, events are only logged.
+    /// Starts the senders. With no URL configured, events are only logged.
     pub fn start(url: Option<String>, secret: Option<String>) -> Self {
+        Self::start_lanes(url, secret, LIVE, COMPLETIONS, COMPLETION_QUEUE)
+    }
+
+    /// [`start`](Self::start), with the live and completion lanes' limits
+    /// and the completion queue's length given: tests shorten them.
+    fn start_lanes(
+        url: Option<String>,
+        secret: Option<String>,
+        live: Lane,
+        completions: Lane,
+        completion_queue: usize,
+    ) -> Self {
         let Some(url) = url else {
             return Self::with_queue(None);
         };
         let (tx, rx) = mpsc::channel(QUEUE);
+        let (completion_tx, completion_rx) = mpsc::channel(completion_queue);
         let (recovered_tx, recovered_rx) = mpsc::channel(RECOVERED_QUEUE);
-        tokio::spawn(run(url.clone(), secret.clone(), rx, LIVE));
-        tokio::spawn(run(url, secret, recovered_rx, RECOVERED));
+        // The live sender holds the only handle to the completion queue:
+        // when it ends, the completion sender sends what it was passed and
+        // ends too.
+        tokio::spawn(run(
+            url.clone(),
+            secret.clone(),
+            rx,
+            live,
+            Some(completion_tx),
+        ));
+        tokio::spawn(run(
+            url.clone(),
+            secret.clone(),
+            completion_rx,
+            completions,
+            None,
+        ));
+        tokio::spawn(run(url, secret, recovered_rx, RECOVERED, None));
         let mut callbacks = Self::with_queue(Some(tx));
         callbacks.recovered_tx = Some(recovered_tx);
         callbacks
@@ -202,9 +262,11 @@ impl Callbacks {
         *self.pending.borrow()
     }
 
-    /// Waits until every queued event has been delivered or has failed. Events
-    /// queued meanwhile are waited for too. The caller bounds the wait: one
-    /// event can take four attempts of up to five seconds each.
+    /// Waits until every queued event has been delivered or has failed, a
+    /// live completion passed to its own sender included. Events queued
+    /// meanwhile are waited for too. The caller bounds the wait: one event
+    /// can take four attempts of up to five seconds each, and a completion
+    /// four of up to ten minutes.
     pub async fn drained(&self) {
         let mut pending = self.pending.subscribe();
         let _ = pending.wait_for(|n| *n == 0).await;
@@ -267,7 +329,7 @@ impl Callbacks {
     /// its entry, removed on delivery.
     pub(crate) fn enqueue_recording(&self, path: &StreamPath, body: Bytes, entry: OutboxEntry) {
         let _order = self.scope.as_ref().map(|scope| scope.event_lock());
-        self.enqueue(path, "recordSegmentComplete", body, false, Some(entry));
+        self.enqueue(path, RECORD_SEGMENT_COMPLETE, body, false, Some(entry));
     }
 
     /// Queues a completion recovered at start ([`crate::recording_recovery`]),
@@ -284,7 +346,8 @@ impl Callbacks {
         tracing::info!(path = %path.as_path(), file = entry.file(), "recovered recording event");
         tx.try_send(Queued {
             path: path.clone(),
-            name: "recordSegmentComplete",
+            name: RECORD_SEGMENT_COMPLETE,
+            completion: true,
             body,
             ticket: None,
             entry: Some(entry),
@@ -352,8 +415,9 @@ impl Callbacks {
         (body.len() <= MAX_BODY).then(|| Bytes::from(body))
     }
 
-    /// Queues a decided body on the live lane. The caller holds the scope's
-    /// event lock.
+    /// Queues a decided body on the live lane, where a completion waits its
+    /// turn before the live sender passes it on. The caller holds the
+    /// scope's event lock.
     fn enqueue(
         &self,
         path: &StreamPath,
@@ -372,6 +436,7 @@ impl Callbacks {
         let queued = Queued {
             path: path.clone(),
             name,
+            completion: name == RECORD_SEGMENT_COMPLETE,
             body,
             ticket,
             entry,
@@ -760,8 +825,38 @@ fn hinted_wait(lane: Lane, delay: Duration, hint: Option<Duration>) -> Duration 
     hint.map_or(delay, |hint| hint.min(lane.max_hint).max(delay))
 }
 
-async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Queued>, lane: Lane) {
-    while let Some(mut queued) = rx.recv().await {
+/// One sender: it takes each event off `rx` in turn and sends it, through
+/// all its attempts, before the next. The live sender is given `completions`
+/// and passes each `recordSegmentComplete` it reaches to that queue instead:
+/// the events queued before it have been sent by then, and none queued
+/// behind it waits for the app's import.
+async fn run(
+    template: String,
+    secret: Option<String>,
+    mut rx: mpsc::Receiver<Queued>,
+    lane: Lane,
+    completions: Option<mpsc::Sender<Queued>>,
+) {
+    while let Some(queued) = rx.recv().await {
+        let queued = match &completions {
+            Some(completions) if queued.completion => match completions.try_send(queued) {
+                Ok(()) => continue,
+                Err(
+                    mpsc::error::TrySendError::Full(queued)
+                    | mpsc::error::TrySendError::Closed(queued),
+                ) => {
+                    // Not sent here instead: that would hold the live lane
+                    // for the import after all.
+                    tracing::warn!(
+                        event = queued.name,
+                        "recording callback queue full or unavailable"
+                    );
+                    settle(queued, Delivery::Unreachable).await;
+                    continue;
+                }
+            },
+            _ => queued,
+        };
         let url = callback_url(&template, &queued.path, secret.as_deref());
         let mut delay = Duration::from_millis(500);
         let mut delivered = false;
@@ -832,35 +927,43 @@ async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Qu
             reached = true;
             tracing::error!(event = queued.name, "callback URL is not valid");
         }
-        if let Some(ticket) = queued.ticket.take() {
-            ticket.finish(delivered);
+        let delivery = if delivered {
+            Delivery::Delivered
+        } else if refused {
+            Delivery::Refused
+        } else if reached {
+            Delivery::Failed
+        } else {
+            Delivery::Unreachable
+        };
+        settle(queued, delivery).await;
+    }
+}
+
+/// A sender is done with an event: its session's count, its recording's
+/// outbox entry, and whoever waits to hear how it went.
+async fn settle(mut queued: Queued, delivery: Delivery) {
+    let delivered = delivery == Delivery::Delivered;
+    if let Some(ticket) = queued.ticket.take() {
+        ticket.finish(delivered);
+    }
+    // Removed before the event stops counting, so a stop that waited
+    // for the queue leaves no entry for a delivered callback. A refused
+    // or failed one stays for the next start: a restart with a wrong
+    // token must not erase what is owed.
+    if let Some(entry) = queued.entry.take() {
+        if delivered {
+            entry.remove().await;
+        } else {
+            tracing::warn!(
+                event = queued.name,
+                file = entry.file(),
+                "recording callback not delivered; its outbox entry is kept to send again"
+            );
         }
-        // Removed before the event stops counting, so a stop that waited
-        // for the queue leaves no entry for a delivered callback. A refused
-        // or failed one stays for the next start: a restart with a wrong
-        // token must not erase what is owed.
-        if let Some(entry) = queued.entry.take() {
-            if delivered {
-                entry.remove().await;
-            } else {
-                tracing::warn!(
-                    event = queued.name,
-                    file = entry.file(),
-                    "recording callback not delivered; its outbox entry is kept to send again"
-                );
-            }
-        }
-        if let Some(done) = queued.done.take() {
-            let _ = done.send(if delivered {
-                Delivery::Delivered
-            } else if refused {
-                Delivery::Refused
-            } else if reached {
-                Delivery::Failed
-            } else {
-                Delivery::Unreachable
-            });
-        }
+    }
+    if let Some(done) = queued.done.take() {
+        let _ = done.send(delivery);
     }
 }
 
@@ -1167,6 +1270,17 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// What a [`Receiver`] does with one request.
+    enum Reply {
+        /// Sends these bytes at once.
+        Now(Vec<u8>),
+        /// Sends these bytes once a permit is added: an import that takes
+        /// its time.
+        Held(Arc<tokio::sync::Semaphore>, Vec<u8>),
+        /// Stays silent.
+        Never,
+    }
+
     /// A plain-socket stand-in for v4v, parsing requests with `httparse`
     /// separately from the client's own code. `answer` gets the index of each
     /// request and returns the raw bytes to send, or `None` to stay silent.
@@ -1178,6 +1292,16 @@ mod tests {
 
     impl Receiver {
         async fn start(answer: impl Fn(usize) -> Option<Vec<u8>> + Send + Sync + 'static) -> Self {
+            Self::start_matching(move |index, _| answer(index).map_or(Reply::Never, Reply::Now))
+                .await
+        }
+
+        /// [`start`](Self::start), with `answer` also given the request, so
+        /// that two senders' requests are told apart by what they carry and
+        /// not by which arrived first.
+        async fn start_matching(
+            answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .expect("listener");
@@ -1195,18 +1319,25 @@ mod tests {
                         let Some(request) = Self::read(&mut socket).await else {
                             return;
                         };
-                        let index = {
+                        let reply = {
                             let mut log = log.lock().expect("log");
+                            let reply = answer(log.len(), &request);
                             log.push(request);
-                            log.len() - 1
+                            reply
                         };
-                        match answer(index) {
-                            Some(bytes) => {
-                                let _ = socket.write_all(&bytes).await;
-                                let _ = socket.shutdown().await;
+                        let bytes = match reply {
+                            Reply::Now(bytes) => bytes,
+                            Reply::Held(release, bytes) => {
+                                let Ok(permit) = release.acquire().await else {
+                                    return;
+                                };
+                                permit.forget();
+                                bytes
                             }
-                            None => std::future::pending::<()>().await,
-                        }
+                            Reply::Never => std::future::pending().await,
+                        };
+                        let _ = socket.write_all(&bytes).await;
+                        let _ = socket.shutdown().await;
                     });
                 }
             });
@@ -1411,6 +1542,190 @@ mod tests {
         state_is(&scope, "delivered", Duration::from_secs(2)).await;
     }
 
+    /// The event a request carries.
+    fn event_of(seen: &Seen) -> String {
+        serde_json::from_slice::<serde_json::Value>(&seen.body)
+            .ok()
+            .and_then(|body| body["event"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// The real senders with shortened limits: a live attempt gives up after
+    /// `live_limit`, a completion's after `import_limit`, and `queue`
+    /// completions may wait for their sender.
+    fn start_scaled(
+        receiver: &Receiver,
+        live_limit: Duration,
+        import_limit: Duration,
+        queue: usize,
+    ) -> Callbacks {
+        Callbacks::start_lanes(
+            Some(receiver.url()),
+            None,
+            Lane {
+                attempt_timeout: live_limit,
+                ..LIVE
+            },
+            Lane {
+                attempt_timeout: import_limit,
+                ..COMPLETIONS
+            },
+            queue,
+        )
+    }
+
+    async fn pending_is(callbacks: &Callbacks, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while callbacks.pending() != count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} pending, not {count}", callbacks.pending()));
+    }
+
+    /// A receiver that answers a completion only once `release` has a
+    /// permit for it, and every other event at once.
+    async fn importing(release: &Arc<tokio::sync::Semaphore>) -> Receiver {
+        let release = release.clone();
+        Receiver::start_matching(move |_, seen| {
+            let answer = http_lite::response(204, &[], b"");
+            if event_of(seen) == RECORD_SEGMENT_COMPLETE {
+                Reply::Held(release.clone(), answer)
+            } else {
+                Reply::Now(answer)
+            }
+        })
+        .await
+    }
+
+    #[test]
+    fn the_event_passed_on_is_the_one_the_core_names() {
+        assert_eq!(completion().name(), RECORD_SEGMENT_COMPLETE);
+    }
+
+    #[tokio::test]
+    async fn a_completion_waits_its_turn_then_holds_up_no_other_event() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let receiver = importing(&release).await;
+        let live_limit = Duration::from_millis(100);
+        let callbacks = start_scaled(
+            &receiver,
+            live_limit,
+            Duration::from_secs(30),
+            COMPLETION_QUEUE,
+        );
+        let stage = fixture_scope("a", 1, 1, 1).key().path.clone();
+        let other = fixture_scope("b", 1, 1, 1).key().path.clone();
+
+        callbacks.send(&stage, StreamEvent::Unpublish);
+        callbacks.send_recording(&stage, completion(), true, None);
+        callbacks.send(&other, StreamEvent::Publish);
+
+        // The other stage's `publish` is delivered while the import runs.
+        pending_is(&callbacks, 1).await;
+        // The import outlasts a live attempt several times over: it is still
+        // the one attempt, and still counted, so a stop waits for it.
+        tokio::time::sleep(live_limit * 4).await;
+        assert_eq!(receiver.count(), 3, "the completion is not sent again");
+        assert_eq!(callbacks.pending(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), callbacks.drained())
+                .await
+                .is_err()
+        );
+        {
+            let seen = receiver.seen.lock().expect("log");
+            let mut events: Vec<String> = seen.iter().map(event_of).collect();
+            assert_eq!(
+                events[0], "unpublish",
+                "sent before the completion queued behind it"
+            );
+            events[1..].sort();
+            assert_eq!(events[1..], ["publish", RECORD_SEGMENT_COMPLETE]);
+        }
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), callbacks.drained())
+            .await
+            .expect("the import answered");
+        assert_eq!(receiver.count(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_full_completion_queue_fails_the_completion_and_keeps_what_it_owes() {
+        use crate::recording_outbox::Finished;
+        use crate::recording_outbox::tests::{Scratch, legacy};
+
+        let scratch = Scratch::new("completion-queue");
+        let outbox = Arc::new(Outbox::open(&scratch.0).expect("outbox"));
+        let owed = || -> Vec<String> {
+            let (names, _) = outbox.list(usize::MAX).expect("list");
+            let mut files: Vec<String> = names
+                .iter()
+                .map(|name| outbox.read(name).expect("entry").0.file)
+                .collect();
+            files.sort();
+            files
+        };
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let receiver = importing(&release).await;
+        // One completion with its sender and one waiting: a third has
+        // nowhere to go.
+        let callbacks = start_scaled(
+            &receiver,
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            1,
+        );
+        let stage = fixture_scope("a", 1, 1, 1).key().path.clone();
+        let report = async |file: &str| {
+            let mut entry = OutboxEntry::open(outbox.clone(), legacy(file)).await;
+            entry
+                .finish(Finished {
+                    complete: true,
+                    reason: None,
+                    duration_ms: 1_000,
+                })
+                .await;
+            let body = callbacks
+                .recording_body(&stage, &completion(), true, None, None)
+                .expect("body");
+            callbacks.enqueue_recording(&stage, body, entry);
+        };
+
+        report("live/event-a/101.mp4").await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.count() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first import began");
+        report("live/event-a/102.mp4").await;
+        report("live/event-a/103.mp4").await;
+
+        // The third is failed at once, not sent on the live lane instead,
+        // and stays owed for the next start.
+        pending_is(&callbacks, 2).await;
+        assert_eq!(receiver.count(), 1);
+        assert_eq!(
+            owed(),
+            [
+                "live/event-a/101.mp4",
+                "live/event-a/102.mp4",
+                "live/event-a/103.mp4"
+            ]
+        );
+
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(2), callbacks.drained())
+            .await
+            .expect("both imports answered");
+        assert_eq!(receiver.count(), 2);
+        assert_eq!(owed(), ["live/event-a/103.mp4"]);
+    }
+
     #[tokio::test]
     async fn an_event_counts_until_the_sender_is_done_with_it() {
         // Without a URL nothing is queued, so there is nothing to wait for.
@@ -1613,14 +1928,18 @@ mod tests {
     }
 
     #[test]
-    fn a_hint_holds_the_live_lane_seconds_and_the_recovered_lane_a_minute() {
+    fn a_hint_holds_the_live_lane_seconds_and_a_completion_lane_a_minute() {
         let hint = Some(Duration::from_secs(600));
         let backoff = Duration::from_millis(500);
         assert_eq!(hinted_wait(LIVE, backoff, hint), Duration::from_secs(10));
-        assert_eq!(
-            hinted_wait(RECOVERED, backoff, hint),
-            Duration::from_secs(60)
-        );
+        for lane in [COMPLETIONS, RECOVERED] {
+            assert_eq!(hinted_wait(lane, backoff, hint), Duration::from_secs(60));
+        }
+        // A live completion gets as many attempts as any live event, each
+        // as long as a recovered one's.
+        assert_eq!(COMPLETIONS.attempts, LIVE.attempts);
+        assert_eq!(COMPLETIONS.attempt_timeout, RECOVERED.attempt_timeout);
+        assert!(COMPLETIONS.attempt_timeout > LIVE.attempt_timeout * LIVE.attempts);
         assert_eq!(hinted_wait(LIVE, backoff, None), backoff);
         assert_eq!(
             hinted_wait(LIVE, backoff, Some(Duration::from_millis(1))),
