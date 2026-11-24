@@ -50,14 +50,19 @@ def cpu_seconds(pid):
     return total
 
 
-def peak_rss_mib(pid):
+def status_mib(pid, field):
+    """A memory figure from /proc/PID/status, where there is one."""
     status = Path(f"/proc/{pid}/status")
     if not status.exists():
         return None
     for line in status.read_text().splitlines():
-        if line.startswith("VmHWM:"):
+        if line.startswith(field + ":"):
             return int(line.split()[1]) / 1024
     return None
+
+
+def peak_rss_mib(pid):
+    return status_mib(pid, "VmHWM")
 
 
 def media_sequence(opener, url):
@@ -157,6 +162,8 @@ def trial(binary, clip, publishers, seconds, work, extra_env=None):
             raise RuntimeError(f"a stream advanced only {min(advanced)} segments")
         return dict(qualified=True, cpu_seconds=cpu, wall_seconds=wall,
                     cpu_percent=100 * cpu / wall, peak_rss_mib=peak_rss_mib(server.pid),
+                    # At the end of the window, with every stream's window full.
+                    rss_mib=status_mib(server.pid, "VmRSS"), rss_anon_mib=status_mib(server.pid, "RssAnon"),
                     segments_advanced_min=min(advanced), segments_advanced_max=max(advanced))
     finally:
         for child in reversed(children):
@@ -177,7 +184,15 @@ def summarise(trials, pairs):
         return dict(complete=False)
     lookup = {(row["pair"], row["variant"]): row["cpu_seconds"] / row["wall_seconds"] for row in trials}
     ratios = [lookup[pair, "candidate"] / lookup[pair, "baseline"] for pair in range(pairs)]
-    return dict(complete=True, cpu_ratios=ratios, median_cpu_ratio=statistics.median(ratios),
+    memory = {}
+    for field in ("peak_rss_mib", "rss_mib"):
+        held = {(row["pair"], row["variant"]): row.get(field) for row in trials}
+        if all(value for value in held.values()):
+            memory[f"{field}_ratios"] = [held[pair, "candidate"] / held[pair, "baseline"] for pair in range(pairs)]
+            for variant in ("baseline", "candidate"):
+                memory[f"{variant}_{field}_median"] = statistics.median(
+                    value for (_, v), value in held.items() if v == variant)
+    return dict(complete=True, cpu_ratios=ratios, median_cpu_ratio=statistics.median(ratios), **memory,
                 maximum_cpu_ratio=max(ratios), minimum_cpu_ratio=min(ratios),
                 baseline_cpu_percent_median=statistics.median(
                     row["cpu_percent"] for row in trials if row["variant"] == "baseline"),
@@ -200,8 +215,8 @@ def main():
     candidate_env = {}
     for item in args.candidate_env:
         key, separator, value = item.partition("=")
-        if not separator or not key or key.startswith("SAPFLOW_"):
-            parser.error("--candidate-env takes KEY=VALUE, and not a SAPFLOW_ setting")
+        if not separator or not key:
+            parser.error("--candidate-env takes KEY=VALUE")
         candidate_env[key] = value
     if not (1 <= args.publishers <= 64 and 5 <= args.seconds <= 300 and 1 <= args.pairs <= 12
             and 500 <= args.bitrate_kbit <= 20_000):
