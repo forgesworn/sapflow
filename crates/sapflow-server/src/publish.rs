@@ -127,6 +127,9 @@ pub struct Publication {
     published: bool,
     connected: Instant,
     last_health: Instant,
+    /// The muxer's part counter at the last health report, to tell a stream
+    /// that has stopped publishing from one that is still measured.
+    health_progress: Option<u64>,
     /// The transport's count of packets it gave up on, where it keeps one.
     transport_dropped: Option<Arc<AtomicU64>>,
     rate: RateCap,
@@ -205,6 +208,12 @@ fn health_of(m: &sapflow_hls::Muxer) -> Option<Health> {
     })
 }
 
+/// Whether the muxer published nothing between two health reports. Reports
+/// closer together than two segments prove nothing either way.
+fn stalled(before: Option<u64>, now: u64, since_last: Duration, target_secs: u64) -> bool {
+    before == Some(now) && since_last >= Duration::from_secs(target_secs.saturating_mul(2))
+}
+
 /// What the transport's counter reads now, if it keeps one.
 fn dropped_so_far(counter: Option<&AtomicU64>) -> Option<u64> {
     counter.map(|dropped| dropped.load(Ordering::Relaxed))
@@ -221,6 +230,21 @@ mod health_tests {
         assert_eq!(dropped_so_far(Some(&counter)), Some(0));
         counter.store(3600, Ordering::Relaxed);
         assert_eq!(dropped_so_far(Some(&counter)), Some(3600));
+    }
+
+    #[test]
+    fn a_stream_that_published_nothing_between_reports_is_stalled() {
+        let long = Duration::from_secs(30);
+        assert!(stalled(Some(32), 32, long, 2));
+        assert!(!stalled(Some(32), 33, long, 2), "a new part is progress");
+        assert!(
+            !stalled(None, 32, long, 2),
+            "the first report has nothing to compare"
+        );
+        assert!(
+            !stalled(Some(32), 32, Duration::from_secs(3), 2),
+            "reports closer than two segments apart"
+        );
     }
     use sapflow_hls::codec::{AudioConfig, OpusConfig};
 
@@ -630,6 +654,7 @@ impl Publication {
             published: false,
             connected: now,
             last_health: now,
+            health_progress: None,
             transport_dropped: None,
             rate: RateCap::new(max_bps, Duration::from_secs(5)),
             scope,
@@ -846,14 +871,28 @@ impl Publication {
         if interval.is_zero() || !self.published || self.last_health.elapsed() < interval {
             return;
         }
+        let since_last = self.last_health.elapsed();
         self.last_health = Instant::now();
-        let mut health = {
+        let (mut health, progress, target) = {
             let st = self.stream.lock();
-            let Some(health) = st.ingest.muxer().and_then(health_of) else {
+            let Some(m) = st.ingest.muxer() else {
                 return;
             };
-            health
+            let Some(health) = health_of(m) else {
+                return;
+            };
+            (health, m.next_part_id(), m.target_duration())
         };
+        if stalled(self.health_progress, progress, since_last, target) {
+            // The segments measured are old: nothing has been published since.
+            health.bitrate_kbps = 0;
+            tracing::warn!(
+                path = %self.stream.path.as_path(),
+                secs = since_last.as_secs(),
+                "nothing published since the last health report; reporting a bitrate of 0"
+            );
+        }
+        self.health_progress = Some(progress);
         health.transport_dropped = dropped_so_far(self.transport_dropped.as_deref());
         self.callbacks
             .send(&self.stream.path, StreamEvent::Health(health));

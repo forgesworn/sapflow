@@ -177,6 +177,11 @@ Notes for the release after 0.2.0-rc.1.
   discarding media its uplink could not carry was invisible while the
   stream ran. Other transports leave the field out; the rest of the body
   is unchanged.
+- The health callback reports `bitrateKbps` 0 when nothing was published
+  since the previous report, and logs a warning. It used to repeat the
+  figure measured over the last segments however old they were, so a
+  stream whose video never recovered from loss looked healthy for as long
+  as the encoder stayed connected.
 - A live `recordSegmentComplete` no longer holds up the other callbacks.
   It used to be sent on the one live queue with five seconds an attempt,
   while v4v copies and hashes the whole file before it answers: a long
