@@ -269,7 +269,10 @@ v4v. `transportDropped` is sent for an SRT publisher only: the packets the
 receiver gave up on since that connection began, which never arrived even
 resent. It starts again from zero when the encoder reconnects. A count that
 climbs by thousands at a time, with a break each time, means the encoder is
-discarding media its uplink cannot carry, and the cure is a lower bitrate. The callback endpoint allows 120 requests a minute from one address:
+discarding media its uplink cannot carry, and the cure is a lower bitrate. `bitrateKbps` is 0 when
+nothing was published since the previous report (reports at least two
+segments apart): the encoder is still connected, but no playable media is
+coming out, so the last measured figure would be stale. The callback endpoint allows 120 requests a minute from one address:
 at 30 s, 16 live stages use 32.
 
 When an encoder drops, sapflow sends `unpublish` at once and holds the
