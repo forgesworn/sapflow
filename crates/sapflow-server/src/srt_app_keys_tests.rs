@@ -372,7 +372,20 @@ async fn required_encryption_refuses_plaintext_before_the_app_is_asked() {
     let (addr, server) = origin(&fixture.app);
     let plain = Encoder::call(addr, None).await;
     assert_eq!(plain.rejected(), Some(RejectCode::UNSECURE.0));
-    assert_eq!(stub.count(), 0);
+    // Refused by the listener before the app could be asked; the app is told
+    // afterwards, once, so it can tell the broadcaster.
+    for _ in 0..200 {
+        if stub.count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(stub.count(), 1);
+    assert_eq!(stub.last()["srtKey"], "missing");
+    let again = Encoder::call(addr, None).await;
+    assert_eq!(again.rejected(), Some(RejectCode::UNSECURE.0));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(stub.count(), 1, "one report per address every 30 s");
     // Refused by the listener before any event, yet still logged.
     let text = captured.text();
     assert!(
@@ -382,11 +395,47 @@ async fn required_encryption_refuses_plaintext_before_the_app_is_asked() {
     );
     let mut keyed = Encoder::call(addr, Some(key(KEY, KeySize::Aes128))).await;
     assert!(keyed.connected, "{:?}", keyed.closed);
-    assert_eq!(stub.count(), 1);
+    assert_eq!(stub.count(), 2);
+    assert_eq!(stub.last()["srtKey"], "accepted");
     keyed.stop().await;
     server.abort();
     let _ = server.await;
     drop(captured);
+}
+
+#[test]
+fn unkeyed_reports_are_spaced_per_address_and_bounded() {
+    let ip = |n: u32| std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+    let t0 = Instant::now();
+    let mut told = HashMap::new();
+    assert!(unkeyed_report_due(&mut told, ip(1), t0));
+    assert!(!unkeyed_report_due(
+        &mut told,
+        ip(1),
+        t0 + Duration::from_secs(29)
+    ));
+    assert!(unkeyed_report_due(&mut told, ip(2), t0));
+    assert!(unkeyed_report_due(
+        &mut told,
+        ip(1),
+        t0 + Duration::from_secs(30)
+    ));
+    // A full table of recent addresses takes no more until they age out.
+    let mut told = HashMap::new();
+    for n in 0..256 {
+        assert!(unkeyed_report_due(&mut told, ip(n), t0));
+    }
+    assert!(!unkeyed_report_due(
+        &mut told,
+        ip(999),
+        t0 + Duration::from_secs(1)
+    ));
+    assert!(unkeyed_report_due(
+        &mut told,
+        ip(999),
+        t0 + Duration::from_secs(31)
+    ));
+    assert_eq!(told.len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
