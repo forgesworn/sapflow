@@ -245,6 +245,7 @@ async fn run(
     // before any event reaches us; count them in to the refusal log.
     let unsecure_reason = unsecure_refusal_reason(&app.config);
     let mut unsecure_seen = 0u64;
+    let mut unkeyed_told = HashMap::new();
     loop {
         let Engine {
             listener,
@@ -290,6 +291,9 @@ async fn run(
         while unsecure_seen < unsecure {
             unsecure_seen += 1;
             app.log_refusal("srt", &unsecure_reason);
+        }
+        while let Some(caller) = listener.poll_unkeyed() {
+            report_unkeyed(&app, &mut unkeyed_told, caller, Instant::now());
         }
         while let Some(event) = listener.poll_event() {
             match event {
@@ -593,6 +597,61 @@ fn start(
         "SRT publisher accepted"
     );
     tokio::spawn(publish(id, publication, rx, ended.clone()));
+}
+
+/// How often one address's unkeyed attempts are reported to the app, and how
+/// many addresses are remembered for that.
+const UNKEYED_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+const UNKEYED_ADDRESSES: usize = 256;
+
+/// Whether to report an unkeyed caller from `ip` now: once per address per
+/// [`UNKEYED_REPORT_EVERY`], and not at all while the table is full of
+/// addresses reported more recently than that.
+fn unkeyed_report_due(
+    told: &mut HashMap<std::net::IpAddr, Instant>,
+    ip: std::net::IpAddr,
+    now: Instant,
+) -> bool {
+    let fresh = |at: &Instant| now.saturating_duration_since(*at) < UNKEYED_REPORT_EVERY;
+    if told.get(&ip).is_some_and(fresh) {
+        return false;
+    }
+    if told.len() >= UNKEYED_ADDRESSES {
+        told.retain(|_, at| fresh(at));
+        if told.len() >= UNKEYED_ADDRESSES {
+            return false;
+        }
+    }
+    told.insert(ip, now);
+    true
+}
+
+/// Tells the app that an encoder reached a stream without a passphrase, so
+/// it can tell the broadcaster: the listener has refused the caller already,
+/// and nothing else would say why. Only where the app decides who publishes.
+fn report_unkeyed(
+    app: &Arc<App>,
+    told: &mut HashMap<std::net::IpAddr, Instant>,
+    caller: sapflow_srt::UnkeyedCaller,
+    now: Instant,
+) {
+    if app.config.publish_auth.is_none() || app.publish_sessions.is_some() {
+        return;
+    }
+    let Ok(req) = PublishRequest::parse_srt_stream_id(&String::from_utf8_lossy(&caller.stream_id))
+    else {
+        return;
+    };
+    let ip = caller.peer.ip();
+    if !unkeyed_report_due(told, ip, now) {
+        return;
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        if let Some(endpoint) = &app.config.publish_auth {
+            crate::publish_auth::report_unkeyed_srt(endpoint, &req, ip).await;
+        }
+    });
 }
 
 /// A caller refused at accept: a failed attempt against its address's

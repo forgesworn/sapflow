@@ -46,6 +46,11 @@ use crate::http_lite::Endpoint;
 /// The request field, and its value, that says this sapflow checks an SRT
 /// passphrase the app returns. Set by the binary, never by configuration.
 pub(crate) const SRT_KEY_FIELD: (&str, &str) = ("srtKey", "accepted");
+/// On a request that is a report, not a question: an SRT caller already
+/// refused in the handshake for sending no key material where encryption is
+/// required. The app can tell that stream's broadcaster; its answer is not
+/// acted on.
+pub(crate) const SRT_KEY_MISSING: (&str, &str) = ("srtKey", "missing");
 
 /// The request field, and its value, that marks a live publisher's request
 /// sent again ([`Recheck::still_admitted`]). Set by the binary, never by
@@ -276,6 +281,15 @@ async fn ask_within(
     let outcome = attempt(endpoint, body, limit).await;
     log_outcome(protocol, &outcome);
     classify(outcome)
+}
+
+/// Tells the app about an SRT caller refused for sending no key material
+/// ([`SRT_KEY_MISSING`]), once. Nothing rides on the answer.
+pub(crate) async fn report_unkeyed_srt(endpoint: &Endpoint, req: &PublishRequest, from: IpAddr) {
+    let mut value = value(req, Protocol::Srt, from);
+    insert(&mut value, SRT_KEY_MISSING);
+    let outcome = attempt(endpoint, &to_bytes(&value), TIMEOUT).await;
+    log_outcome(Protocol::Srt, &outcome);
 }
 
 /// Asks the app about an SRT publisher, once, offering to check a passphrase
@@ -801,6 +815,17 @@ mod tests {
             body(&srt(&stream_id), Protocol::Srt, from()),
             serde_json::to_vec(&mediamtx_body("srt")).expect("JSON")
         );
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_srt_caller_is_reported_with_its_own_field() {
+        let stub = stub::start(Answer::Status(401)).await;
+        let stream_id = format!("publish:live/event-a:encoder:{PASSWORD}");
+        report_unkeyed_srt(&stub.endpoint, &srt(&stream_id), from()).await;
+        let mut expected = mediamtx_body("srt");
+        expected["srtKey"] = "missing".into();
+        assert_eq!(stub.count(), 1);
+        assert_eq!(stub.last(), expected);
     }
 
     #[tokio::test]

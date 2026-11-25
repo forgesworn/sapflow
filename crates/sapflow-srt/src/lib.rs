@@ -58,6 +58,7 @@ pub use caller::{Caller, CallerCloseReason, CallerConfig, CallerEvent, CallerSta
 pub use sender::{SendConfig, SendError, SendStats};
 
 pub use listener::{
-    Config, ConnId, Event, KeyCheckError, Listener, ListenerStats, RejectCode, check_key_material,
+    Config, ConnId, Event, KeyCheckError, Listener, ListenerStats, RejectCode, UnkeyedCaller,
+    check_key_material,
 };
 pub use receiver::{CloseReason, Stats};

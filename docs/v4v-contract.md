@@ -126,6 +126,14 @@ handshake carries in clear in the stream id, no longer admits on its own.
 - With app keys and no global passphrase, `SAPFLOW_SRT_ENCRYPTION=required`
   refuses every caller that sends no key material, in the handshake, before
   the app is asked. Left unset, plaintext callers still connect.
+- The app is told about such a caller afterwards, so it can tell the
+  broadcaster: one more request in the same shape with `"srtKey":"missing"`,
+  sent after the caller has been refused, at most once per address every
+  30 s. It is a report, not a question: sapflow ignores the answer, and the
+  stream id in it is as the caller sent it, password included. An app
+  that does not know the value treats the request as it would any SRT
+  request without `"srtKey":"accepted"`. Sent only where
+  `SAPFLOW_PUBLISH_AUTH_URL` decides who publishes.
 - A replayed handshake is refused too. A passing check proves only that
   the key material was made with the passphrase, and it crosses the
   network in clear, so a captured conclusion would pass from anywhere.

@@ -177,6 +177,12 @@ Notes for the release after 0.2.0-rc.1.
   discarding media its uplink could not carry was invisible while the
   stream ran. Other transports leave the field out; the rest of the body
   is unchanged.
+- An SRT caller refused for sending no key material where encryption is
+  required is now reported to the publish-auth app, in a request carrying
+  `"srtKey":"missing"`, at most once per address every 30 s. The listener
+  refuses such a caller before the app is asked, so until now an encoder
+  set up without the passphrase retried for ever and nobody was told.
+  sapflow ignores the answer.
 - The health callback reports `bitrateKbps` 0 when nothing was published
   since the previous report, and logs a warning. It used to repeat the
   figure measured over the last segments however old they were, so a
@@ -613,6 +619,11 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-srt
 
+- `Listener::poll_unkeyed` (new) returns the callers the listener refused
+  for sending no key material where encryption is required, as
+  `UnkeyedCaller` (address and stream ID). No event names them, and until
+  now `ListenerStats::unsecure` only counted them. At most 32 wait; later
+  ones are counted and not kept.
 - `Listener::last_received` (new): when the last packet, data or control,
   arrived from an open connection's peer. Media is delivered up to the
   latency later, so this is when the peer was last heard. Backed by

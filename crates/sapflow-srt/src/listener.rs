@@ -211,10 +211,26 @@ pub struct ListenerStats {
     /// Callers the listener itself refused in the handshake for their
     /// encryption, before any [`Event::Connect`]: no key material where
     /// encryption is required, or key material with no passphrase to check
-    /// it. Also counted in `rejected`. The application never hears of these
-    /// callers, so this is its only way to report them.
+    /// it. Also counted in `rejected`. No [`Event`] names these callers; the
+    /// ones that sent no key material are kept for
+    /// [`Listener::poll_unkeyed`].
     pub unsecure: u64,
 }
+
+/// A caller the listener refused in the handshake because it sent no key
+/// material where encryption is required. Its address passed the cookie
+/// check; the stream ID is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnkeyedCaller {
+    /// The caller's address.
+    pub peer: SocketAddr,
+    /// The caller's stream ID; empty when it sent none.
+    pub stream_id: Vec<u8>,
+}
+
+/// How many [`UnkeyedCaller`]s wait for [`Listener::poll_unkeyed`]; more are
+/// counted in [`ListenerStats::unsecure`] and not kept.
+const UNKEYED_HELD: usize = 32;
 
 /// Why [`Listener::check_key`] cannot accept a caller's key. Never carries
 /// the passphrase or key material.
@@ -321,6 +337,7 @@ pub struct Listener<S = RandomState> {
     by_caller: HashMap<(SocketAddr, u32), u32>,
     transmits: VecDeque<(SocketAddr, Vec<u8>)>,
     events: VecDeque<Event>,
+    unkeyed: VecDeque<UnkeyedCaller>,
     /// Handshake allowance, in millionths of a handshake.
     tokens: u64,
     tokens_at: i64,
@@ -349,6 +366,7 @@ impl<S: BuildHasher> Listener<S> {
             by_caller: HashMap::new(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
+            unkeyed: VecDeque::new(),
             tokens: burst,
             tokens_at: 0,
             stats: ListenerStats::default(),
@@ -407,6 +425,14 @@ impl<S: BuildHasher> Listener<S> {
     /// The next [`Event`], if any.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+
+    /// The next caller refused for sending no key material where encryption
+    /// is required, if any. The caller has been answered already: this is
+    /// for an application that wants to tell someone their encoder needs a
+    /// passphrase. At most 32 wait; later ones are only counted.
+    pub fn poll_unkeyed(&mut self) -> Option<UnkeyedCaller> {
+        self.unkeyed.pop_front()
     }
 
     /// When to call [`handle_timeout`](Self::handle_timeout); `None` when
@@ -904,6 +930,16 @@ impl<S: BuildHasher> Listener<S> {
         if let Err(code) = self.check(&h) {
             if code == RejectCode::UNSECURE {
                 self.stats.unsecure += 1;
+                let keyed = h
+                    .extensions
+                    .iter()
+                    .any(|e| matches!(e, Extension::KmReq(_)));
+                if !keyed && self.unkeyed.len() < UNKEYED_HELD {
+                    self.unkeyed.push_back(UnkeyedCaller {
+                        peer,
+                        stream_id: h.stream_id().map(<[u8]>::to_vec).unwrap_or_default(),
+                    });
+                }
             }
             self.send_rejection(peer, &h, code);
             return;
@@ -1669,11 +1705,26 @@ mod tests {
         assert_eq!(l.poll_event(), None, "the application never hears of it");
         assert_eq!(rejection(&mut l), Some(RejectCode::UNSECURE.0));
         assert_eq!((l.stats().unsecure, l.stats().rejected), (1, 1));
+        assert_eq!(
+            l.poll_unkeyed(),
+            Some(UnkeyedCaller {
+                peer: peer(),
+                stream_id: b"publish:live/event-x:u:p".to_vec(),
+            })
+        );
+        assert_eq!(l.poll_unkeyed(), None);
+        // Only so many are kept; the count still covers the rest.
+        for socket in 0..40 {
+            l.handle_datagram(t0, peer(), &conclusion(10 + socket, c, vec![]));
+        }
+        assert_eq!(l.stats().unsecure, 41);
+        assert_eq!(std::iter::from_fn(|| l.poll_unkeyed()).count(), 32);
         // A refusal the application makes is its own to report.
         let mut l = with_config(t0, app_keys());
         let id = waiting(&mut l, t0, 2, None);
         assert!(l.reject(id, RejectCode::UNSECURE));
         assert_eq!((l.stats().unsecure, l.stats().rejected), (0, 1));
+        assert_eq!(l.poll_unkeyed(), None);
     }
 
     #[test]
